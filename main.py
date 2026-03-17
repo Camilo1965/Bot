@@ -8,6 +8,15 @@ Every order-book snapshot and scored headline is persisted to TimescaleDB.
 
 An ML predictor (XGBoost) is warm-started from historical market data at
 startup and emits a BUY / SELL / HOLD signal every 60 seconds.
+
+When the signal is **BUY** the :class:`~risk.risk_manager.RiskManager`
+sizes a position via the Half-Kelly Criterion and the
+:class:`~execution.paper_executor.PaperExecutor` simulates the trade entry.
+Open positions are monitored on every market tick and closed automatically
+when the static Stop-Loss (1.5 %) or Take-Profit (3 %) is hit.
+
+A dashboard task prints the total simulated PnL and current balance every
+5 minutes.
 """
 
 from __future__ import annotations
@@ -25,6 +34,8 @@ from dotenv import load_dotenv
 from data_ingestion.news_client import DEFAULT_FEED_URL, run_news_client
 from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
+from execution.paper_executor import PaperExecutor
+from risk.risk_manager import RiskManager
 from strategy.ml_predictor import MLPredictor
 from strategy.sentiment_analyzer import SentimentAnalyzer
 
@@ -93,9 +104,22 @@ async def sentiment_processor(
 async def market_consumer(
     market_queue: asyncio.Queue[dict[str, Any]],
     state: dict[str, Any],
+    paper_executor: PaperExecutor,
 ) -> None:
     """Log BTC trade prices alongside the latest sentiment score, persist
-    order-book snapshots to TimescaleDB, and maintain a rolling price buffer."""
+    order-book snapshots to TimescaleDB, maintain a rolling price buffer,
+    and check open paper positions for SL/TP exits on every tick.
+
+    Parameters
+    ----------
+    market_queue:
+        Queue of market messages produced by the WebSocket client.
+    state:
+        Shared application state dict (``prices``, ``sentiment``).
+    paper_executor:
+        :class:`~execution.paper_executor.PaperExecutor` instance used to
+        monitor and close open positions when SL/TP thresholds are hit.
+    """
     logger = logging.getLogger("clawdbot.market")
     while True:
         message = await market_queue.get()
@@ -107,6 +131,18 @@ async def market_consumer(
                 price,
                 sentiment,
             )
+            # Check whether the open position has hit SL or TP
+            if price is not None and paper_executor.open_position is not None:
+                try:
+                    pnl = await paper_executor.check_and_close(float(price))
+                    if pnl is not None:
+                        logger.info(
+                            "Position closed on trade tick  pnl=%.4f  total_pnl=%.4f",
+                            pnl,
+                            paper_executor.total_pnl,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("check_and_close failed: %s", exc)
         elif message.get("type") == "order_book":
             symbol: str = message.get("symbol", "")
             bids: list[Any] = message.get("bids", [])
@@ -131,6 +167,18 @@ async def market_consumer(
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("DB insert_market_tick failed: %s", exc)
+                # Also check SL/TP on order-book mid-price updates
+                if paper_executor.open_position is not None:
+                    try:
+                        pnl = await paper_executor.check_and_close(mid_price, ts)
+                        if pnl is not None:
+                            logger.info(
+                                "Position closed on order-book tick  pnl=%.4f  total_pnl=%.4f",
+                                pnl,
+                                paper_executor.total_pnl,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("check_and_close (order_book) failed: %s", exc)
         else:
             logger.info("Received message: %s", message)
         market_queue.task_done()
@@ -139,20 +187,85 @@ async def market_consumer(
 async def signal_emitter(
     state: dict[str, Any],
     predictor: MLPredictor,
+    paper_executor: PaperExecutor,
     interval: int = 60,
 ) -> None:
-    """Emit a BUY / SELL / HOLD AI signal every *interval* seconds."""
+    """Emit a BUY / SELL / HOLD AI signal every *interval* seconds.
+
+    On a BUY signal the :class:`~execution.paper_executor.PaperExecutor`
+    attempts to open a paper trade sized by the Half-Kelly Criterion.
+
+    Parameters
+    ----------
+    state:
+        Shared application state dict (``prices``, ``sentiment``).
+    predictor:
+        Trained :class:`~strategy.ml_predictor.MLPredictor` instance.
+    paper_executor:
+        :class:`~execution.paper_executor.PaperExecutor` used to open
+        simulated trades when the signal is BUY.
+    interval:
+        Seconds between signal evaluations.  Defaults to 60.
+    """
     logger = logging.getLogger("clawdbot.signal")
     while True:
         await asyncio.sleep(interval)
         prices: list[float] = list(state["prices"])
         sentiment: float = state.get("sentiment", 0.0)
         signal = predictor.generate_signal(prices, sentiment)
+        win_prob: float = predictor.predict_proba(prices, sentiment) or 0.0
         logger.info(
-            "AI Signal: %s  prices_in_buffer=%d  sentiment=%.4f",
+            "AI Signal: %s  prices_in_buffer=%d  sentiment=%.4f  win_prob=%.4f",
             signal,
             len(prices),
             sentiment,
+            win_prob,
+        )
+
+        if signal == "BUY" and prices:
+            entry_price = prices[-1]
+            try:
+                opened = await paper_executor.try_open_trade(
+                    entry_price=entry_price,
+                    win_probability=win_prob,
+                )
+                if not opened:
+                    logger.info(
+                        "BUY signal ignored – position already open or insufficient balance."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Paper trade open failed: %s", exc)
+
+
+async def dashboard_logger(
+    paper_executor: PaperExecutor,
+    risk_manager: RiskManager,
+    interval: int = 300,
+) -> None:
+    """Print a summary of the simulated trading account every *interval* seconds.
+
+    Logs the total realised PnL, current simulated balance, and whether a
+    position is currently open.
+
+    Parameters
+    ----------
+    paper_executor:
+        :class:`~execution.paper_executor.PaperExecutor` instance whose
+        ``total_pnl`` and ``open_position`` attributes are reported.
+    risk_manager:
+        :class:`~risk.risk_manager.RiskManager` instance whose ``balance``
+        is reported.
+    interval:
+        Seconds between dashboard log lines.  Defaults to 300 (5 minutes).
+    """
+    logger = logging.getLogger("clawdbot.dashboard")
+    while True:
+        await asyncio.sleep(interval)
+        logger.info(
+            "DASHBOARD ── Total PnL: %.4f USDT  |  Balance: %.2f USDT  |  Open position: %s",
+            paper_executor.total_pnl,
+            risk_manager.balance,
+            "YES" if paper_executor.open_position is not None else "NO",
         )
 
 
@@ -174,6 +287,9 @@ async def main() -> None:
     predictor = MLPredictor()
     ws_client = BinanceWebSocketClient(queue=market_queue)
 
+    risk_manager = RiskManager(initial_balance=10_000.0)
+    paper_executor = PaperExecutor(db=db, risk_manager=risk_manager)
+
     # Warm-start the ML model from historical data already stored in TimescaleDB
     try:
         historical_prices = await db.fetch_market_data(symbol="BTC/USDT", limit=500)
@@ -190,8 +306,9 @@ async def main() -> None:
             ws_client.run(),
             run_news_client(news_queue),
             sentiment_processor(news_queue, shared_state, analyzer, source=DEFAULT_FEED_URL),
-            market_consumer(market_queue, shared_state),
-            signal_emitter(shared_state, predictor),
+            market_consumer(market_queue, shared_state, paper_executor),
+            signal_emitter(shared_state, predictor, paper_executor),
+            dashboard_logger(paper_executor, risk_manager),
         )
     finally:
         await close_db()
