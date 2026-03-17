@@ -21,6 +21,7 @@ import json
 import sys
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -240,16 +241,25 @@ async def main() -> None:
     risk_manager = RiskManager(initial_balance=10_000.0)
     paper_executor = PaperExecutor(db=db, risk_manager=risk_manager)
 
-    try:
-        historical_prices = await db.fetch_market_data(symbol="BTC/USDT", limit=500)
-        if historical_prices:
-            shared_state["prices"].extend(historical_prices)
-            predictor.warm_start(prices=historical_prices)
-            logger.info("✅ ML model warm-started with %d historical prices.", len(historical_prices))
-        else:
-            logger.info("ℹ️ No historical market data found – model will train on live data.")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not warm-start ML model: %s", exc)
+    # ------------------------------------------------------------------
+    # Attempt to load a pre-trained model; fall back to warm-start
+    # ------------------------------------------------------------------
+    _MODEL_PATH = Path(__file__).parent / "models" / "xgb_live.json"
+    model_loaded = predictor.load_model(_MODEL_PATH)
+    if model_loaded:
+        logger.info("✅ Pre-trained model loaded from %s.", _MODEL_PATH)
+    else:
+        logger.info("ℹ️ No pre-trained model found – will warm-start from historical DB data.")
+        try:
+            historical_prices = await db.fetch_market_data(symbol="BTC/USDT", limit=500)
+            if historical_prices:
+                shared_state["prices"].extend(historical_prices)
+                predictor.warm_start(prices=historical_prices)
+                logger.info("✅ ML model warm-started with %d historical prices.", len(historical_prices))
+            else:
+                logger.info("ℹ️ No historical market data found – model will train on live data.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not warm-start ML model: %s", exc)
 
     try:
         await asyncio.gather(

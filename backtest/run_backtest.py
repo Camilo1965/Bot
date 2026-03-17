@@ -1,0 +1,310 @@
+"""
+backtest.run_backtest
+~~~~~~~~~~~~~~~~~~~~~
+
+Downloads 1 year of 1-hour BTC/USDT OHLCV data from Binance via ccxt,
+engineers the same features used by MLPredictor, trains an XGBoost model
+on the first 70 % of data, evaluates on the remaining 30 %, prints
+backtest performance metrics (Total Return, Win Rate), and saves the
+trained model to ``models/xgb_live.json`` so that ``main.py`` can load
+it at startup instead of training from scratch.
+
+Usage
+-----
+    python -m backtest.run_backtest
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from pathlib import Path
+
+import ccxt
+import numpy as np
+import pandas as pd
+from xgboost import XGBClassifier
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants (must mirror strategy/ml_predictor.py)
+# ---------------------------------------------------------------------------
+
+_SYMBOL = "BTC/USDT"
+_TIMEFRAME = "1h"
+_FETCH_LIMIT = 500          # ccxt max per request
+_PREDICTION_HORIZON = 5     # ticks ahead used as the label
+_SMA_PERIOD = 20
+_RSI_PERIOD = 14
+_MOMENTUM_PERIOD = 5
+_TRAIN_RATIO = 0.70
+_FEATURE_COLS = ["sentiment", "rsi", "sma_ratio", "volatility", "momentum"]
+
+# Path where the trained model is saved
+_MODEL_DIR = Path(__file__).parent.parent / "models"
+_MODEL_PATH = _MODEL_DIR / "xgb_live.json"
+
+# Simulated trade parameters (must mirror risk/risk_manager.py)
+_TAKE_PROFIT_PCT = 0.03    # 3 %
+_STOP_LOSS_PCT = 0.015     # 1.5 %
+
+# Maximum number of candles to hold a simulated position before closing at market
+_MAX_HOLDING_PERIOD = 50
+
+
+# ---------------------------------------------------------------------------
+# Data download
+# ---------------------------------------------------------------------------
+
+def fetch_ohlcv(symbol: str = _SYMBOL, timeframe: str = _TIMEFRAME) -> pd.DataFrame:
+    """Download ~1 year of hourly OHLCV data from Binance.
+
+    Returns a DataFrame with columns:
+        timestamp (UTC), open, high, low, close, volume
+    sorted in ascending chronological order.
+    """
+    exchange = ccxt.binance({"enableRateLimit": True})
+    one_year_ms = 365 * 24 * 60 * 60 * 1000
+    since = exchange.milliseconds() - one_year_ms
+
+    all_candles: list[list] = []
+    logger.info("Fetching %s %s OHLCV data from Binance…", symbol, timeframe)
+
+    while True:
+        candles = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=_FETCH_LIMIT)
+        if not candles:
+            break
+        all_candles.extend(candles)
+        last_ts = candles[-1][0]
+        if last_ts >= exchange.milliseconds() - exchange.parse_timeframe(timeframe) * 1000:
+            break
+        since = last_ts + 1
+        time.sleep(exchange.rateLimit / 1000)
+
+    df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.drop_duplicates(subset="timestamp").sort_values("timestamp").reset_index(drop=True)
+    logger.info("Downloaded %d candles.", len(df))
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Feature engineering
+# ---------------------------------------------------------------------------
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute technical indicator features from OHLCV data.
+
+    Adds the following columns (matching _FEATURE_COLS):
+        sentiment  – always 0.0 (no live sentiment in historical data)
+        rsi        – RSI-14 using Wilder's exponential smoothing
+        sma_ratio  – close / SMA-20 (normalised price level)
+        volatility – rolling 20-period standard deviation of close
+        momentum   – percentage price change over 5 periods
+        label      – 1 if close rises after _PREDICTION_HORIZON ticks, else 0
+
+    Rows without a complete window or future label are dropped.
+    """
+    series = df["close"].astype(float)
+
+    # SMA-20 ratio
+    sma_20 = series.rolling(_SMA_PERIOD).mean()
+    sma_ratio = (series / sma_20).where(sma_20 != 0)
+
+    # Volatility
+    volatility = series.rolling(_SMA_PERIOD).std()
+
+    # RSI-14 (Wilder's EMA)
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
+    avg_loss = loss.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
+    rs = avg_gain / avg_loss
+    rsi = (100 - (100 / (1 + rs))).fillna(50.0)
+
+    # Momentum
+    momentum = series.pct_change(_MOMENTUM_PERIOD) * 100
+
+    # Label: 1 if price is higher after horizon steps
+    label = (series.shift(-_PREDICTION_HORIZON) > series).astype(float)
+
+    feat_df = df[["timestamp", "close"]].copy()
+    feat_df["sentiment"] = 0.0
+    feat_df["rsi"] = rsi
+    feat_df["sma_ratio"] = sma_ratio
+    feat_df["volatility"] = volatility
+    feat_df["momentum"] = momentum
+    feat_df["label"] = label
+
+    # Fill NaN from indicator warm-up with 0
+    feat_df[["sma_ratio", "volatility", "momentum"]] = feat_df[
+        ["sma_ratio", "volatility", "momentum"]
+    ].fillna(0.0)
+
+    # Drop rows missing a future label (last _PREDICTION_HORIZON rows)
+    feat_df = feat_df.dropna(subset=["label"]).reset_index(drop=True)
+    return feat_df
+
+
+# ---------------------------------------------------------------------------
+# Backtest simulation
+# ---------------------------------------------------------------------------
+
+def simulate_backtest(
+    feat_df: pd.DataFrame,
+    model: XGBClassifier,
+    buy_threshold: float = 0.7,
+) -> dict[str, float]:
+    """Simulate a simple long-only strategy on the test set.
+
+    A BUY signal is generated when the model's upward-probability
+    exceeds ``buy_threshold``.  Each simulated trade is held until either
+    the Take-Profit (+3 %) or Stop-Loss (-1.5 %) is hit against the close
+    prices that follow the entry candle.
+
+    Parameters
+    ----------
+    feat_df:        Feature DataFrame (test split) with a ``close`` column.
+    model:          Trained XGBClassifier.
+    buy_threshold:  Minimum predicted probability to open a long trade.
+
+    Returns
+    -------
+    dict with keys ``total_return_pct`` and ``win_rate_pct``.
+    """
+    X = feat_df[_FEATURE_COLS]
+    probas = model.predict_proba(X)[:, 1]
+
+    closes = feat_df["close"].values
+    total_return = 0.0
+    wins = 0
+    trades = 0
+
+    i = 0
+    while i < len(feat_df):
+        if probas[i] > buy_threshold:
+            entry = closes[i]
+            tp = entry * (1 + _TAKE_PROFIT_PCT)
+            sl = entry * (1 - _STOP_LOSS_PCT)
+            exited = False
+            # Scan subsequent candles for exit
+            for j in range(i + 1, min(i + _MAX_HOLDING_PERIOD, len(feat_df))):
+                price = closes[j]
+                if price >= tp:
+                    total_return += _TAKE_PROFIT_PCT * 100
+                    wins += 1
+                    trades += 1
+                    i = j
+                    exited = True
+                    break
+                if price <= sl:
+                    total_return -= _STOP_LOSS_PCT * 100
+                    trades += 1
+                    i = j
+                    exited = True
+                    break
+            if not exited:
+                # Close at market price after max holding period
+                end_idx = min(i + _MAX_HOLDING_PERIOD, len(feat_df) - 1)
+                pct = (closes[end_idx] - entry) / entry * 100
+                total_return += pct
+                if pct > 0:
+                    wins += 1
+                trades += 1
+                i = end_idx
+            continue
+        i += 1
+
+    win_rate = (wins / trades * 100) if trades > 0 else 0.0
+    return {
+        "total_return_pct": total_return,
+        "win_rate_pct": win_rate,
+        "total_trades": trades,
+        "winning_trades": wins,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Model persistence
+# ---------------------------------------------------------------------------
+
+def save_model(model: XGBClassifier, path: Path = _MODEL_PATH) -> None:
+    """Save *model* to *path* in XGBoost's native JSON format."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    model.save_model(str(path))
+    logger.info("Model saved to %s", path)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def run() -> None:
+    """End-to-end backtest: download → features → train → evaluate → save."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    # 1. Download data
+    df = fetch_ohlcv()
+
+    # 2. Build features & labels
+    feat_df = build_features(df)
+    logger.info("Feature matrix shape: %s", feat_df.shape)
+
+    # 3. Train / test split (70 / 30, chronological)
+    split_idx = int(len(feat_df) * _TRAIN_RATIO)
+    train_df = feat_df.iloc[:split_idx]
+    test_df = feat_df.iloc[split_idx:].reset_index(drop=True)
+
+    X_train = train_df[_FEATURE_COLS]
+    y_train = train_df["label"].astype(int)
+    X_test = test_df[_FEATURE_COLS]
+    y_test = test_df["label"].astype(int)
+
+    logger.info(
+        "Train samples: %d  |  Test samples: %d",
+        len(X_train),
+        len(X_test),
+    )
+
+    # 4. Train XGBoost
+    model = XGBClassifier(
+        n_estimators=100,
+        max_depth=4,
+        learning_rate=0.1,
+        eval_metric="logloss",
+        random_state=42,
+    )
+    model.fit(X_train, y_train)
+
+    # 5. Evaluate on test set
+    y_pred = model.predict(X_test)
+    accuracy = float(np.mean(y_pred == y_test.values))
+
+    backtest_stats = simulate_backtest(test_df, model)
+
+    print("\n" + "=" * 55)
+    print("          BACKTEST PERFORMANCE REPORT")
+    print("=" * 55)
+    print(f"  Symbol        : {_SYMBOL}  ({_TIMEFRAME} candles)")
+    print(f"  Training rows : {len(X_train)}")
+    print(f"  Test rows     : {len(X_test)}")
+    print(f"  Label accuracy: {accuracy * 100:.2f} %")
+    print("-" * 55)
+    print(f"  Total trades  : {backtest_stats['total_trades']}")
+    print(f"  Winning trades: {backtest_stats['winning_trades']}")
+    print(f"  Win Rate      : {backtest_stats['win_rate_pct']:.2f} %")
+    print(f"  Total Return  : {backtest_stats['total_return_pct']:.2f} %")
+    print("=" * 55 + "\n")
+
+    # 6. Save the trained model
+    save_model(model)
+
+
+if __name__ == "__main__":
+    run()
