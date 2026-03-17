@@ -28,10 +28,9 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
-
-from strategy.feature_engineer import FeatureEngineer
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +43,26 @@ _SELL_SENTIMENT_THRESHOLD = -0.3
 # Default prediction horizon (price-tick steps)
 _PREDICTION_HORIZON = 5
 
+# Technical indicator parameters
+_SMA_PERIOD = 20
+_RSI_PERIOD = 14
+_MOMENTUM_PERIOD = 5
+
+# Minimum prices needed for inference (SMA_20 requires 20 observations)
+_MIN_PRICES_FOR_INFERENCE = _SMA_PERIOD
+
+# Feature column order expected by the model
+_FEATURE_COLS = ["sentiment", "rsi", "sma_ratio", "volatility", "momentum"]
+
 Signal = str  # literal: "BUY" | "SELL" | "HOLD"
 
 
 class MLPredictor:
     """Predicts price-direction probability and generates trading signals.
 
-    The underlying model is an XGBoost binary classifier trained on features
-    produced by :class:`~strategy.feature_engineer.FeatureEngineer`.
+    The underlying model is an XGBoost binary classifier trained on a
+    five-element feature vector: [sentiment, rsi, sma_ratio, volatility,
+    momentum].
     """
 
     def __init__(self) -> None:
@@ -62,9 +73,60 @@ class MLPredictor:
             eval_metric="logloss",
             random_state=42,
         )
-        self._engineer = FeatureEngineer()
         self._is_trained = False
         logger.info("MLPredictor initialised (XGBoost).")
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _compute_features(self, prices: list[float], sentiment: float) -> list[float]:
+        """Compute technical indicators and return a feature vector.
+
+        Parameters
+        ----------
+        prices:    Recent mid-prices in chronological order.
+        sentiment: Current VADER compound score in [-1, +1].
+
+        Returns
+        -------
+        A five-element list ``[sentiment, rsi, sma_ratio, volatility, momentum]``
+        where NaN values are replaced with ``0.0``.
+        """
+        series = pd.Series(prices, dtype=float)
+
+        # SMA_20 ratio: current_price / SMA_20 (normalised)
+        sma_20 = series.rolling(_SMA_PERIOD).mean()
+        sma_20_val = float(sma_20.iloc[-1])
+        current_price = float(series.iloc[-1])
+        if np.isnan(sma_20_val) or sma_20_val == 0.0:
+            sma_ratio = 0.0
+        else:
+            sma_ratio = current_price / sma_20_val
+
+        # Volatility: rolling standard deviation of the last 20 periods
+        vol_series = series.rolling(_SMA_PERIOD).std()
+        vol_val = float(vol_series.iloc[-1])
+        volatility = 0.0 if np.isnan(vol_val) else vol_val
+
+        # RSI_14: Relative Strength Index using Wilder's exponential smoothing.
+        # When avg_loss=0 and avg_gain>0, RS=inf → RSI=100 (pure uptrend).
+        # When both are 0 (no movement), RS=NaN → fill with 50 (neutral).
+        delta = series.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
+        avg_loss = loss.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
+        rs = avg_gain / avg_loss
+        rsi_series = (100 - (100 / (1 + rs))).fillna(50.0)
+        rsi = float(rsi_series.iloc[-1])
+
+        # Momentum: percentage change of current price vs 5 periods ago
+        mom_series = series.pct_change(_MOMENTUM_PERIOD) * 100
+        mom_val = float(mom_series.iloc[-1])
+        momentum = 0.0 if np.isnan(mom_val) else mom_val
+
+        return [float(sentiment), rsi, sma_ratio, volatility, momentum]
 
     # ------------------------------------------------------------------
     # Training / warm-start
@@ -93,11 +155,58 @@ class MLPredictor:
         ``True`` on success, ``False`` when there is insufficient data to
         produce at least 10 labelled training samples.
         """
-        X, y = self._engineer.build_feature_matrix(prices, sentiment_scores, horizon)
-        if X is None or len(X) < 10:
+        series = pd.Series(prices, dtype=float)
+
+        # Compute all indicators across the full price history
+        sma_20 = series.rolling(_SMA_PERIOD).mean()
+        vol_series = series.rolling(_SMA_PERIOD).std()
+
+        delta = series.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
+        avg_loss = loss.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
+        rs = avg_gain / avg_loss
+        rsi_series = (100 - (100 / (1 + rs))).fillna(50.0)
+
+        mom_series = series.pct_change(_MOMENTUM_PERIOD) * 100
+        sma_ratio_series = series / sma_20
+
+        sentiment_series = (
+            pd.Series(sentiment_scores, dtype=float)
+            if sentiment_scores is not None
+            else pd.Series(0.0, index=series.index)
+        )
+
+        df = pd.DataFrame(
+            {
+                "sentiment": sentiment_series,
+                "rsi": rsi_series,
+                "sma_ratio": sma_ratio_series,
+                "volatility": vol_series,
+                "momentum": mom_series,
+                "price": series,
+            }
+        )
+
+        # Fill NaN from rolling warm-up with 0
+        df[["sma_ratio", "volatility", "momentum"]] = df[
+            ["sma_ratio", "volatility", "momentum"]
+        ].fillna(0.0)
+
+        # Label: 1 if price rises after `horizon` ticks, else 0
+        df["label"] = (series.shift(-horizon) > series).astype(int)
+
+        # Drop rows without a future label (last `horizon` rows)
+        df = df.dropna(subset=["label"])
+
+        X = df[_FEATURE_COLS]
+        y = df["label"]
+
+        if len(X) < 10:
             logger.warning(
-                "warm_start: not enough labelled samples (%s). Model not trained.",
-                0 if X is None else len(X),
+                "warm_start: not enough labelled samples (%d). Model not trained.",
+                len(X),
             )
             return False
 
@@ -124,7 +233,8 @@ class MLPredictor:
         Parameters
         ----------
         prices:          Recent mid-prices in chronological order.
-                         At least 50 values are required.
+                         At least ``_MIN_PRICES_FOR_INFERENCE`` (20) values are
+                         required.
         sentiment_score: Current VADER compound score in [-1, +1].
 
         Returns
@@ -136,12 +246,27 @@ class MLPredictor:
             logger.debug("predict_proba called before model is trained.")
             return None
 
-        features = self._engineer.build_features(prices, sentiment_score)
-        if features is None:
+        if len(prices) < _MIN_PRICES_FOR_INFERENCE:
+            logger.debug(
+                "predict_proba: not enough prices (%d < %d).",
+                len(prices),
+                _MIN_PRICES_FOR_INFERENCE,
+            )
             return None
 
-        X = pd.DataFrame([features])
+        features = self._compute_features(prices, sentiment_score)
+        X = pd.DataFrame([features], columns=_FEATURE_COLS)
         proba: float = float(self._model.predict_proba(X)[0][1])
+
+        rsi = features[1]
+        volatility = features[3]
+        momentum = features[4]
+        logger.info(
+            "[INDICATORS] RSI: %.1f | Volatility: %.1f | Momentum: %.1f%%",
+            rsi,
+            volatility,
+            momentum,
+        )
         logger.debug("Predicted probability=%.4f", proba)
         return proba
 
