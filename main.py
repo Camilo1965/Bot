@@ -5,6 +5,9 @@ Sets up a structured JSON logger and starts the asyncio event loop.
 Runs the Binance WebSocket client and the crypto-news collector concurrently;
 each incoming BTC trade is logged together with the latest sentiment score.
 Every order-book snapshot and scored headline is persisted to TimescaleDB.
+
+An ML predictor (XGBoost) is warm-started from historical market data at
+startup and emits a BUY / SELL / HOLD signal every 60 seconds.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import asyncio
 import logging
 import json
 import sys
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +25,7 @@ from dotenv import load_dotenv
 from data_ingestion.news_client import DEFAULT_FEED_URL, run_news_client
 from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
+from strategy.ml_predictor import MLPredictor
 from strategy.sentiment_analyzer import SentimentAnalyzer
 
 load_dotenv()
@@ -89,8 +94,8 @@ async def market_consumer(
     market_queue: asyncio.Queue[dict[str, Any]],
     state: dict[str, Any],
 ) -> None:
-    """Log BTC trade prices alongside the latest sentiment score and persist
-    order-book snapshots to TimescaleDB."""
+    """Log BTC trade prices alongside the latest sentiment score, persist
+    order-book snapshots to TimescaleDB, and maintain a rolling price buffer."""
     logger = logging.getLogger("clawdbot.market")
     while True:
         message = await market_queue.get()
@@ -113,6 +118,8 @@ async def market_consumer(
                 else datetime.now(tz=timezone.utc)
             )
             if bids and asks:
+                mid_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                state["prices"].append(mid_price)
                 try:
                     await db.insert_market_tick(
                         symbol=symbol,
@@ -129,6 +136,26 @@ async def market_consumer(
         market_queue.task_done()
 
 
+async def signal_emitter(
+    state: dict[str, Any],
+    predictor: MLPredictor,
+    interval: int = 60,
+) -> None:
+    """Emit a BUY / SELL / HOLD AI signal every *interval* seconds."""
+    logger = logging.getLogger("clawdbot.signal")
+    while True:
+        await asyncio.sleep(interval)
+        prices: list[float] = list(state["prices"])
+        sentiment: float = state.get("sentiment", 0.0)
+        signal = predictor.generate_signal(prices, sentiment)
+        logger.info(
+            "AI Signal: %s  prices_in_buffer=%d  sentiment=%.4f",
+            signal,
+            len(prices),
+            sentiment,
+        )
+
+
 async def main() -> None:
     logger = setup_logging()
     logger.info("ClawdBot starting up")
@@ -137,10 +164,26 @@ async def main() -> None:
 
     market_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     news_queue: asyncio.Queue[list[str]] = asyncio.Queue()
-    shared_state: dict[str, Any] = {"sentiment": 0.0}
+    # Rolling buffer of mid-prices (up to 500 ticks) for the ML predictor
+    shared_state: dict[str, Any] = {
+        "sentiment": 0.0,
+        "prices": deque(maxlen=500),
+    }
 
     analyzer = SentimentAnalyzer()
+    predictor = MLPredictor()
     ws_client = BinanceWebSocketClient(queue=market_queue)
+
+    # Warm-start the ML model from historical data already stored in TimescaleDB
+    try:
+        historical_prices = await db.fetch_market_data(symbol="BTC/USDT", limit=500)
+        if historical_prices:
+            shared_state["prices"].extend(historical_prices)
+            predictor.warm_start(prices=historical_prices)
+        else:
+            logger.info("No historical market data found – model will train on live data.")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not warm-start ML model: %s", exc)
 
     try:
         await asyncio.gather(
@@ -148,6 +191,7 @@ async def main() -> None:
             run_news_client(news_queue),
             sentiment_processor(news_queue, shared_state, analyzer, source=DEFAULT_FEED_URL),
             market_consumer(market_queue, shared_state),
+            signal_emitter(shared_state, predictor),
         )
     finally:
         await close_db()

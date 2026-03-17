@@ -81,6 +81,14 @@ INSERT INTO news_sentiment
 VALUES ($1, $2, $3, $4);
 """
 
+_FETCH_MARKET_DATA = """
+SELECT timestamp, best_bid, best_ask
+FROM market_data
+WHERE symbol = $1
+ORDER BY timestamp ASC
+LIMIT $2;
+"""
+
 
 # ---------------------------------------------------------------------------
 # Manager class
@@ -177,6 +185,32 @@ class DatabaseManager:
                 sentiment_score,
                 source,
             )
+
+    async def fetch_market_data(
+        self,
+        symbol: str,
+        limit: int = 500,
+    ) -> list[float]:
+        """Fetch the most recent *limit* mid-prices for *symbol*.
+
+        Mid-price is computed as ``(best_bid + best_ask) / 2``.  Results are
+        returned in **chronological** (ascending timestamp) order.
+
+        Parameters
+        ----------
+        symbol: Trading pair, e.g. ``"BTC/USDT"``.
+        limit:  Maximum number of rows to retrieve.
+
+        Returns
+        -------
+        A list of mid-price floats, oldest first.
+        """
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_FETCH_MARKET_DATA, symbol, limit)
+        # Rows come back in ascending timestamp order; return as-is
+        return [(float(r["best_bid"]) + float(r["best_ask"])) / 2.0 for r in rows]
 
     # ------------------------------------------------------------------
     # Private helpers
