@@ -1,0 +1,21 @@
+# Python byte-code caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Environment variables
+.env
+
+# Editor / OS artefacts
+.DS_Store
+*.swp
