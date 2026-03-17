@@ -27,6 +27,7 @@ Usage
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -218,6 +219,38 @@ class MLPredictor:
             X.shape[1],
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Model persistence
+    # ------------------------------------------------------------------
+
+    def load_model(self, filepath: str | Path) -> bool:
+        """Load a previously saved XGBoost model from *filepath*.
+
+        The model file must have been created by XGBoost's native
+        ``save_model`` (JSON or binary format).
+
+        Parameters
+        ----------
+        filepath: Path to the saved model file (e.g. ``models/xgb_live.json``).
+
+        Returns
+        -------
+        ``True`` on success, ``False`` if the file does not exist or cannot
+        be loaded.
+        """
+        path = Path(filepath)
+        if not path.exists():
+            logger.info("load_model: file not found at %s.", path)
+            return False
+        try:
+            self._model.load_model(str(path))
+            self._is_trained = True
+            logger.info("MLPredictor loaded pre-trained model from %s.", path)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("load_model failed (%s): %s", path, exc)
+            return False
 
     # ------------------------------------------------------------------
     # Inference
