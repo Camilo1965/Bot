@@ -1,8 +1,7 @@
-# Core async runtime (stdlib, listed for clarity)
-asyncio==3.4.3
+# Core async runtime (stdlib – no install needed)
 
 # Exchange connectivity
-ccxt==4.3.16
+ccxt[pro]==4.3.16
 
 # Data manipulation
 pandas==2.2.2

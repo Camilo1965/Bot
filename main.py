@@ -12,6 +12,8 @@ import json
 import sys
 from datetime import datetime, timezone
 
+from data_ingestion.websocket_client import run_websocket_client
+
 
 class _JsonFormatter(logging.Formatter):
     """Emit log records as single-line JSON objects."""
@@ -43,8 +45,7 @@ async def main() -> None:
     logger = setup_logging()
     logger.info("ClawdBot starting up")
 
-    # TODO: initialise event bus, data ingestion, strategies, execution engine
-    #       and risk manager, then run until cancelled.
+    await run_websocket_client()
 
     logger.info("ClawdBot shut down cleanly")
 
