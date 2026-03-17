@@ -4,6 +4,7 @@ ClawdBot – entry point.
 Sets up a structured JSON logger and starts the asyncio event loop.
 Runs the Binance WebSocket client and the crypto-news collector concurrently;
 each incoming BTC trade is logged together with the latest sentiment score.
+Every order-book snapshot and scored headline is persisted to TimescaleDB.
 """
 
 from __future__ import annotations
@@ -15,9 +16,14 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-from data_ingestion.news_client import run_news_client
+from dotenv import load_dotenv
+
+from data_ingestion.news_client import DEFAULT_FEED_URL, run_news_client
 from data_ingestion.websocket_client import BinanceWebSocketClient
+from database.db_manager import close_db, db, init_db
 from strategy.sentiment_analyzer import SentimentAnalyzer
+
+load_dotenv()
 
 
 class _JsonFormatter(logging.Formatter):
@@ -50,8 +56,10 @@ async def sentiment_processor(
     news_queue: asyncio.Queue[list[str]],
     state: dict[str, Any],
     analyzer: SentimentAnalyzer,
+    source: str = "cointelegraph",
 ) -> None:
-    """Consume headline batches from *news_queue*, update shared *state*."""
+    """Consume headline batches from *news_queue*, update shared *state*, and
+    persist each scored headline to TimescaleDB."""
     while True:
         headlines = await news_queue.get()
         score = analyzer.score_headlines(headlines)
@@ -62,6 +70,18 @@ async def sentiment_processor(
             len(headlines),
             score,
         )
+        for headline in headlines:
+            headline_score = analyzer.score_headline(headline)
+            ts = datetime.now(tz=timezone.utc)
+            try:
+                await db.insert_sentiment(
+                    headline=headline,
+                    sentiment_score=headline_score,
+                    source=source,
+                    timestamp=ts,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DB insert_sentiment failed: %s", exc)
         news_queue.task_done()
 
 
@@ -69,7 +89,8 @@ async def market_consumer(
     market_queue: asyncio.Queue[dict[str, Any]],
     state: dict[str, Any],
 ) -> None:
-    """Log BTC trade prices alongside the latest sentiment score."""
+    """Log BTC trade prices alongside the latest sentiment score and persist
+    order-book snapshots to TimescaleDB."""
     logger = logging.getLogger("clawdbot.market")
     while True:
         message = await market_queue.get()
@@ -81,6 +102,28 @@ async def market_consumer(
                 price,
                 sentiment,
             )
+        elif message.get("type") == "order_book":
+            symbol: str = message.get("symbol", "")
+            bids: list[Any] = message.get("bids", [])
+            asks: list[Any] = message.get("asks", [])
+            raw_ts = message.get("timestamp")
+            ts = (
+                datetime.fromtimestamp(raw_ts / 1000, tz=timezone.utc)
+                if isinstance(raw_ts, (int, float))
+                else datetime.now(tz=timezone.utc)
+            )
+            if bids and asks:
+                try:
+                    await db.insert_market_tick(
+                        symbol=symbol,
+                        best_bid=float(bids[0][0]),
+                        bid_volume=float(bids[0][1]),
+                        best_ask=float(asks[0][0]),
+                        ask_volume=float(asks[0][1]),
+                        timestamp=ts,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("DB insert_market_tick failed: %s", exc)
         else:
             logger.info("Received message: %s", message)
         market_queue.task_done()
@@ -90,6 +133,8 @@ async def main() -> None:
     logger = setup_logging()
     logger.info("ClawdBot starting up")
 
+    await init_db()
+
     market_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     news_queue: asyncio.Queue[list[str]] = asyncio.Queue()
     shared_state: dict[str, Any] = {"sentiment": 0.0}
@@ -97,12 +142,15 @@ async def main() -> None:
     analyzer = SentimentAnalyzer()
     ws_client = BinanceWebSocketClient(queue=market_queue)
 
-    await asyncio.gather(
-        ws_client.run(),
-        run_news_client(news_queue),
-        sentiment_processor(news_queue, shared_state, analyzer),
-        market_consumer(market_queue, shared_state),
-    )
+    try:
+        await asyncio.gather(
+            ws_client.run(),
+            run_news_client(news_queue),
+            sentiment_processor(news_queue, shared_state, analyzer, source=DEFAULT_FEED_URL),
+            market_consumer(market_queue, shared_state),
+        )
+    finally:
+        await close_db()
 
     logger.info("ClawdBot shut down cleanly")
 
