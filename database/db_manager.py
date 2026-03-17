@@ -89,6 +89,42 @@ ORDER BY timestamp ASC
 LIMIT $2;
 """
 
+_CREATE_TRADES_HISTORY = """
+CREATE TABLE IF NOT EXISTS trades_history (
+    id            SERIAL             PRIMARY KEY,
+    symbol        TEXT               NOT NULL,
+    entry_price   DOUBLE PRECISION   NOT NULL,
+    position_size DOUBLE PRECISION   NOT NULL,
+    entry_time    TIMESTAMPTZ        NOT NULL,
+    exit_price    DOUBLE PRECISION,
+    exit_time     TIMESTAMPTZ,
+    pnl           DOUBLE PRECISION,
+    status        TEXT               NOT NULL DEFAULT 'open'
+);
+"""
+
+_INSERT_OPEN_TRADE = """
+INSERT INTO trades_history
+    (symbol, entry_price, position_size, entry_time, status)
+VALUES ($1, $2, $3, $4, 'open')
+RETURNING id;
+"""
+
+_CLOSE_TRADE = """
+UPDATE trades_history
+SET exit_price = $2,
+    exit_time  = $3,
+    pnl        = $4,
+    status     = 'closed'
+WHERE id = $1;
+"""
+
+_FETCH_TOTAL_PNL = """
+SELECT COALESCE(SUM(pnl), 0.0) AS total_pnl
+FROM trades_history
+WHERE status = 'closed';
+"""
+
 
 # ---------------------------------------------------------------------------
 # Manager class
@@ -212,6 +248,62 @@ class DatabaseManager:
         # Rows come back in ascending timestamp order; return as-is
         return [(float(r["best_bid"]) + float(r["best_ask"])) / 2.0 for r in rows]
 
+    async def insert_open_trade(
+        self,
+        symbol: str,
+        entry_price: float,
+        position_size: float,
+        entry_time: datetime | None = None,
+    ) -> int:
+        """Insert a new open trade into *trades_history* and return its id.
+
+        Parameters
+        ----------
+        symbol:        Trading pair, e.g. ``"BTC/USDT"``.
+        entry_price:   Price at which the trade was entered.
+        position_size: Size of the position in quote currency.
+        entry_time:    Trade entry time (UTC).  Defaults to *now*.
+        """
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        ts = entry_time or datetime.now(tz=timezone.utc)
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_INSERT_OPEN_TRADE, symbol, entry_price, position_size, ts)
+        return int(row["id"])  # type: ignore[index]
+
+    async def close_trade(
+        self,
+        trade_id: int,
+        exit_price: float,
+        exit_time: datetime | None = None,
+        pnl: float = 0.0,
+    ) -> None:
+        """Update a trade record in *trades_history* to mark it as closed.
+
+        Parameters
+        ----------
+        trade_id:   Row id of the trade to close.
+        exit_price: Price at which the trade was exited.
+        exit_time:  Trade exit time (UTC).  Defaults to *now*.
+        pnl:        Realised profit / loss in quote currency.
+        """
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        ts = exit_time or datetime.now(tz=timezone.utc)
+        async with self._pool.acquire() as conn:
+            await conn.execute(_CLOSE_TRADE, trade_id, exit_price, ts, pnl)
+
+    async def fetch_total_pnl(self) -> float:
+        """Return the sum of all realised PnL from closed trades.
+
+        Returns ``0.0`` when no closed trades exist yet.
+        """
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_FETCH_TOTAL_PNL)
+        return float(row["total_pnl"])  # type: ignore[index]
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -222,6 +314,7 @@ class DatabaseManager:
         async with self._pool.acquire() as conn:
             await conn.execute(_CREATE_MARKET_DATA)
             await conn.execute(_CREATE_NEWS_SENTIMENT)
+            await conn.execute(_CREATE_TRADES_HISTORY)
             await conn.execute(_CREATE_HYPERTABLE_MARKET)
             await conn.execute(_CREATE_HYPERTABLE_SENTIMENT)
         logger.info("TimescaleDB schema initialised.")
