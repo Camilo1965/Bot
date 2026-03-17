@@ -4,27 +4,27 @@
 aiohttp==3.13.3
 
 # Exchange connectivity
-ccxt[pro]==4.3.16
+ccxt[pro]
 
 # Data manipulation
-pandas==2.2.2
-polars==0.20.23
-numpy==1.26.4
+pandas
+polars
+numpy
 
 # Machine learning
-xgboost==2.0.3
-scikit-learn==1.8.0
-transformers==4.48.0
+xgboost
+scikit-learn
+transformers
 
 # Sentiment analysis
-vaderSentiment==3.3.2
+vaderSentiment
 
 # Storage / caching
-redis==5.0.4
-asyncpg==0.29.0
+redis
+asyncpg
 
 # Backtesting / portfolio analytics
-vectorbt==0.26.2
+vectorbt
 
 # Configuration
-python-dotenv==1.0.1
+python-dotenv
