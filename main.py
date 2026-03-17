@@ -2,15 +2,18 @@
 ClawdBot – entry point.
 
 Sets up a structured JSON logger and starts the asyncio event loop.
-Runs the Binance WebSocket client and the crypto-news collector concurrently;
-each incoming BTC trade is logged together with the latest sentiment score.
-Every order-book snapshot and scored headline is persisted to TimescaleDB.
+Runs the Binance WebSocket client (for all symbols in WATCHLIST) and the
+crypto-news collector concurrently; each incoming trade is logged together
+with the latest sentiment score.  Every order-book snapshot and scored
+headline is persisted to TimescaleDB.
 
 An ML predictor (XGBoost) is warm-started from historical market data at
-startup and emits a BUY / SELL / HOLD signal.
+startup and emits a BUY / SELL / HOLD signal for each symbol independently.
 
-When the signal is BUY the RiskManager sizes a position via the Half-Kelly Criterion 
-and the PaperExecutor simulates the trade entry.
+When the signal is BUY the RiskManager sizes a position via the Half-Kelly
+Criterion (capped to 1/max_positions of the portfolio) and the PaperExecutor
+simulates the trade entry.  Up to max_positions trades may be open
+simultaneously, one per symbol.
 """
 
 from __future__ import annotations
@@ -35,6 +38,9 @@ from strategy.ml_predictor import MLPredictor
 from strategy.sentiment_analyzer import SentimentAnalyzer
 
 load_dotenv()
+
+# ── Multi-asset watchlist ─────────────────────────────────────────────────────
+WATCHLIST: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 
 
 class _JsonFormatter(logging.Formatter):
@@ -103,29 +109,35 @@ async def market_consumer(
     ticks = 0
     while True:
         message = await market_queue.get()
+        symbol: str = message.get("symbol", "BTC/USDT")
+
         if message.get("type") == "trade":
             price = message.get("price")
             sentiment = state.get("sentiment", 0.0)
             ticks += 1
-            
+
             # Solo imprimimos el precio cada 50 ticks para no inundar la pantalla
             if ticks % 50 == 0:
-                logger.info("BTC/USDT price=%.2f  sentiment_score=%.4f | Buffer: %d/500", price, sentiment, len(state["prices"]))
+                prices_buf = state["prices"].get(symbol, [])
+                logger.info(
+                    "%s price=%.2f  sentiment_score=%.4f | Buffer: %d/500",
+                    symbol, price, sentiment, len(prices_buf),
+                )
 
-            if price is not None and paper_executor.open_position is not None:
+            if price is not None:
                 try:
-                    pnl = await paper_executor.check_and_close(float(price))
+                    pnl = await paper_executor.check_and_close(float(price), symbol=symbol)
                     if pnl is not None:
                         logger.info(
-                            "Position closed on trade tick  pnl=%.4f  total_pnl=%.4f",
+                            "Position closed on trade tick  symbol=%s  pnl=%.4f  total_pnl=%.4f",
+                            symbol,
                             pnl,
                             paper_executor.total_pnl,
                         )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("check_and_close failed: %s", exc)
-                    
+
         elif message.get("type") == "order_book":
-            symbol: str = message.get("symbol", "")
             bids: list[Any] = message.get("bids", [])
             asks: list[Any] = message.get("asks", [])
             raw_ts = message.get("timestamp")
@@ -136,7 +148,9 @@ async def market_consumer(
             )
             if bids and asks:
                 mid_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
-                state["prices"].append(mid_price)
+                prices_dict: dict[str, deque[float]] = state["prices"]
+                if symbol in prices_dict:
+                    prices_dict[symbol].append(mid_price)
                 try:
                     await db.insert_market_tick(
                         symbol=symbol,
@@ -148,18 +162,18 @@ async def market_consumer(
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("DB insert_market_tick failed: %s", exc)
-                    
-                if paper_executor.open_position is not None:
-                    try:
-                        pnl = await paper_executor.check_and_close(mid_price, ts)
-                        if pnl is not None:
-                            logger.info(
-                                "Position closed on order-book tick  pnl=%.4f  total_pnl=%.4f",
-                                pnl,
-                                paper_executor.total_pnl,
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("check_and_close (order_book) failed: %s", exc)
+
+                try:
+                    pnl = await paper_executor.check_and_close(mid_price, symbol=symbol, timestamp=ts)
+                    if pnl is not None:
+                        logger.info(
+                            "Position closed on order-book tick  symbol=%s  pnl=%.4f  total_pnl=%.4f",
+                            symbol,
+                            pnl,
+                            paper_executor.total_pnl,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("check_and_close (order_book) failed: %s", exc)
         market_queue.task_done()
 
 
@@ -167,42 +181,59 @@ async def signal_emitter(
     state: dict[str, Any],
     predictor: MLPredictor,
     paper_executor: PaperExecutor,
+    watchlist: list[str],
     interval: int = 15,
 ) -> None:
     logger = logging.getLogger("clawdbot.signal")
     while True:
         await asyncio.sleep(interval)
-        prices: list[float] = list(state["prices"])
         sentiment: float = state.get("sentiment", 0.0)
-        
-        if len(prices) < 50:
-            logger.info("⏳ [AI WARMUP] Recopilando datos... (%d/50 ticks necesarios)", len(prices))
-            continue
-            
-        signal = predictor.generate_signal(prices, sentiment)
-        win_prob: float = predictor.predict_proba(prices, sentiment) or 0.0
-        
-        logger.info(
-            "🧠 [AI THOUGHT] Signal: %s | Confidence: %.2f%% | Prices in buffer: %d | Sentiment: %.4f",
-            signal,
-            win_prob * 100,
-            len(prices),
-            sentiment,
-        )
 
-        if signal == "BUY" and prices:
-            entry_price = prices[-1]
-            try:
-                opened = await paper_executor.try_open_trade(
-                    entry_price=entry_price,
-                    win_probability=win_prob,
+        for symbol in watchlist:
+            prices: list[float] = list(state["prices"].get(symbol, []))
+
+            if len(prices) < 50:
+                logger.info(
+                    "⏳ [AI WARMUP] %s – Recopilando datos... (%d/50 ticks necesarios)",
+                    symbol,
+                    len(prices),
                 )
-                if not opened:
-                    logger.info("⚠️ BUY signal ignored – position already open or insufficient balance.")
-                else:
-                    logger.info("🚀 [TRADE OPENED] Comprando BTC simulado a %.2f", entry_price)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Paper trade open failed: %s", exc)
+                continue
+
+            signal = predictor.generate_signal(prices, sentiment)
+            win_prob: float = predictor.predict_proba(prices, sentiment) or 0.0
+
+            logger.info(
+                "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d | Sentiment: %.4f",
+                symbol,
+                signal,
+                win_prob * 100,
+                len(prices),
+                sentiment,
+            )
+
+            if signal == "BUY" and prices:
+                entry_price = prices[-1]
+                try:
+                    opened = await paper_executor.try_open_trade(
+                        entry_price=entry_price,
+                        win_probability=win_prob,
+                        symbol=symbol,
+                    )
+                    if not opened:
+                        logger.info(
+                            "⚠️ BUY signal ignored for %s – position already open, "
+                            "max positions reached, or insufficient balance.",
+                            symbol,
+                        )
+                    else:
+                        logger.info(
+                            "🚀 [TRADE OPENED] Comprando %s simulado a %.2f",
+                            symbol,
+                            entry_price,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Paper trade open failed for %s: %s", symbol, exc)
 
 
 async def dashboard_logger(
@@ -213,11 +244,15 @@ async def dashboard_logger(
     logger = logging.getLogger("clawdbot.dashboard")
     while True:
         await asyncio.sleep(interval)
+        open_symbols = list(paper_executor.open_positions.keys())
         logger.info(
-            "📊 [DASHBOARD] Total PnL: %.4f USDT  |  Balance: %.2f USDT  |  Open position: %s",
+            "📊 [DASHBOARD] Total PnL: %.4f USDT  |  Balance: %.2f USDT  |  "
+            "Open positions: %d/%d  |  Symbols: %s",
             paper_executor.total_pnl,
             risk_manager.balance,
-            "YES" if paper_executor.open_position is not None else "NO",
+            len(open_symbols),
+            risk_manager.max_positions,
+            open_symbols if open_symbols else "none",
         )
 
 
@@ -231,12 +266,12 @@ async def main() -> None:
     news_queue: asyncio.Queue[list[str]] = asyncio.Queue()
     shared_state: dict[str, Any] = {
         "sentiment": 0.0,
-        "prices": deque(maxlen=500),
+        "prices": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
     }
 
     analyzer = SentimentAnalyzer()
     predictor = MLPredictor()
-    ws_client = BinanceWebSocketClient(queue=market_queue)
+    ws_client = BinanceWebSocketClient(queue=market_queue, watchlist=WATCHLIST)
 
     risk_manager = RiskManager(initial_balance=10_000.0)
     paper_executor = PaperExecutor(db=db, risk_manager=risk_manager)
@@ -250,16 +285,29 @@ async def main() -> None:
         logger.info("✅ Pre-trained model loaded from %s.", _MODEL_PATH)
     else:
         logger.info("ℹ️ No pre-trained model found – will warm-start from historical DB data.")
-        try:
-            historical_prices = await db.fetch_market_data(symbol="BTC/USDT", limit=500)
-            if historical_prices:
-                shared_state["prices"].extend(historical_prices)
-                predictor.warm_start(prices=historical_prices)
-                logger.info("✅ ML model warm-started with %d historical prices.", len(historical_prices))
-            else:
-                logger.info("ℹ️ No historical market data found – model will train on live data.")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not warm-start ML model: %s", exc)
+        for sym in WATCHLIST:
+            try:
+                historical_prices = await db.fetch_market_data(symbol=sym, limit=500)
+                if historical_prices:
+                    shared_state["prices"][sym].extend(historical_prices)
+                    # Train the model once using the first available symbol's data
+                    if not predictor._is_trained:  # noqa: SLF001
+                        predictor.warm_start(prices=historical_prices)
+                        logger.info(
+                            "✅ ML model warm-started with %d historical prices for %s.",
+                            len(historical_prices),
+                            sym,
+                        )
+                    else:
+                        logger.info(
+                            "✅ Historical prices loaded for %s (%d ticks).",
+                            sym,
+                            len(historical_prices),
+                        )
+                else:
+                    logger.info("ℹ️ No historical market data found for %s.", sym)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not warm-start for %s: %s", sym, exc)
 
     try:
         await asyncio.gather(
@@ -267,7 +315,7 @@ async def main() -> None:
             run_news_client(news_queue),
             sentiment_processor(news_queue, shared_state, analyzer, source=DEFAULT_FEED_URL),
             market_consumer(market_queue, shared_state, paper_executor),
-            signal_emitter(shared_state, predictor, paper_executor, interval=15),
+            signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
             dashboard_logger(paper_executor, risk_manager, interval=60),
         )
     finally:
