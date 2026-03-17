@@ -2,7 +2,7 @@
 backtest.run_backtest
 ~~~~~~~~~~~~~~~~~~~~~
 
-Downloads 1 year of 1-hour BTC/USDT OHLCV data from Binance via ccxt,
+Downloads 1 year of 15-minute BTC/USDT OHLCV data from Binance via ccxt,
 engineers the same features used by MLPredictor, trains an XGBoost model
 on the first 70 % of data, evaluates on the remaining 30 %, prints
 backtest performance metrics (Total Return, Win Rate), and saves the
@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _SYMBOL = "BTC/USDT"
-_TIMEFRAME = "1h"
-_FETCH_LIMIT = 500          # ccxt max per request
+_TIMEFRAME = "15m"
+_FETCH_LIMIT = 1000         # ccxt max per request
 _PREDICTION_HORIZON = 5     # ticks ahead used as the label
 _SMA_PERIOD = 20
 _RSI_PERIOD = 14
@@ -47,8 +47,8 @@ _MODEL_DIR = Path(__file__).parent.parent / "models"
 _MODEL_PATH = _MODEL_DIR / "xgb_live.json"
 
 # Simulated trade parameters (must mirror risk/risk_manager.py)
-_TAKE_PROFIT_PCT = 0.03    # 3 %
-_STOP_LOSS_PCT = 0.015     # 1.5 %
+_TAKE_PROFIT_PCT = 0.04    # 4 %
+_STOP_LOSS_PCT = 0.01      # 1 %
 
 # Maximum number of candles to hold a simulated position before closing at market
 _MAX_HOLDING_PERIOD = 50
@@ -59,7 +59,7 @@ _MAX_HOLDING_PERIOD = 50
 # ---------------------------------------------------------------------------
 
 def fetch_ohlcv(symbol: str = _SYMBOL, timeframe: str = _TIMEFRAME) -> pd.DataFrame:
-    """Download ~1 year of hourly OHLCV data from Binance.
+    """Download ~1 year of 15-minute OHLCV data from Binance.
 
     Returns a DataFrame with columns:
         timestamp (UTC), open, high, low, close, volume
@@ -156,13 +156,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 def simulate_backtest(
     feat_df: pd.DataFrame,
     model: XGBClassifier,
-    buy_threshold: float = 0.7,
+    buy_threshold: float = 0.65,
 ) -> dict[str, float]:
     """Simulate a simple long-only strategy on the test set.
 
     A BUY signal is generated when the model's upward-probability
     exceeds ``buy_threshold``.  Each simulated trade is held until either
-    the Take-Profit (+3 %) or Stop-Loss (-1.5 %) is hit against the close
+    the Take-Profit (+4 %) or Stop-Loss (-1 %) is hit against the close
     prices that follow the entry candle.
 
     Parameters
