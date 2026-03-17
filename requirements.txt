@@ -1,0 +1,24 @@
+# Core async runtime (stdlib, listed for clarity)
+asyncio==3.4.3
+
+# Exchange connectivity
+ccxt==4.3.16
+
+# Data manipulation
+pandas==2.2.2
+polars==0.20.23
+numpy==1.26.4
+
+# Machine learning
+xgboost==2.0.3
+transformers==4.41.2
+
+# Storage / caching
+redis==5.0.4
+asyncpg==0.29.0
+
+# Backtesting / portfolio analytics
+vectorbt==0.26.2
+
+# Configuration
+python-dotenv==1.0.1
