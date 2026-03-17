@@ -77,6 +77,11 @@ class MLPredictor:
         self._is_trained = False
         logger.info("MLPredictor initialised (XGBoost).")
 
+    @property
+    def is_trained(self) -> bool:
+        """Return *True* when the model has been fitted or loaded."""
+        return self._is_trained
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------

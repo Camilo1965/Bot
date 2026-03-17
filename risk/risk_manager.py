@@ -108,7 +108,13 @@ class RiskManager:
 
     def register_close(self) -> None:
         """Decrement the open-position counter (call when a trade is closed)."""
-        self._open_count = max(0, self._open_count - 1)
+        if self._open_count == 0:
+            logger.warning(
+                "register_close called when open_count is already 0 – "
+                "possible mismatched open/close calls."
+            )
+            return
+        self._open_count -= 1
 
     def has_sufficient_balance(self, position_size: float) -> bool:
         """Return *True* if the current balance can cover *position_size*."""

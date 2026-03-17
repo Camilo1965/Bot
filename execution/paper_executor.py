@@ -216,7 +216,13 @@ class PaperExecutor:
         pnl: float,
     ) -> None:
         """Persist the closed trade, update balance, and remove the open position."""
-        pos = self.open_positions[symbol]
+        pos = self.open_positions.get(symbol)
+        if pos is None:
+            logger.warning(
+                "_close_position called for %s but no open position found – skipping.",
+                symbol,
+            )
+            return
 
         if pos.trade_id is not None:
             await self._db.close_trade(

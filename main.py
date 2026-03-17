@@ -291,7 +291,7 @@ async def main() -> None:
                 if historical_prices:
                     shared_state["prices"][sym].extend(historical_prices)
                     # Train the model once using the first available symbol's data
-                    if not predictor._is_trained:  # noqa: SLF001
+                    if not predictor.is_trained:
                         predictor.warm_start(prices=historical_prices)
                         logger.info(
                             "✅ ML model warm-started with %d historical prices for %s.",
