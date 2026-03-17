@@ -13,6 +13,7 @@ numpy==1.26.4
 
 # Machine learning
 xgboost==2.0.3
+scikit-learn==1.8.0
 transformers==4.48.0
 
 # Sentiment analysis
