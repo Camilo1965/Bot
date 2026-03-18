@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import ccxt.async_support as ccxt_async
 from dotenv import load_dotenv
 
 from data_ingestion.funding_rate_client import FundingRateClient
@@ -425,6 +426,50 @@ async def weekly_retrainer(
             )
 
 
+async def preload_historical_data(
+    state: dict[str, Any],
+    watchlist: list[str],
+    timeframe: str = "15m",
+    limit: int = 100,
+) -> None:
+    """[ELITE] Fast REST Warmup – populate price/high/low buffers before WebSocket starts.
+
+    Fetches *limit* historical OHLCV candles for every symbol in *watchlist*
+    via the Binance REST API (ccxt.async_support) and appends the close, high,
+    and low values to the respective shared-state deques.  This means that when
+    the first live WebSocket kline arrives the buffer is already pre-filled,
+    bypassing the ``[AI WARMUP]`` phase entirely.
+    """
+    log = logging.getLogger("clawdbot.preload")
+    exchange = ccxt_async.binance({"enableRateLimit": True})
+    try:
+        for symbol in watchlist:
+            try:
+                ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+                # ohlcv rows: [timestamp, open, high, low, close, volume]
+                for candle in ohlcv:
+                    _, open_price, high, low, close, _volume = candle
+                    if close is not None and symbol in state["prices"]:
+                        state["prices"][symbol].append(float(close))
+                    if high is not None and symbol in state.get("highs", {}):
+                        state["highs"][symbol].append(float(high))
+                    if low is not None and symbol in state.get("lows", {}):
+                        state["lows"][symbol].append(float(low))
+                log.info(
+                    "[ELITE] Preloaded %d historical candles for %s.",
+                    len(ohlcv),
+                    symbol,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[ELITE] Could not preload historical candles for %s: %s",
+                    symbol,
+                    exc,
+                )
+    finally:
+        await exchange.close()
+
+
 async def dashboard_logger(
     paper_executor: PaperExecutor,
     risk_manager: RiskManager,
@@ -509,6 +554,11 @@ async def main() -> None:
                     logger.info("ℹ️ No historical market data found for %s.", sym)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not warm-start for %s: %s", sym, exc)
+
+    # ------------------------------------------------------------------
+    # [ELITE] Fast REST Warmup – pre-fill buffers before WebSocket starts
+    # ------------------------------------------------------------------
+    await preload_historical_data(shared_state, WATCHLIST)
 
     try:
         await asyncio.gather(
