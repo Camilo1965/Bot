@@ -147,6 +147,29 @@ async def market_consumer(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("check_and_close failed: %s", exc)
 
+        elif message.get("type") == "kline":
+            # ----------------------------------------------------------------
+            # Update the prices buffer with 15-minute candle close prices.
+            # Deduplicate by timestamp so each completed candle contributes
+            # exactly one entry – matching the backtester's OHLCV data.
+            # ----------------------------------------------------------------
+            close_price = message.get("close")
+            candle_ts = message.get("timestamp")
+            if close_price is not None and candle_ts is not None:
+                last_ts = state["last_kline_ts"].get(symbol)
+                if candle_ts != last_ts:
+                    state["last_kline_ts"][symbol] = candle_ts
+                    prices_dict: dict[str, deque[float]] = state["prices"]
+                    if symbol in prices_dict:
+                        prices_dict[symbol].append(float(close_price))
+                    logger.info(
+                        "📊 [KLINE] %s – new 15m candle close=%.2f | Buffer: %d/%d",
+                        symbol,
+                        float(close_price),
+                        len(prices_dict.get(symbol, [])),
+                        prices_dict[symbol].maxlen if symbol in prices_dict else 0,
+                    )
+
         elif message.get("type") == "order_book":
             bids: list[Any] = message.get("bids", [])
             asks: list[Any] = message.get("asks", [])
@@ -158,9 +181,6 @@ async def market_consumer(
             )
             if bids and asks:
                 mid_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
-                prices_dict: dict[str, deque[float]] = state["prices"]
-                if symbol in prices_dict:
-                    prices_dict[symbol].append(mid_price)
                 try:
                     await db.insert_market_tick(
                         symbol=symbol,
@@ -404,6 +424,8 @@ async def main() -> None:
         # [PRO] News Filter state
         "sentiment_history": deque(),  # stores (datetime, float) tuples
         "news_hold_until": None,       # datetime | None
+        # Per-symbol last seen kline timestamp for deduplication
+        "last_kline_ts": {symbol: None for symbol in WATCHLIST},
     }
 
     analyzer = SentimentAnalyzer()
