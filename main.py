@@ -23,7 +23,7 @@ import logging
 import json
 import sys
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,16 @@ load_dotenv()
 
 # ── Multi-asset watchlist ─────────────────────────────────────────────────────
 WATCHLIST: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+
+# ── [PRO] News Filter parameters ─────────────────────────────────────────────
+# Maximum allowed sentiment swing within the 10-minute observation window.
+_NEWS_FILTER_VOLATILITY_THRESHOLD: float = 0.4
+# Duration (minutes) of the global HOLD period triggered by the filter.
+_NEWS_FILTER_HOLD_MINUTES: int = 30
+
+# ── [PRO] Weekly Re-trainer ───────────────────────────────────────────────────
+_RETRAINER_DATA_LIMIT: int = 10_000   # price rows to fetch for retraining
+_MODEL_PATH = Path(__file__).parent / "models" / "xgb_live.json"
 
 
 class _JsonFormatter(logging.Formatter):
@@ -189,6 +199,49 @@ async def signal_emitter(
         await asyncio.sleep(interval)
         sentiment: float = state.get("sentiment", 0.0)
 
+        # ------------------------------------------------------------------
+        # [PRO] Advanced News Filter
+        # ------------------------------------------------------------------
+        # Record the current sentiment reading with its timestamp.
+        now = datetime.now(tz=timezone.utc)
+        sentiment_history: deque[tuple[datetime, float]] = state["sentiment_history"]
+        sentiment_history.append((now, sentiment))
+
+        # Prune entries older than the 10-minute observation window.
+        cutoff = now - timedelta(minutes=10)
+        while sentiment_history and sentiment_history[0][0] < cutoff:
+            sentiment_history.popleft()
+
+        # Check for high-volatility sentiment fluctuation.
+        hold_until: datetime | None = state.get("news_hold_until")
+        if len(sentiment_history) >= 2:
+            scores = [s for _, s in sentiment_history]
+            if max(scores) - min(scores) > _NEWS_FILTER_VOLATILITY_THRESHOLD:
+                new_hold_until = now + timedelta(minutes=_NEWS_FILTER_HOLD_MINUTES)
+                # Extend the HOLD window on every new trigger.
+                if hold_until is None or new_hold_until > hold_until:
+                    state["news_hold_until"] = new_hold_until
+                    logger.info(
+                        "[PRO] News Filter triggered – sentiment swing %.4f > %.2f "
+                        "in the last 10 min. Global HOLD until %s.",
+                        max(scores) - min(scores),
+                        _NEWS_FILTER_VOLATILITY_THRESHOLD,
+                        new_hold_until.isoformat(),
+                    )
+
+        # Honour the active HOLD period: skip all signal evaluation.
+        hold_until = state.get("news_hold_until")
+        if hold_until is not None and now < hold_until:
+            remaining = int((hold_until - now).total_seconds() / 60)
+            logger.info(
+                "[PRO] News Filter active – global HOLD in effect (%d min remaining).",
+                remaining,
+            )
+            continue
+        elif hold_until is not None and now >= hold_until:
+            # Clear the expired HOLD.
+            state["news_hold_until"] = None
+
         for symbol in watchlist:
             prices: list[float] = list(state["prices"].get(symbol, []))
 
@@ -236,6 +289,87 @@ async def signal_emitter(
                     logger.warning("Paper trade open failed for %s: %s", symbol, exc)
 
 
+async def weekly_retrainer(
+    predictor: MLPredictor,
+    watchlist: list[str],
+    model_path: Path,
+) -> None:
+    """[PRO] Background task – re-trains the ML model every Sunday at 00:00 UTC.
+
+    On each trigger the function:
+
+    1. Fetches the latest :data:`_RETRAINER_DATA_LIMIT` price rows from
+       TimescaleDB for every symbol in *watchlist*.
+    2. Concatenates the price series and calls :meth:`MLPredictor.warm_start`
+       to re-fit the model.
+    3. Saves the updated model to *model_path* (``models/xgb_live.json``).
+    4. Hot-reloads the saved file back into *predictor* so the running process
+       immediately uses the fresh model without a restart.
+    """
+    log = logging.getLogger("clawdbot.retrainer")
+
+    def _seconds_until_next_sunday_midnight() -> float:
+        """Return the number of seconds until the next Sunday 00:00 UTC."""
+        now = datetime.now(tz=timezone.utc)
+        # isoweekday(): Monday=1 … Sunday=7.  Compute days until the next
+        # Sunday, then set the time component to 00:00:00 on that date.
+        days_until_sunday = (7 - now.isoweekday()) % 7
+        candidate = (now + timedelta(days=days_until_sunday)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        # If the computed candidate is already in the past (e.g. it is Sunday
+        # at 01:00 so candidate fell at Sunday 00:00), advance by one week.
+        if candidate < now:
+            candidate += timedelta(weeks=1)
+        return (candidate - now).total_seconds()
+
+    while True:
+        wait_secs = _seconds_until_next_sunday_midnight()
+        log.info(
+            "[PRO] Weekly Re-trainer sleeping %.1f hours until Sunday 00:00 UTC.",
+            wait_secs / 3600,
+        )
+        await asyncio.sleep(wait_secs)
+
+        log.info("[PRO] Weekly Re-training started – fetching latest market data.")
+        all_prices: list[float] = []
+        for sym in watchlist:
+            try:
+                prices = await db.fetch_market_data(symbol=sym, limit=_RETRAINER_DATA_LIMIT)
+                all_prices.extend(prices)
+                log.info("[PRO] Fetched %d prices for %s.", len(prices), sym)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[PRO] Could not fetch data for %s: %s", sym, exc)
+
+        if len(all_prices) < 50:
+            log.warning(
+                "[PRO] Re-training skipped – only %d price samples available (need ≥ 50).",
+                len(all_prices),
+            )
+            continue
+
+        log.info("[PRO] Re-training model on %d total price samples.", len(all_prices))
+        success = predictor.warm_start(prices=all_prices)
+        if not success:
+            log.warning("[PRO] Re-training failed (warm_start returned False).")
+            continue
+
+        saved = predictor.save_model(model_path)
+        if not saved:
+            log.warning("[PRO] Re-training complete but model could not be saved to %s.", model_path)
+            continue
+
+        # Hot-reload: load the freshly saved model back so inference picks it
+        # up immediately (validates that the file round-trips correctly).
+        reloaded = predictor.load_model(model_path)
+        if reloaded:
+            log.info("[PRO] Weekly Re-training complete – model hot-reloaded from %s.", model_path)
+        else:
+            log.warning(
+                "[PRO] Re-training complete but hot-reload from %s failed.", model_path
+            )
+
+
 async def dashboard_logger(
     paper_executor: PaperExecutor,
     risk_manager: RiskManager,
@@ -267,6 +401,9 @@ async def main() -> None:
     shared_state: dict[str, Any] = {
         "sentiment": 0.0,
         "prices": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
+        # [PRO] News Filter state
+        "sentiment_history": deque(),  # stores (datetime, float) tuples
+        "news_hold_until": None,       # datetime | None
     }
 
     analyzer = SentimentAnalyzer()
@@ -279,7 +416,6 @@ async def main() -> None:
     # ------------------------------------------------------------------
     # Attempt to load a pre-trained model; fall back to warm-start
     # ------------------------------------------------------------------
-    _MODEL_PATH = Path(__file__).parent / "models" / "xgb_live.json"
     model_loaded = predictor.load_model(_MODEL_PATH)
     if model_loaded:
         logger.info("✅ Pre-trained model loaded from %s.", _MODEL_PATH)
@@ -317,6 +453,7 @@ async def main() -> None:
             market_consumer(market_queue, shared_state, paper_executor),
             signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
             dashboard_logger(paper_executor, risk_manager, interval=60),
+            weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
         )
     finally:
         await close_db()
