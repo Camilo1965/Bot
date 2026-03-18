@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 SYMBOL = "BTC/USDT"
 RECONNECT_DELAY = 5  # seconds between reconnection attempts
+OHLCV_TIMEFRAME = "15m"  # candle timeframe used for ML feature calculation
 
 
 class BinanceWebSocketClient:
@@ -51,6 +52,7 @@ class BinanceWebSocketClient:
                 for sym in self.watchlist:
                     tasks.append(asyncio.create_task(self._watch_order_book(sym)))
                     tasks.append(asyncio.create_task(self._watch_trades(sym)))
+                    tasks.append(asyncio.create_task(self._watch_ohlcv(sym)))
                 await asyncio.gather(*tasks)
             except (ccxtpro.NetworkError, ccxtpro.ExchangeError) as exc:
                 logger.warning(
@@ -112,6 +114,30 @@ class BinanceWebSocketClient:
                     "amount": trade.get("amount"),
                     "side": trade.get("side"),
                     "timestamp": trade.get("timestamp"),
+                }
+                await self.queue.put(message)
+
+    async def _watch_ohlcv(self, symbol: str, timeframe: str = OHLCV_TIMEFRAME) -> None:
+        """Watch 15-minute OHLCV klines for *symbol* and push candle messages to queue.
+
+        Each message contains the most recent candle's close price and timestamp.
+        Downstream consumers should deduplicate by timestamp so only one price
+        entry is added per completed candle.
+        """
+        while self._exchange is not None:
+            ohlcv = await self._exchange.watch_ohlcv(symbol, timeframe)
+            if ohlcv:
+                candle = ohlcv[-1]  # [timestamp, open, high, low, close, volume]
+                message: dict[str, Any] = {
+                    "type": "kline",
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "timestamp": candle[0],
+                    "open": candle[1],
+                    "high": candle[2],
+                    "low": candle[3],
+                    "close": candle[4],
+                    "volume": candle[5],
                 }
                 await self.queue.put(message)
 
