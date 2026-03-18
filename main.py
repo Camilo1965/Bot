@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import ccxt.async_support as ccxt_async
 from dotenv import load_dotenv
 
 from data_ingestion.news_client import DEFAULT_FEED_URL, run_news_client
@@ -51,6 +52,9 @@ _NEWS_FILTER_HOLD_MINUTES: int = 30
 # ── [PRO] Weekly Re-trainer ───────────────────────────────────────────────────
 _RETRAINER_DATA_LIMIT: int = 10_000   # price rows to fetch for retraining
 _MODEL_PATH = Path(__file__).parent / "models" / "xgb_live.json"
+
+# ── [ELITE] Funding Rate fetcher ──────────────────────────────────────────────
+_FUNDING_RATE_INTERVAL_HOURS: int = 4   # how often to refresh funding rates
 
 
 class _JsonFormatter(logging.Formatter):
@@ -179,6 +183,11 @@ async def market_consumer(
                 if isinstance(raw_ts, (int, float))
                 else datetime.now(tz=timezone.utc)
             )
+
+            # [ELITE] Store the latest OBI ratio in shared state
+            obi = message.get("obi", 0.0)
+            state["obi"][symbol] = obi
+
             if bids and asks:
                 mid_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
                 try:
@@ -273,8 +282,11 @@ async def signal_emitter(
                 )
                 continue
 
-            signal = predictor.generate_signal(prices, sentiment)
-            win_prob: float = predictor.predict_proba(prices, sentiment) or 0.0
+            obi_ratio: float = state["obi"][symbol]
+            funding_rate: float = state["funding_rates"][symbol]
+
+            signal = predictor.generate_signal(prices, sentiment, obi_ratio, funding_rate)
+            win_prob: float = predictor.predict_proba(prices, sentiment, obi_ratio, funding_rate) or 0.0
 
             logger.info(
                 "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d | Sentiment: %.4f",
@@ -390,6 +402,40 @@ async def weekly_retrainer(
             )
 
 
+async def funding_rate_fetcher(
+    state: dict[str, Any],
+    watchlist: list[str],
+    interval_hours: int = _FUNDING_RATE_INTERVAL_HOURS,
+) -> None:
+    """[ELITE] Background task – refresh Binance perpetual funding rates every *interval_hours*.
+
+    Funding rates act as a Greed/Fear indicator:
+    * A high positive rate signals market greed → the ML predictor applies a BUY penalty.
+    * A negative rate signals market fear → can be used to boost BUY confidence.
+
+    Rates are stored in ``state["funding_rates"]`` keyed by symbol.
+    """
+    log = logging.getLogger("clawdbot.funding")
+    exchange = ccxt_async.binance({"enableRateLimit": True})
+    try:
+        while True:
+            log.info(
+                "[ELITE] Funding Rate Fetcher – refreshing rates for %s.", watchlist
+            )
+            for sym in watchlist:
+                try:
+                    # fetch_funding_rate returns a dict with 'fundingRate' key
+                    data = await exchange.fetch_funding_rate(sym)
+                    rate = float(data.get("fundingRate") or 0.0)
+                    state["funding_rates"][sym] = rate
+                    log.info("[ELITE] Funding rate %s = %.6f", sym, rate)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("[ELITE] Could not fetch funding rate for %s: %s", sym, exc)
+            await asyncio.sleep(interval_hours * 3600)
+    finally:
+        await exchange.close()
+
+
 async def dashboard_logger(
     paper_executor: PaperExecutor,
     risk_manager: RiskManager,
@@ -426,6 +472,10 @@ async def main() -> None:
         "news_hold_until": None,       # datetime | None
         # Per-symbol last seen kline timestamp for deduplication
         "last_kline_ts": {symbol: None for symbol in WATCHLIST},
+        # [ELITE] Order Book Imbalance per symbol
+        "obi": {symbol: 0.0 for symbol in WATCHLIST},
+        # [ELITE] Funding rates per symbol (updated every 4 h)
+        "funding_rates": {symbol: 0.0 for symbol in WATCHLIST},
     }
 
     analyzer = SentimentAnalyzer()
@@ -436,36 +486,40 @@ async def main() -> None:
     paper_executor = PaperExecutor(db=db, risk_manager=risk_manager)
 
     # ------------------------------------------------------------------
-    # Attempt to load a pre-trained model; fall back to warm-start
+    # [ELITE] Fast REST Warmup – download last 100 15m candles per symbol
     # ------------------------------------------------------------------
     model_loaded = predictor.load_model(_MODEL_PATH)
     if model_loaded:
         logger.info("✅ Pre-trained model loaded from %s.", _MODEL_PATH)
-    else:
-        logger.info("ℹ️ No pre-trained model found – will warm-start from historical DB data.")
+
+    logger.info("[ELITE] Fast REST Warmup – fetching last 100 15m candles for each symbol...")
+    rest_exchange = ccxt_async.binance({"enableRateLimit": True})
+    try:
         for sym in WATCHLIST:
             try:
-                historical_prices = await db.fetch_market_data(symbol=sym, limit=500)
-                if historical_prices:
-                    shared_state["prices"][sym].extend(historical_prices)
+                ohlcv = await rest_exchange.fetch_ohlcv(sym, timeframe="15m", limit=100)
+                if ohlcv:
+                    close_prices = [float(candle[4]) for candle in ohlcv]
+                    shared_state["prices"][sym].extend(close_prices)
+                    logger.info(
+                        "[ELITE] Warmup complete for %s – %d candles loaded into price buffer.",
+                        sym,
+                        len(close_prices),
+                    )
                     # Train the model once using the first available symbol's data
                     if not predictor.is_trained:
-                        predictor.warm_start(prices=historical_prices)
+                        predictor.warm_start(prices=close_prices)
                         logger.info(
-                            "✅ ML model warm-started with %d historical prices for %s.",
-                            len(historical_prices),
+                            "[ELITE] ML model warm-started with %d REST candles for %s.",
+                            len(close_prices),
                             sym,
-                        )
-                    else:
-                        logger.info(
-                            "✅ Historical prices loaded for %s (%d ticks).",
-                            sym,
-                            len(historical_prices),
                         )
                 else:
-                    logger.info("ℹ️ No historical market data found for %s.", sym)
+                    logger.warning("[ELITE] No OHLCV data returned for %s.", sym)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Could not warm-start for %s: %s", sym, exc)
+                logger.warning("[ELITE] REST warmup failed for %s: %s", sym, exc)
+    finally:
+        await rest_exchange.close()
 
     try:
         await asyncio.gather(
@@ -476,6 +530,7 @@ async def main() -> None:
             signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
             dashboard_logger(paper_executor, risk_manager, interval=60),
             weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
+            funding_rate_fetcher(shared_state, watchlist=WATCHLIST),
         )
     finally:
         await close_db()

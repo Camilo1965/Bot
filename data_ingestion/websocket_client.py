@@ -89,15 +89,30 @@ class BinanceWebSocketClient:
     # ------------------------------------------------------------------
 
     async def _watch_order_book(self, symbol: str) -> None:
-        """Continuously receive L2 order-book snapshots for *symbol* and push to queue."""
+        """Continuously receive L2 order-book snapshots for *symbol* and push to queue.
+
+        [ELITE] Calculates the Order Book Imbalance (OBI) ratio from the top-5
+        levels: ``obi = (bid_volume - ask_volume) / (bid_volume + ask_volume)``.
+        A positive value signals more buying pressure; negative more selling.
+        """
         while self._exchange is not None:
             order_book = await self._exchange.watch_order_book(symbol)
+            bids = order_book["bids"][:5]
+            asks = order_book["asks"][:5]
+
+            # [ELITE] Order Book Imbalance calculation
+            bid_vol = sum(float(b[1]) for b in bids)
+            ask_vol = sum(float(a[1]) for a in asks)
+            total_vol = bid_vol + ask_vol
+            obi_ratio = (bid_vol - ask_vol) / total_vol if total_vol > 0 else 0.0
+
             message: dict[str, Any] = {
                 "type": "order_book",
                 "symbol": symbol,
-                "bids": order_book["bids"][:5],
-                "asks": order_book["asks"][:5],
+                "bids": bids,
+                "asks": asks,
                 "timestamp": order_book.get("timestamp"),
+                "obi": obi_ratio,
             }
             await self.queue.put(message)
 

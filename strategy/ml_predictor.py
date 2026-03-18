@@ -33,6 +33,18 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
+# [ELITE] ADX thresholds for market-regime detection
+_ADX_RANGING_THRESHOLD = 20   # ADX < 20 → ranging market (reduce momentum weight)
+_ADX_TRENDING_THRESHOLD = 25  # ADX > 25 → trending market (increase RSI weight)
+_ADX_PERIOD = 14
+
+# [ELITE] Funding-rate penalty: large positive funding → market overheated (penalise BUY)
+_FUNDING_RATE_GREED_THRESHOLD = 0.001   # 0.1% per 8h – above this, apply greed penalty
+_FUNDING_RATE_PENALTY = 0.05            # subtract from probability when greedy
+
+# [ELITE] OBI scaling: each unit of imbalance shifts raw probability by this amount
+_OBI_ADJUSTMENT_FACTOR = 0.05          # e.g. OBI=1.0 → probability shifts ±0.05
+
 logger = logging.getLogger(__name__)
 
 # Signal thresholds
@@ -86,6 +98,40 @@ class MLPredictor:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _compute_adx(self, prices: list[float]) -> float:
+        """[ELITE] Compute the Average Directional Index (ADX) for *prices*.
+
+        Uses Wilder's smoothing over ``_ADX_PERIOD`` bars.  Returns ``0.0``
+        when there is insufficient history.
+        """
+        if len(prices) < _ADX_PERIOD * 2:
+            # Wilder's ADX needs at least 2 × _ADX_PERIOD bars: one period for the
+            # directional movement and a second period for the ADX smoothing pass.
+            return 0.0
+
+        close = pd.Series(prices, dtype=float)
+
+        # True Range (using close-only proxy: TR = abs(close_t - close_t-1))
+        tr = close.diff().abs()
+
+        # Directional Movement (close-only proxy)
+        dm_plus = close.diff().clip(lower=0)
+        dm_minus = (-close.diff()).clip(lower=0)
+
+        # Wilder smoothing
+        atr = tr.ewm(alpha=1 / _ADX_PERIOD, min_periods=_ADX_PERIOD, adjust=False).mean()
+        smooth_plus = dm_plus.ewm(alpha=1 / _ADX_PERIOD, min_periods=_ADX_PERIOD, adjust=False).mean()
+        smooth_minus = dm_minus.ewm(alpha=1 / _ADX_PERIOD, min_periods=_ADX_PERIOD, adjust=False).mean()
+
+        di_plus = (smooth_plus / atr.replace(0, np.nan)) * 100
+        di_minus = (smooth_minus / atr.replace(0, np.nan)) * 100
+
+        dx = ((di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)) * 100
+        adx_series = dx.ewm(alpha=1 / _ADX_PERIOD, min_periods=_ADX_PERIOD, adjust=False).mean()
+
+        adx_val = float(adx_series.iloc[-1])
+        return 0.0 if np.isnan(adx_val) else adx_val
+
     def _compute_features(self, prices: list[float], sentiment: float) -> list[float]:
         """Compute technical indicators and return a feature vector.
 
@@ -131,6 +177,23 @@ class MLPredictor:
         mom_series = series.pct_change(_MOMENTUM_PERIOD) * 100
         mom_val = float(mom_series.iloc[-1])
         momentum = 0.0 if np.isnan(mom_val) else mom_val
+
+        # [ELITE] ADX-based market-regime adjustment
+        adx = self._compute_adx(prices)
+        if adx > 0:
+            if adx < _ADX_RANGING_THRESHOLD:
+                # Ranging market – reduce momentum influence
+                momentum *= 0.5
+                logger.debug(
+                    "[ELITE] ADX=%.1f (Ranging) – Momentum weight reduced to 50%%.", adx
+                )
+            elif adx > _ADX_TRENDING_THRESHOLD:
+                # Trending market – amplify RSI contribution
+                rsi_distance = rsi - 50.0  # signed distance from neutral
+                rsi = 50.0 + rsi_distance * 1.25
+                logger.debug(
+                    "[ELITE] ADX=%.1f (Trending) – RSI weight increased by 25%%.", adx
+                )
 
         return [float(sentiment), rsi, sma_ratio, volatility, momentum]
 
@@ -290,6 +353,8 @@ class MLPredictor:
         self,
         prices: list[float],
         sentiment_score: float = 0.0,
+        obi_ratio: float = 0.0,
+        funding_rate: float = 0.0,
     ) -> float | None:
         """Return the probability of an upward price move.
 
@@ -299,6 +364,10 @@ class MLPredictor:
                          At least ``_MIN_PRICES_FOR_INFERENCE`` (20) values are
                          required.
         sentiment_score: Current VADER compound score in [-1, +1].
+        obi_ratio:       [ELITE] Order Book Imbalance in [-1, +1].
+                         Positive values indicate more bid volume (buying pressure).
+        funding_rate:    [ELITE] Current perpetual funding rate.
+                         A high positive rate signals market overheating (greed penalty).
 
         Returns
         -------
@@ -321,14 +390,30 @@ class MLPredictor:
         X = pd.DataFrame([features], columns=_FEATURE_COLS)
         proba: float = float(self._model.predict_proba(X)[0][1])
 
+        # [ELITE] OBI adjustment: shift probability toward buy/sell pressure
+        if obi_ratio != 0.0:
+            proba = max(0.0, min(1.0, proba + obi_ratio * _OBI_ADJUSTMENT_FACTOR))
+            logger.debug("[ELITE] OBI=%.4f applied – adjusted proba=%.4f", obi_ratio, proba)
+
+        # [ELITE] Funding rate Greed/Fear penalty
+        if funding_rate > _FUNDING_RATE_GREED_THRESHOLD:
+            proba = max(0.0, proba - _FUNDING_RATE_PENALTY)
+            logger.info(
+                "[ELITE] Funding rate=%.5f (Greed) – BUY probability penalised by %.2f.",
+                funding_rate,
+                _FUNDING_RATE_PENALTY,
+            )
+
+        adx = self._compute_adx(prices)
         rsi = features[1]
         volatility = features[3]
         momentum = features[4]
         logger.info(
-            "[INDICATORS] RSI: %.1f | Volatility: %.1f | Momentum: %.1f%%",
+            "[INDICATORS] RSI: %.1f | Volatility: %.1f | Momentum: %.1f%% | ADX: %.1f",
             rsi,
             volatility,
             momentum,
+            adx,
         )
         logger.debug("Predicted probability=%.4f", proba)
         return proba
@@ -337,6 +422,8 @@ class MLPredictor:
         self,
         prices: list[float],
         sentiment_score: float = 0.0,
+        obi_ratio: float = 0.0,
+        funding_rate: float = 0.0,
     ) -> Signal:
         """Generate a trading signal (BUY / SELL / HOLD).
 
@@ -344,6 +431,8 @@ class MLPredictor:
         ----------
         prices:          Recent mid-prices in chronological order.
         sentiment_score: Current VADER compound score in [-1, +1].
+        obi_ratio:       [ELITE] Order Book Imbalance in [-1, +1].
+        funding_rate:    [ELITE] Current perpetual funding rate.
 
         Returns
         -------
@@ -353,7 +442,7 @@ class MLPredictor:
         * probability < 0.3 AND sentiment < -0.3  → SELL
         * otherwise                               → HOLD
         """
-        probability = self.predict_proba(prices, sentiment_score)
+        probability = self.predict_proba(prices, sentiment_score, obi_ratio, funding_rate)
 
         if probability is None:
             logger.info("Signal=HOLD (model not ready or insufficient data)")
@@ -367,9 +456,11 @@ class MLPredictor:
             signal = "HOLD"
 
         logger.info(
-            "Signal=%s  probability=%.4f  sentiment=%.4f",
+            "Signal=%s  probability=%.4f  sentiment=%.4f  obi=%.4f  funding=%.6f",
             signal,
             probability,
             sentiment_score,
+            obi_ratio,
+            funding_rate,
         )
         return signal
