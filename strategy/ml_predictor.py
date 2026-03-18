@@ -257,6 +257,31 @@ class MLPredictor:
             logger.warning("load_model failed (%s): %s", path, exc)
             return False
 
+    def save_model(self, filepath: str | Path) -> bool:
+        """Save the current XGBoost model to *filepath* in JSON format.
+
+        Parameters
+        ----------
+        filepath: Destination path (e.g. ``models/xgb_live.json``).
+
+        Returns
+        -------
+        ``True`` on success, ``False`` if the model is untrained or an error
+        occurs.
+        """
+        if not self._is_trained:
+            logger.warning("save_model: model is not trained – nothing to save.")
+            return False
+        path = Path(filepath)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._model.save_model(str(path))
+            logger.info("[PRO] Model saved to %s.", path)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[PRO] save_model failed (%s): %s", path, exc)
+            return False
+
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------

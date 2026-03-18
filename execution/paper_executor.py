@@ -12,6 +12,10 @@ A position is closed automatically when the current market price hits either:
 
 * **Take Profit** (TP): price rises ≥ 3 % above entry price.
 * **Stop Loss** (SL): price falls ≥ 1.5 % below entry price.
+* **Trailing Stop** (TS): once a position reaches 1.5 % profit a trailing
+  stop is activated that follows the price at a 1 % distance from the
+  running peak.  If the price then drops 1 % from its peak the position is
+  closed to lock in profit.
 
 Multi-asset support: up to ``risk_manager.max_positions`` independent
 positions may be open simultaneously, one per symbol.  Attempting to open a
@@ -26,6 +30,12 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from risk.risk_manager import STOP_LOSS_PCT, TAKE_PROFIT_PCT, RiskManager
+
+# ── [PRO] Trailing Stop parameters ───────────────────────────────────────────
+# Profit level at which the trailing stop is activated (1.5 %)
+_TRAILING_STOP_ACTIVATION_PCT: float = 0.015
+# Distance that the trailing stop maintains below the running peak price (1 %)
+_TRAILING_STOP_DISTANCE_PCT: float = 0.01
 
 if TYPE_CHECKING:
     from database.db_manager import DatabaseManager
@@ -42,6 +52,13 @@ class OpenPosition:
     position_size: float
     entry_time: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
     trade_id: int | None = None
+    # [PRO] Trailing Stop state
+    peak_price: float = field(init=False)
+    trailing_stop_active: bool = False
+
+    def __post_init__(self) -> None:
+        # Initialise peak_price to entry_price so it is always defined
+        self.peak_price = self.entry_price
 
 
 class PaperExecutor:
@@ -181,6 +198,43 @@ class PaperExecutor:
 
         pos = self.open_positions[sym]
         price_change_pct = (current_price - pos.entry_price) / pos.entry_price
+
+        # ------------------------------------------------------------------
+        # [PRO] Trailing Stop logic
+        # ------------------------------------------------------------------
+        # 1. Update the running peak price whenever the price makes a new high.
+        if current_price > pos.peak_price:
+            pos.peak_price = current_price
+
+        # 2. Activate the trailing stop once the position crosses the 1.5 %
+        #    profit threshold for the first time.
+        if not pos.trailing_stop_active and price_change_pct >= _TRAILING_STOP_ACTIVATION_PCT:
+            pos.trailing_stop_active = True
+            logger.info(
+                "[PRO] Trailing Stop ACTIVATED  symbol=%s  entry=%.2f  current=%.2f  profit=%.2f%%",
+                sym,
+                pos.entry_price,
+                current_price,
+                price_change_pct * 100,
+            )
+
+        # 3. When the trailing stop is active, close the position if the price
+        #    drops more than TRAILING_STOP_DISTANCE_PCT below the peak.
+        if pos.trailing_stop_active:
+            drop_from_peak = (pos.peak_price - current_price) / pos.peak_price
+            if drop_from_peak >= _TRAILING_STOP_DISTANCE_PCT:
+                pnl = price_change_pct * pos.position_size
+                ts = timestamp or datetime.now(tz=timezone.utc)
+                await self._close_position(symbol=sym, exit_price=current_price, exit_time=ts, pnl=pnl)
+                logger.info(
+                    "[PRO] TRADE CLOSED [TS]  symbol=%s  entry=%.2f  peak=%.2f  exit=%.2f  pnl=%.4f",
+                    sym,
+                    pos.entry_price,
+                    pos.peak_price,
+                    current_price,
+                    pnl,
+                )
+                return pnl
 
         hit_take_profit = price_change_pct >= TAKE_PROFIT_PCT
         hit_stop_loss = price_change_pct <= -STOP_LOSS_PCT
