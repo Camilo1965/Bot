@@ -17,6 +17,13 @@ A half-Kelly multiplier (0.5) is applied to reduce variance::
 
 When the Kelly fraction is zero or negative the trade has a non-positive
 expected value and no position is opened.
+
+Multi-asset risk controls:
+
+* ``max_positions`` limits the number of simultaneously open positions.
+* Each trade's position size is capped at ``balance / max_positions`` so
+  that no single trade can consume more than an equal share of the
+  portfolio.
 """
 
 from __future__ import annotations
@@ -31,6 +38,8 @@ TAKE_PROFIT_PCT: float = 0.04   # 4.0 %
 _REWARD_RISK_RATIO: float = TAKE_PROFIT_PCT / STOP_LOSS_PCT   # 4.0
 _HALF_KELLY: float = 0.5        # Half-Kelly multiplier
 
+MAX_POSITIONS: int = 3          # Maximum simultaneous open positions
+
 
 class RiskManager:
     """Calculate position sizes using the Fractional (Half) Kelly Criterion.
@@ -40,10 +49,19 @@ class RiskManager:
     initial_balance:
         Starting simulated balance in quote currency (e.g. USDT).
         Defaults to 10 000.
+    max_positions:
+        Maximum number of positions that may be open at the same time.
+        Defaults to 3.
     """
 
-    def __init__(self, initial_balance: float = 10_000.0) -> None:
+    def __init__(
+        self,
+        initial_balance: float = 10_000.0,
+        max_positions: int = MAX_POSITIONS,
+    ) -> None:
         self.balance: float = initial_balance
+        self.max_positions: int = max_positions
+        self._open_count: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -55,6 +73,10 @@ class RiskManager:
         Uses the Half-Kelly Criterion.  Returns ``0.0`` when the expected
         value is non-positive (Kelly fraction ≤ 0).
 
+        The position size is also capped at ``balance / max_positions`` so
+        that no single trade consumes more than a fair share of the
+        portfolio.
+
         Parameters
         ----------
         win_probability:
@@ -63,15 +85,36 @@ class RiskManager:
         b = _REWARD_RISK_RATIO
         kelly = (win_probability * b - (1.0 - win_probability)) / b
         fractional_kelly = _HALF_KELLY * max(kelly, 0.0)
-        position_size = self.balance * fractional_kelly
+        # Cap allocation to an equal share of the current balance
+        max_allocation = self.balance / self.max_positions
+        position_size = min(self.balance * fractional_kelly, max_allocation)
         logger.debug(
-            "Kelly=%.4f  fractional=%.4f  position_size=%.2f  balance=%.2f",
+            "Kelly=%.4f  fractional=%.4f  position_size=%.2f  balance=%.2f  max_allocation=%.2f",
             kelly,
             fractional_kelly,
             position_size,
             self.balance,
+            max_allocation,
         )
         return position_size
+
+    def can_open_position(self) -> bool:
+        """Return *True* if another position may be opened (below max_positions)."""
+        return self._open_count < self.max_positions
+
+    def register_open(self) -> None:
+        """Increment the open-position counter (call when a trade is opened)."""
+        self._open_count += 1
+
+    def register_close(self) -> None:
+        """Decrement the open-position counter (call when a trade is closed)."""
+        if self._open_count == 0:
+            logger.warning(
+                "register_close called when open_count is already 0 – "
+                "possible mismatched open/close calls."
+            )
+            return
+        self._open_count -= 1
 
     def has_sufficient_balance(self, position_size: float) -> bool:
         """Return *True* if the current balance can cover *position_size*."""
@@ -84,3 +127,4 @@ class RiskManager:
     def credit(self, amount: float) -> None:
         """Add *amount* to the simulated balance (trade close + PnL)."""
         self.balance += amount
+

@@ -12,6 +12,10 @@ A position is closed automatically when the current market price hits either:
 
 * **Take Profit** (TP): price rises ≥ 3 % above entry price.
 * **Stop Loss** (SL): price falls ≥ 1.5 % below entry price.
+
+Multi-asset support: up to ``risk_manager.max_positions`` independent
+positions may be open simultaneously, one per symbol.  Attempting to open a
+second position on the same symbol is silently rejected.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ class OpenPosition:
 
 
 class PaperExecutor:
-    """Simulate order execution for a single symbol.
+    """Simulate order execution for multiple symbols simultaneously.
 
     Parameters
     ----------
@@ -50,9 +54,11 @@ class PaperExecutor:
         persist completed trades.
     risk_manager:
         :class:`~risk.risk_manager.RiskManager` instance that tracks the
-        simulated balance and computes position sizes.
+        simulated balance, computes position sizes, and enforces the
+        maximum number of concurrent open positions.
     symbol:
-        Trading pair (e.g. ``"BTC/USDT"``).
+        Default trading pair (e.g. ``"BTC/USDT"``).  Used when callers do
+        not explicitly pass a *symbol* argument.
     """
 
     def __init__(
@@ -64,7 +70,7 @@ class PaperExecutor:
         self._db = db
         self._risk = risk_manager
         self.symbol = symbol
-        self.open_position: OpenPosition | None = None
+        self.open_positions: dict[str, OpenPosition] = {}
         self.total_pnl: float = 0.0
 
     # ------------------------------------------------------------------
@@ -75,12 +81,16 @@ class PaperExecutor:
         self,
         entry_price: float,
         win_probability: float,
+        symbol: str | None = None,
         timestamp: datetime | None = None,
     ) -> bool:
         """Size and open a new paper trade using the Kelly Criterion.
 
-        Returns *False* (and does nothing) if a position is already open or
-        the simulated balance is insufficient.
+        Returns *False* (and does nothing) if:
+
+        * A position for *symbol* is already open.
+        * The maximum number of concurrent positions has been reached.
+        * The simulated balance is insufficient.
 
         Parameters
         ----------
@@ -88,11 +98,22 @@ class PaperExecutor:
             Current market price at which the trade is entered.
         win_probability:
             ML-predicted probability of a profitable outcome (0–1).
+        symbol:
+            Trading pair to open.  Defaults to ``self.symbol``.
         timestamp:
             Trade entry time (UTC).  Defaults to *now*.
         """
-        if self.open_position is not None:
-            logger.debug("Trade skipped – a position is already open.")
+        sym = symbol or self.symbol
+
+        if sym in self.open_positions:
+            logger.debug("Trade skipped – a position for %s is already open.", sym)
+            return False
+
+        if not self._risk.can_open_position():
+            logger.info(
+                "Trade skipped – max open positions (%d) reached.",
+                self._risk.max_positions,
+            )
             return False
 
         position_size = self._risk.calculate_position_size(win_probability)
@@ -106,15 +127,16 @@ class PaperExecutor:
 
         ts = timestamp or datetime.now(tz=timezone.utc)
         self._risk.deduct(position_size)
+        self._risk.register_open()
 
         trade_id = await self._db.insert_open_trade(
-            symbol=self.symbol,
+            symbol=sym,
             entry_price=entry_price,
             position_size=position_size,
             entry_time=ts,
         )
-        self.open_position = OpenPosition(
-            symbol=self.symbol,
+        self.open_positions[sym] = OpenPosition(
+            symbol=sym,
             entry_price=entry_price,
             position_size=position_size,
             entry_time=ts,
@@ -122,7 +144,7 @@ class PaperExecutor:
         )
         logger.info(
             "TRADE OPENED  symbol=%s  entry_price=%.2f  size=%.2f  id=%s  balance=%.2f",
-            self.symbol,
+            sym,
             entry_price,
             position_size,
             trade_id,
@@ -133,20 +155,31 @@ class PaperExecutor:
     async def check_and_close(
         self,
         current_price: float,
+        symbol: str | None = None,
         timestamp: datetime | None = None,
     ) -> float | None:
-        """Check whether *current_price* triggers the SL or TP threshold.
+        """Check whether *current_price* triggers the SL or TP threshold for *symbol*.
 
         If either threshold is reached the position is closed, the trade is
         persisted to the database, and the realised PnL is returned.
 
-        Returns ``None`` when no position is open or neither threshold has
-        been reached yet.
+        Returns ``None`` when no position for *symbol* is open or neither
+        threshold has been reached yet.
+
+        Parameters
+        ----------
+        current_price:
+            Latest market price to evaluate against open positions.
+        symbol:
+            Trading pair to check.  Defaults to ``self.symbol``.
+        timestamp:
+            Evaluation time (UTC).  Defaults to *now*.
         """
-        if self.open_position is None:
+        sym = symbol or self.symbol
+        if sym not in self.open_positions:
             return None
 
-        pos = self.open_position
+        pos = self.open_positions[sym]
         price_change_pct = (current_price - pos.entry_price) / pos.entry_price
 
         hit_take_profit = price_change_pct >= TAKE_PROFIT_PCT
@@ -157,7 +190,7 @@ class PaperExecutor:
             pnl = price_change_pct * pos.position_size
             ts = timestamp or datetime.now(tz=timezone.utc)
 
-            await self._close_position(exit_price=current_price, exit_time=ts, pnl=pnl)
+            await self._close_position(symbol=sym, exit_price=current_price, exit_time=ts, pnl=pnl)
 
             logger.info(
                 "TRADE CLOSED [%s]  symbol=%s  entry=%.2f  exit=%.2f  pnl=%.4f",
@@ -177,13 +210,19 @@ class PaperExecutor:
 
     async def _close_position(
         self,
+        symbol: str,
         exit_price: float,
         exit_time: datetime,
         pnl: float,
     ) -> None:
-        """Persist the closed trade, update balance, and clear open position."""
-        pos = self.open_position
-        assert pos is not None  # noqa: S101 – guaranteed by caller
+        """Persist the closed trade, update balance, and remove the open position."""
+        pos = self.open_positions.get(symbol)
+        if pos is None:
+            logger.warning(
+                "_close_position called for %s but no open position found – skipping.",
+                symbol,
+            )
+            return
 
         if pos.trade_id is not None:
             await self._db.close_trade(
@@ -195,5 +234,7 @@ class PaperExecutor:
 
         # Credit back the original stake plus any PnL (positive or negative)
         self._risk.credit(pos.position_size + pnl)
+        self._risk.register_close()
         self.total_pnl += pnl
-        self.open_position = None
+        del self.open_positions[symbol]
+

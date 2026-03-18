@@ -3,7 +3,8 @@ data_ingestion.websocket_client
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Connects to Binance via ccxt.pro WebSockets and feeds live L2 order-book
-snapshots and trade events for BTC/USDT into an asyncio.Queue.
+snapshots and trade events for all symbols in the watchlist into an
+asyncio.Queue.
 """
 
 from __future__ import annotations
@@ -21,15 +22,17 @@ RECONNECT_DELAY = 5  # seconds between reconnection attempts
 
 
 class BinanceWebSocketClient:
-    """Streams L2 order-book and trades for *symbol* into *queue*."""
+    """Streams L2 order-book and trades for every symbol in *watchlist* into *queue*."""
 
     def __init__(
         self,
         queue: asyncio.Queue[dict[str, Any]],
+        watchlist: list[str] | None = None,
         symbol: str = SYMBOL,
     ) -> None:
         self.queue = queue
-        self.symbol = symbol
+        # *watchlist* takes priority; fall back to the legacy *symbol* parameter
+        self.watchlist: list[str] = watchlist if watchlist is not None else [symbol]
         self._exchange: ccxtpro.binance | None = None
 
     # ------------------------------------------------------------------
@@ -37,18 +40,17 @@ class BinanceWebSocketClient:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        """Start both stream coroutines and keep them alive on errors."""
+        """Start stream coroutines for every watchlist symbol and keep them alive on errors."""
         while True:
             self._exchange = ccxtpro.binance({"enableRateLimit": True})
             tasks: list[asyncio.Task[None]] = []
             try:
                 logger.info(
-                    "Connecting to Binance WebSocket streams for %s", self.symbol
+                    "Connecting to Binance WebSocket streams for %s", self.watchlist
                 )
-                tasks = [
-                    asyncio.create_task(self._watch_order_book()),
-                    asyncio.create_task(self._watch_trades()),
-                ]
+                for sym in self.watchlist:
+                    tasks.append(asyncio.create_task(self._watch_order_book(sym)))
+                    tasks.append(asyncio.create_task(self._watch_trades(sym)))
                 await asyncio.gather(*tasks)
             except (ccxtpro.NetworkError, ccxtpro.ExchangeError) as exc:
                 logger.warning(
@@ -84,27 +86,27 @@ class BinanceWebSocketClient:
     # Private helpers
     # ------------------------------------------------------------------
 
-    async def _watch_order_book(self) -> None:
-        """Continuously receive L2 order-book snapshots and push to queue."""
+    async def _watch_order_book(self, symbol: str) -> None:
+        """Continuously receive L2 order-book snapshots for *symbol* and push to queue."""
         while self._exchange is not None:
-            order_book = await self._exchange.watch_order_book(self.symbol)
+            order_book = await self._exchange.watch_order_book(symbol)
             message: dict[str, Any] = {
                 "type": "order_book",
-                "symbol": self.symbol,
+                "symbol": symbol,
                 "bids": order_book["bids"][:5],
                 "asks": order_book["asks"][:5],
                 "timestamp": order_book.get("timestamp"),
             }
             await self.queue.put(message)
 
-    async def _watch_trades(self) -> None:
-        """Continuously receive trade events and push to queue."""
+    async def _watch_trades(self, symbol: str) -> None:
+        """Continuously receive trade events for *symbol* and push to queue."""
         while self._exchange is not None:
-            trades = await self._exchange.watch_trades(self.symbol)
+            trades = await self._exchange.watch_trades(symbol)
             for trade in trades:
                 message: dict[str, Any] = {
                     "type": "trade",
-                    "symbol": self.symbol,
+                    "symbol": symbol,
                     "id": trade.get("id"),
                     "price": trade.get("price"),
                     "amount": trade.get("amount"),
