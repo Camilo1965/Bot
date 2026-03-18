@@ -11,6 +11,30 @@ Signal generation rules
 * probability < 0.3 AND sentiment_score < -0.3  → **SELL**
 * otherwise                                      → **HOLD**
 
+Elite Quant additions
+----------------------
+* **Order Book Imbalance (OBI)**: ``obi_ratio`` = total bid volume / total ask
+  volume across the top-5 depth levels.  Values > 1 indicate buy-side
+  pressure; values < 1 indicate sell-side pressure.
+
+* **Market Regime Classifier** (ADX-based):
+
+  - ADX > 25 (trending market): Trend-Following mode – BUY requires RSI > 50
+    AND positive momentum; SELL requires RSI < 50 AND negative momentum.
+  - ADX < 20 (range-bound market): Mean-Reversion mode – BUY triggered by RSI
+    oversold (< 35); SELL triggered by RSI overbought (> 65).
+  - 20 ≤ ADX ≤ 25: standard ML signal is used without regime adjustment.
+
+* **Funding Rate Bias**:
+
+  - lastFundingRate > +0.0003 (> +0.03 %, extreme greed): Short-Bias penalty –
+    a BUY signal is demoted to HOLD.
+  - lastFundingRate < -0.0003 (< -0.03 %, extreme fear): Long-Bias bonus – the
+    BUY signal is retained and flagged as ``[ELITE]``.
+
+When any of the Elite factors influences the final signal, the log line is
+prefixed with ``[ELITE]``.
+
 The model supports "warm-starting" from historical price data already stored
 in TimescaleDB via :meth:`MLPredictor.warm_start`.
 
@@ -48,12 +72,36 @@ _PREDICTION_HORIZON = 5
 _SMA_PERIOD = 20
 _RSI_PERIOD = 14
 _MOMENTUM_PERIOD = 5
+_ADX_PERIOD = 14
+_ATR_PERIOD = 14
+
+# Market Regime thresholds (ADX-based)
+_ADX_TREND_THRESHOLD = 25.0    # above → trending market (trend-following mode)
+_ADX_RANGE_THRESHOLD = 20.0    # below → range-bound market (mean-reversion mode)
+_RSI_OVERSOLD = 35.0           # mean-reversion BUY trigger
+_RSI_OVERBOUGHT = 65.0         # mean-reversion SELL trigger
+
+# Funding rate bias thresholds (decimal form: 0.0003 = 0.03 %)
+_FUNDING_RATE_EXTREME_GREED = 0.0003   # > this → Short-Bias penalty on BUY
+_FUNDING_RATE_EXTREME_FEAR = -0.0003   # < this → Long-Bias bonus on BUY
 
 # Minimum prices needed for inference (SMA_20 requires 20 observations)
 _MIN_PRICES_FOR_INFERENCE = _SMA_PERIOD
 
+# Default ADX value used when OHLCV data is unavailable (neutral – no regime)
+_ADX_NEUTRAL_DEFAULT = 25.0
+
 # Feature column order expected by the model
-_FEATURE_COLS = ["sentiment", "rsi", "sma_ratio", "volatility", "momentum"]
+_FEATURE_COLS = [
+    "sentiment",
+    "rsi",
+    "sma_ratio",
+    "volatility",
+    "momentum",
+    "obi_ratio",
+    "adx",
+    "atr",
+]
 
 Signal = str  # literal: "BUY" | "SELL" | "HOLD"
 
@@ -61,9 +109,9 @@ Signal = str  # literal: "BUY" | "SELL" | "HOLD"
 class MLPredictor:
     """Predicts price-direction probability and generates trading signals.
 
-    The underlying model is an XGBoost binary classifier trained on a
-    five-element feature vector: [sentiment, rsi, sma_ratio, volatility,
-    momentum].
+    The underlying model is an XGBoost binary classifier trained on an
+    eight-element feature vector:
+    [sentiment, rsi, sma_ratio, volatility, momentum, obi_ratio, adx, atr].
     """
 
     def __init__(self) -> None:
@@ -86,17 +134,101 @@ class MLPredictor:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _compute_features(self, prices: list[float], sentiment: float) -> list[float]:
+    @staticmethod
+    def _compute_adx_atr(
+        highs: list[float],
+        lows: list[float],
+        closes: list[float],
+        period: int = _ADX_PERIOD,
+    ) -> tuple[float, float]:
+        """Compute ADX and ATR from OHLC data.
+
+        Parameters
+        ----------
+        highs:   High prices in chronological order.
+        lows:    Low prices in chronological order.
+        closes:  Close prices in chronological order.
+        period:  Smoothing period (default 14).
+
+        Returns
+        -------
+        ``(adx, atr)`` – both are floats; defaults are ``(25.0, 0.0)`` when
+        the series is too short to produce a valid result.
+        """
+        n = len(closes)
+        if n < period + 1:
+            return _ADX_NEUTRAL_DEFAULT, 0.0
+
+        h = pd.Series(highs, dtype=float)
+        l = pd.Series(lows, dtype=float)
+        c = pd.Series(closes, dtype=float)
+        prev_c = c.shift(1)
+        prev_h = h.shift(1)
+        prev_l = l.shift(1)
+
+        # True Range
+        tr = pd.concat(
+            [h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1
+        ).max(axis=1)
+
+        # ATR (Wilder's EMA)
+        atr_series = tr.ewm(com=period - 1, min_periods=period).mean()
+        atr_val = float(atr_series.iloc[-1])
+        if np.isnan(atr_val):
+            atr_val = 0.0
+
+        # Directional Movement
+        up_move = h - prev_h
+        down_move = prev_l - l
+
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+        smoothed_plus_dm = plus_dm.ewm(com=period - 1, min_periods=period).mean()
+        smoothed_minus_dm = minus_dm.ewm(com=period - 1, min_periods=period).mean()
+        smoothed_atr = tr.ewm(com=period - 1, min_periods=period).mean()
+
+        # Avoid division by zero
+        safe_atr = smoothed_atr.replace(0.0, np.nan)
+        plus_di = 100 * smoothed_plus_dm / safe_atr
+        minus_di = 100 * smoothed_minus_dm / safe_atr
+
+        di_sum = plus_di + minus_di
+        di_diff = (plus_di - minus_di).abs()
+        dx = (100 * di_diff / di_sum.replace(0.0, np.nan)).fillna(0.0)
+
+        adx_series = dx.ewm(com=period - 1, min_periods=period).mean()
+        adx_val = float(adx_series.iloc[-1])
+        if np.isnan(adx_val):
+            adx_val = _ADX_NEUTRAL_DEFAULT  # neutral default
+
+        return adx_val, atr_val
+
+    def _compute_features(
+        self,
+        prices: list[float],
+        sentiment: float,
+        highs: list[float] | None = None,
+        lows: list[float] | None = None,
+        obi_ratio: float = 1.0,
+    ) -> list[float]:
         """Compute technical indicators and return a feature vector.
 
         Parameters
         ----------
         prices:    Recent mid-prices in chronological order.
         sentiment: Current VADER compound score in [-1, +1].
+        highs:     Optional high prices (same length as *prices*); used for
+                   ADX / ATR calculation.  Defaults to ``None`` (ADX=25, ATR=0).
+        lows:      Optional low prices (same length as *prices*); used for
+                   ADX / ATR calculation.  Defaults to ``None`` (ADX=25, ATR=0).
+        obi_ratio: Order Book Imbalance ratio (bid_vol / ask_vol, top-5 depth).
+                   Defaults to ``1.0`` (perfectly balanced book).
 
         Returns
         -------
-        A five-element list ``[sentiment, rsi, sma_ratio, volatility, momentum]``
+        An eight-element list
+        ``[sentiment, rsi, sma_ratio, volatility, momentum, obi_ratio, adx, atr]``
         where NaN values are replaced with ``0.0``.
         """
         series = pd.Series(prices, dtype=float)
@@ -132,7 +264,13 @@ class MLPredictor:
         mom_val = float(mom_series.iloc[-1])
         momentum = 0.0 if np.isnan(mom_val) else mom_val
 
-        return [float(sentiment), rsi, sma_ratio, volatility, momentum]
+        # ADX / ATR: require matching highs and lows series
+        if highs is not None and lows is not None and len(highs) >= _ATR_PERIOD + 1:
+            adx, atr = self._compute_adx_atr(highs, lows, prices)
+        else:
+            adx, atr = _ADX_NEUTRAL_DEFAULT, 0.0  # neutral defaults when OHLCV unavailable
+
+        return [float(sentiment), rsi, sma_ratio, volatility, momentum, float(obi_ratio), adx, atr]
 
     # ------------------------------------------------------------------
     # Training / warm-start
@@ -142,6 +280,9 @@ class MLPredictor:
         self,
         prices: list[float],
         sentiment_scores: list[float] | None = None,
+        highs: list[float] | None = None,
+        lows: list[float] | None = None,
+        obi_ratios: list[float] | None = None,
         horizon: int = _PREDICTION_HORIZON,
     ) -> bool:
         """Train (or re-train) the model from historical price data.
@@ -151,9 +292,14 @@ class MLPredictor:
 
         Parameters
         ----------
-        prices:           Historical mid-prices in chronological order.
+        prices:           Historical mid/close-prices in chronological order.
         sentiment_scores: Optional per-tick sentiment scores (same length as
                           *prices*).  Defaults to ``0.0`` for all ticks.
+        highs:            Optional high prices per tick (for ADX/ATR features).
+                          When ``None``, ADX defaults to 25.0 and ATR to 0.0.
+        lows:             Optional low prices per tick (for ADX/ATR features).
+                          When ``None``, ADX defaults to 25.0 and ATR to 0.0.
+        obi_ratios:       Optional per-tick OBI ratios.  Defaults to ``1.0``.
         horizon:          Number of ticks ahead to use as the prediction target.
 
         Returns
@@ -184,6 +330,45 @@ class MLPredictor:
             else pd.Series(0.0, index=series.index)
         )
 
+        obi_series = (
+            pd.Series(obi_ratios, dtype=float)
+            if obi_ratios is not None
+            else pd.Series(1.0, index=series.index)
+        )
+
+        # ADX / ATR series (row-by-row computation for the full history)
+        if highs is not None and lows is not None and len(highs) == len(prices):
+            h_series = pd.Series(highs, dtype=float)
+            l_series = pd.Series(lows, dtype=float)
+            prev_c = series.shift(1)
+
+            tr = pd.concat(
+                [h_series - l_series,
+                 (h_series - prev_c).abs(),
+                 (l_series - prev_c).abs()],
+                axis=1,
+            ).max(axis=1)
+
+            up_move = h_series - h_series.shift(1)
+            down_move = l_series.shift(1) - l_series
+            plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+            minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+            smth_atr = tr.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean()
+            smth_pdm = plus_dm.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean()
+            smth_mdm = minus_dm.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean()
+
+            safe_atr = smth_atr.replace(0.0, np.nan)
+            plus_di = 100 * smth_pdm / safe_atr
+            minus_di = 100 * smth_mdm / safe_atr
+            di_sum = plus_di + minus_di
+            dx = (100 * (plus_di - minus_di).abs() / di_sum.replace(0.0, np.nan)).fillna(0.0)
+            adx_series = dx.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean().fillna(_ADX_NEUTRAL_DEFAULT)
+            atr_series = smth_atr.fillna(0.0)
+        else:
+            adx_series = pd.Series(25.0, index=series.index)
+            atr_series = pd.Series(0.0, index=series.index)
+
         df = pd.DataFrame(
             {
                 "sentiment": sentiment_series,
@@ -191,6 +376,9 @@ class MLPredictor:
                 "sma_ratio": sma_ratio_series,
                 "volatility": vol_series,
                 "momentum": mom_series,
+                "obi_ratio": obi_series,
+                "adx": adx_series,
+                "atr": atr_series,
                 "price": series,
             }
         )
@@ -290,6 +478,9 @@ class MLPredictor:
         self,
         prices: list[float],
         sentiment_score: float = 0.0,
+        highs: list[float] | None = None,
+        lows: list[float] | None = None,
+        obi_ratio: float = 1.0,
     ) -> float | None:
         """Return the probability of an upward price move.
 
@@ -299,6 +490,9 @@ class MLPredictor:
                          At least ``_MIN_PRICES_FOR_INFERENCE`` (20) values are
                          required.
         sentiment_score: Current VADER compound score in [-1, +1].
+        highs:           Optional high prices for ADX/ATR computation.
+        lows:            Optional low prices for ADX/ATR computation.
+        obi_ratio:       Order Book Imbalance ratio (bid_vol / ask_vol, top-5).
 
         Returns
         -------
@@ -317,18 +511,33 @@ class MLPredictor:
             )
             return None
 
-        features = self._compute_features(prices, sentiment_score)
+        features = self._compute_features(prices, sentiment_score, highs, lows, obi_ratio)
         X = pd.DataFrame([features], columns=_FEATURE_COLS)
-        proba: float = float(self._model.predict_proba(X)[0][1])
+        try:
+            proba: float = float(self._model.predict_proba(X)[0][1])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "predict_proba: XGBoost inference failed (%s) – "
+                "model may need retraining with the new feature set.",
+                exc,
+            )
+            return None
 
         rsi = features[1]
         volatility = features[3]
         momentum = features[4]
+        obi = features[5]
+        adx = features[6]
+        atr = features[7]
         logger.info(
-            "[INDICATORS] RSI: %.1f | Volatility: %.1f | Momentum: %.1f%%",
+            "[INDICATORS] RSI: %.1f | Volatility: %.4f | Momentum: %.1f%% | "
+            "OBI: %.4f | ADX: %.1f | ATR: %.4f",
             rsi,
             volatility,
             momentum,
+            obi,
+            adx,
+            atr,
         )
         logger.debug("Predicted probability=%.4f", proba)
         return proba
@@ -337,6 +546,10 @@ class MLPredictor:
         self,
         prices: list[float],
         sentiment_score: float = 0.0,
+        highs: list[float] | None = None,
+        lows: list[float] | None = None,
+        obi_ratio: float = 1.0,
+        funding_rate: float = 0.0,
     ) -> Signal:
         """Generate a trading signal (BUY / SELL / HOLD).
 
@@ -344,32 +557,118 @@ class MLPredictor:
         ----------
         prices:          Recent mid-prices in chronological order.
         sentiment_score: Current VADER compound score in [-1, +1].
+        highs:           Optional high prices for ADX/ATR computation.
+        lows:            Optional low prices for ADX/ATR computation.
+        obi_ratio:       Order Book Imbalance ratio (bid_vol / ask_vol, top-5).
+        funding_rate:    Current perpetual-futures funding rate as a decimal
+                         (e.g. 0.0001 = 0.01 % per 8-hour window).
 
         Returns
         -------
-        ``"BUY"``, ``"SELL"``, or ``"HOLD"`` according to the rules:
+        ``"BUY"``, ``"SELL"``, or ``"HOLD"`` with the following logic:
 
-        * probability > 0.65 AND sentiment > 0.3   → BUY
-        * probability < 0.3 AND sentiment < -0.3  → SELL
-        * otherwise                               → HOLD
+        Base ML signal:
+          * probability > 0.65 AND sentiment > 0.3   → BUY
+          * probability < 0.3  AND sentiment < -0.3  → SELL
+          * otherwise                                → HOLD
+
+        Market Regime override (ADX-based):
+          * ADX > 25 (trending): BUY only when RSI > 50 AND momentum > 0;
+            SELL only when RSI < 50 AND momentum < 0.
+          * ADX < 20 (range-bound): BUY when RSI < 35; SELL when RSI > 65.
+
+        Funding Rate bias:
+          * rate > +0.03 % (extreme greed): BUY → HOLD (Short-Bias penalty).
+          * rate < -0.03 % (extreme fear):  BUY retained + Long-Bias bonus.
+
+        ``[ELITE]`` is logged whenever the regime or funding-rate logic alters
+        the base ML signal.
         """
-        probability = self.predict_proba(prices, sentiment_score)
+        probability = self.predict_proba(prices, sentiment_score, highs, lows, obi_ratio)
 
         if probability is None:
             logger.info("Signal=HOLD (model not ready or insufficient data)")
             return "HOLD"
 
+        # ── Base ML signal ────────────────────────────────────────────────
         if probability > _BUY_PROB_THRESHOLD and sentiment_score > _BUY_SENTIMENT_THRESHOLD:
-            signal: Signal = "BUY"
+            base_signal: Signal = "BUY"
         elif probability < _SELL_PROB_THRESHOLD and sentiment_score < _SELL_SENTIMENT_THRESHOLD:
-            signal = "SELL"
+            base_signal = "SELL"
         else:
-            signal = "HOLD"
+            base_signal = "HOLD"
 
-        logger.info(
-            "Signal=%s  probability=%.4f  sentiment=%.4f",
-            signal,
-            probability,
-            sentiment_score,
-        )
+        # Retrieve the just-computed features so we can inspect regime inputs
+        features = self._compute_features(prices, sentiment_score, highs, lows, obi_ratio)
+        rsi = features[1]
+        momentum = features[4]
+        adx = features[6]
+
+        # ── Market Regime Classifier ──────────────────────────────────────
+        elite_factors: list[str] = []
+        signal: Signal = base_signal
+
+        if adx > _ADX_TREND_THRESHOLD:
+            # Trend-Following mode: trust RSI and Momentum
+            if base_signal == "BUY" and not (rsi > 50 and momentum > 0):
+                signal = "HOLD"
+                elite_factors.append(f"ADX={adx:.1f}>25 trend-following: RSI/momentum not aligned")
+            elif base_signal == "SELL" and not (rsi < 50 and momentum < 0):
+                signal = "HOLD"
+                elite_factors.append(f"ADX={adx:.1f}>25 trend-following: RSI/momentum not aligned")
+            elif base_signal != "HOLD":
+                elite_factors.append(f"ADX={adx:.1f}>25 trend-following confirmed")
+
+        elif adx < _ADX_RANGE_THRESHOLD:
+            # Mean-Reversion mode: oversold/overbought bounces
+            if rsi < _RSI_OVERSOLD and sentiment_score >= 0:
+                if signal != "BUY":
+                    signal = "BUY"
+                    elite_factors.append(
+                        f"ADX={adx:.1f}<20 mean-reversion: RSI oversold ({rsi:.1f})"
+                    )
+                else:
+                    elite_factors.append(
+                        f"ADX={adx:.1f}<20 mean-reversion: RSI oversold ({rsi:.1f}) confirmed"
+                    )
+            elif rsi > _RSI_OVERBOUGHT and sentiment_score <= 0:
+                if signal != "SELL":
+                    signal = "SELL"
+                    elite_factors.append(
+                        f"ADX={adx:.1f}<20 mean-reversion: RSI overbought ({rsi:.1f})"
+                    )
+                else:
+                    elite_factors.append(
+                        f"ADX={adx:.1f}<20 mean-reversion: RSI overbought ({rsi:.1f}) confirmed"
+                    )
+
+        # ── Funding Rate Bias ─────────────────────────────────────────────
+        if signal == "BUY" and funding_rate > _FUNDING_RATE_EXTREME_GREED:
+            signal = "HOLD"
+            elite_factors.append(
+                f"Funding rate={funding_rate:.6f} > +0.03% extreme greed: Short-Bias penalty"
+            )
+        elif signal == "BUY" and funding_rate < _FUNDING_RATE_EXTREME_FEAR:
+            elite_factors.append(
+                f"Funding rate={funding_rate:.6f} < -0.03% extreme fear: Long-Bias bonus"
+            )
+
+        # ── Logging ───────────────────────────────────────────────────────
+        if elite_factors:
+            logger.info(
+                "[ELITE] Signal=%s (base=%s)  probability=%.4f  sentiment=%.4f  "
+                "factors=[%s]",
+                signal,
+                base_signal,
+                probability,
+                sentiment_score,
+                " | ".join(elite_factors),
+            )
+        else:
+            logger.info(
+                "Signal=%s  probability=%.4f  sentiment=%.4f",
+                signal,
+                probability,
+                sentiment_score,
+            )
         return signal

@@ -39,8 +39,19 @@ _PREDICTION_HORIZON = 5     # ticks ahead used as the label
 _SMA_PERIOD = 20
 _RSI_PERIOD = 14
 _MOMENTUM_PERIOD = 5
+_ADX_PERIOD = 14
+_ATR_PERIOD = 14
 _TRAIN_RATIO = 0.70
-_FEATURE_COLS = ["sentiment", "rsi", "sma_ratio", "volatility", "momentum"]
+_FEATURE_COLS = [
+    "sentiment",
+    "rsi",
+    "sma_ratio",
+    "volatility",
+    "momentum",
+    "obi_ratio",
+    "adx",
+    "atr",
+]
 
 # Path where the trained model is saved
 _MODEL_DIR = Path(__file__).parent.parent / "models"
@@ -103,11 +114,16 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         sma_ratio  – close / SMA-20 (normalised price level)
         volatility – rolling 20-period standard deviation of close
         momentum   – percentage price change over 5 periods
+        obi_ratio  – always 1.0 (no live order-book in historical data)
+        adx        – Average Directional Index (14-period)
+        atr        – Average True Range (14-period)
         label      – 1 if close rises after _PREDICTION_HORIZON ticks, else 0
 
     Rows without a complete window or future label are dropped.
     """
     series = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
 
     # SMA-20 ratio
     sma_20 = series.rolling(_SMA_PERIOD).mean()
@@ -128,6 +144,30 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     # Momentum
     momentum = series.pct_change(_MOMENTUM_PERIOD) * 100
 
+    # ATR (Wilder's EMA of True Range)
+    prev_c = series.shift(1)
+    tr = pd.concat(
+        [h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1
+    ).max(axis=1)
+    atr = tr.ewm(com=_ATR_PERIOD - 1, min_periods=_ATR_PERIOD).mean()
+
+    # ADX (Average Directional Index)
+    up_move = h - h.shift(1)
+    down_move = l.shift(1) - l
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    smth_atr = tr.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean()
+    smth_pdm = plus_dm.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean()
+    smth_mdm = minus_dm.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean()
+
+    safe_atr = smth_atr.replace(0.0, np.nan)
+    plus_di = 100 * smth_pdm / safe_atr
+    minus_di = 100 * smth_mdm / safe_atr
+    di_sum = plus_di + minus_di
+    dx = (100 * (plus_di - minus_di).abs() / di_sum.replace(0.0, np.nan)).fillna(0.0)
+    adx = dx.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean().fillna(25.0)  # neutral default
+
     # Label: 1 if price is higher after horizon steps
     label = (series.shift(-_PREDICTION_HORIZON) > series).astype(float)
 
@@ -137,6 +177,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     feat_df["sma_ratio"] = sma_ratio
     feat_df["volatility"] = volatility
     feat_df["momentum"] = momentum
+    feat_df["obi_ratio"] = 1.0   # no live order-book available in backtest
+    feat_df["adx"] = adx
+    feat_df["atr"] = atr
     feat_df["label"] = label
 
     # Fill NaN from indicator warm-up with 0

@@ -29,6 +29,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from data_ingestion.funding_rate_client import FundingRateClient
 from data_ingestion.news_client import DEFAULT_FEED_URL, run_news_client
 from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
@@ -150,10 +151,13 @@ async def market_consumer(
         elif message.get("type") == "kline":
             # ----------------------------------------------------------------
             # Update the prices buffer with 15-minute candle close prices.
+            # Also store high and low for ADX / ATR computation.
             # Deduplicate by timestamp so each completed candle contributes
             # exactly one entry – matching the backtester's OHLCV data.
             # ----------------------------------------------------------------
             close_price = message.get("close")
+            high_price = message.get("high")
+            low_price = message.get("low")
             candle_ts = message.get("timestamp")
             if close_price is not None and candle_ts is not None:
                 last_ts = state["last_kline_ts"].get(symbol)
@@ -162,6 +166,11 @@ async def market_consumer(
                     prices_dict: dict[str, deque[float]] = state["prices"]
                     if symbol in prices_dict:
                         prices_dict[symbol].append(float(close_price))
+                    # [ELITE] Store high / low for ADX/ATR features
+                    if high_price is not None and symbol in state.get("highs", {}):
+                        state["highs"][symbol].append(float(high_price))
+                    if low_price is not None and symbol in state.get("lows", {}):
+                        state["lows"][symbol].append(float(low_price))
                     logger.info(
                         "📊 [KLINE] %s – new 15m candle close=%.2f | Buffer: %d/%d",
                         symbol,
@@ -181,6 +190,13 @@ async def market_consumer(
             )
             if bids and asks:
                 mid_price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+
+                # [ELITE] Order Book Imbalance: total bid volume vs ask volume
+                bid_vol = sum(float(b[1]) for b in bids[:5])
+                ask_vol = sum(float(a[1]) for a in asks[:5])
+                obi_ratio = bid_vol / ask_vol if ask_vol > 0 else 1.0
+                obi_ratios: dict[str, float] = state.get("obi_ratios", {})
+                obi_ratios[symbol] = obi_ratio
                 try:
                     await db.insert_market_tick(
                         symbol=symbol,
@@ -273,8 +289,27 @@ async def signal_emitter(
                 )
                 continue
 
-            signal = predictor.generate_signal(prices, sentiment)
-            win_prob: float = predictor.predict_proba(prices, sentiment) or 0.0
+            # [ELITE] Gather regime and funding inputs
+            highs: list[float] = list(state.get("highs", {}).get(symbol, []))
+            lows: list[float] = list(state.get("lows", {}).get(symbol, []))
+            obi_ratio: float = state.get("obi_ratios", {}).get(symbol, 1.0)
+            funding_rate: float = state.get("funding_rates", {}).get(symbol, 0.0)
+
+            signal = predictor.generate_signal(
+                prices,
+                sentiment,
+                highs=highs or None,
+                lows=lows or None,
+                obi_ratio=obi_ratio,
+                funding_rate=funding_rate,
+            )
+            win_prob: float = predictor.predict_proba(
+                prices,
+                sentiment,
+                highs=highs or None,
+                lows=lows or None,
+                obi_ratio=obi_ratio,
+            ) or 0.0
 
             logger.info(
                 "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d | Sentiment: %.4f",
@@ -421,6 +456,13 @@ async def main() -> None:
     shared_state: dict[str, Any] = {
         "sentiment": 0.0,
         "prices": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
+        # [ELITE] OHLCV buffers for ADX / ATR computation
+        "highs": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
+        "lows": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
+        # [ELITE] Latest Order Book Imbalance ratio per symbol
+        "obi_ratios": {symbol: 1.0 for symbol in WATCHLIST},
+        # [ELITE] Latest perpetual-futures funding rate per symbol
+        "funding_rates": {symbol: 0.0 for symbol in WATCHLIST},
         # [PRO] News Filter state
         "sentiment_history": deque(),  # stores (datetime, float) tuples
         "news_hold_until": None,       # datetime | None
@@ -431,6 +473,7 @@ async def main() -> None:
     analyzer = SentimentAnalyzer()
     predictor = MLPredictor()
     ws_client = BinanceWebSocketClient(queue=market_queue, watchlist=WATCHLIST)
+    funding_rate_client = FundingRateClient(symbols=WATCHLIST, state=shared_state)
 
     risk_manager = RiskManager(initial_balance=10_000.0)
     paper_executor = PaperExecutor(db=db, risk_manager=risk_manager)
@@ -476,6 +519,7 @@ async def main() -> None:
             signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
             dashboard_logger(paper_executor, risk_manager, interval=60),
             weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
+            funding_rate_client.run(),
         )
     finally:
         await close_db()
