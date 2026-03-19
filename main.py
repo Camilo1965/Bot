@@ -35,7 +35,7 @@ from data_ingestion.funding_rate_client import FundingRateClient
 from data_ingestion.news_scraper import fetch_crypto_headlines
 from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
-from execution.binance_executor import create_exchange, fetch_usdt_balance
+from execution.binance_executor import create_exchange, fetch_total_wallet_balance
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import MLPredictor, compute_htf_trend
@@ -728,11 +728,11 @@ async def main() -> None:
             )
         else:
             exchange_client = create_exchange(api_key, api_secret, testnet=True)
-            fetched: float | None = await fetch_usdt_balance(exchange_client)
+            fetched: float | None = await fetch_total_wallet_balance(exchange_client)
             if fetched is not None:
                 initial_balance = fetched
                 logger.info(
-                    "✅ [TESTNET] Binance Futures Testnet balance fetched: %.2f USDT",
+                    "✅ [TESTNET] Binance Futures Testnet total wallet balance fetched: %.2f",
                     initial_balance,
                 )
             else:
@@ -753,11 +753,11 @@ async def main() -> None:
             )
         else:
             exchange_client = create_exchange(api_key, api_secret, testnet=False)
-            fetched = await fetch_usdt_balance(exchange_client)
+            fetched = await fetch_total_wallet_balance(exchange_client)
             if fetched is not None:
                 initial_balance = fetched
                 logger.info(
-                    "✅ [LIVE] Binance Futures live balance fetched: %.2f USDT",
+                    "✅ [LIVE] Binance Futures live total wallet balance fetched: %.2f",
                     initial_balance,
                 )
             else:
