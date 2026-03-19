@@ -9,17 +9,17 @@ Position size formula::
     position_size = balance * RISK_PER_TRADE * LEVERAGE
 
 where:
-* ``RISK_PER_TRADE`` is the fraction of the balance risked per trade (1 %).
+* ``RISK_PER_TRADE`` is the fraction of the balance risked per trade (15 %).
 * ``LEVERAGE``       is the futures leverage multiplier (3×, conservative).
 
 Trailing stop parameters
 ------------------------
 * ``INITIAL_SL``:        Hard stop loss during the entry phase (0.75 %).
 * ``ACTIVATION_PCT``:    Minimum profit required to activate the trailing
-                         stop (2 %).  Once this threshold is reached the
+                         stop (3 %).  Once this threshold is reached the
                          active stop loss updates dynamically.
 * ``TRAILING_DISTANCE``: Gap maintained between the running peak price and
-                         the trailing stop level (1.5 %).
+                         the trailing stop level (2 %).
 
 Daily-loss safety break
 -----------------------
@@ -46,12 +46,12 @@ logger = logging.getLogger(__name__)
 
 # ── Trade parameters ──────────────────────────────────────────────────────────
 INITIAL_SL: float = 0.0075          # 0.75 % hard stop loss for initial protection
-ACTIVATION_PCT: float = 0.02       # 2 % profit required to activate trailing stop
-TRAILING_DISTANCE: float = 0.015   # 1.5 % trailing distance from the highest peak
+ACTIVATION_PCT: float = 0.03       # 3 % profit required to activate trailing stop
+TRAILING_DISTANCE: float = 0.02    # 2 % trailing distance from the highest peak
 
 # ── Futures / leverage parameters ─────────────────────────────────────────────
 LEVERAGE: int = 3                   # Conservative 3× futures leverage
-RISK_PER_TRADE: float = 0.01        # 1 % of balance risked per trade
+RISK_PER_TRADE: float = 0.15        # 15 % of balance risked per trade
 
 # ── Daily-loss safety break ───────────────────────────────────────────────────
 MAX_DAILY_LOSS_PCT: float = 0.03    # 3 % maximum daily loss before halting

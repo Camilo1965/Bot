@@ -11,10 +11,10 @@ XGBoost + Multi-Timeframe Analysis (MTA) strategy on the remaining 30 %.
 Risk parameters
 ---------------
 * Starting capital    : 10,000 USDT  (shared across the portfolio)
-* Risk per trade      : 2 % of current balance  (fixed fractional)
-* Initial Stop Loss   : −0.75 %  (hard floor from entry)
-* Trailing activation : +1.5 % profit activates the trailing stop
-* Trailing distance   : 0.5 % below the running price peak
+* Risk per trade      : 15 % of current balance  (fixed fractional, from risk_manager)
+* Initial Stop Loss   : −0.75 %  (hard floor from entry, from risk_manager)
+* Trailing activation : +3 % profit activates the trailing stop (from risk_manager)
+* Trailing distance   : 2 % below the running price peak (from risk_manager)
 
 Sentiment mock
 --------------
@@ -38,6 +38,12 @@ import ccxt
 import numpy as np
 import pandas as pd
 
+from risk.risk_manager import (
+    ACTIVATION_PCT,
+    INITIAL_SL,
+    RISK_PER_TRADE,
+    TRAILING_DISTANCE,
+)
 from strategy.ml_predictor import MLPredictor, compute_htf_trend
 
 # ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -58,10 +64,6 @@ _SIX_MONTHS_MS    = 183 * 24 * 60 * 60 * 1_000
 
 _TRAIN_RATIO      = 0.70               # 70 % train / 30 % test  (chronological)
 _STARTING_CAPITAL = 10_000.0           # USDT
-_RISK_PER_TRADE   = 0.15               # 15 % of current balance per trade
-_ACTIVATION_PCT   = 0.015             # +1.5 % profit activates trailing stop
-_TRAILING_DISTANCE = 0.005            # 0.5 % trailing gap below running peak
-_INITIAL_SL_PCT   = 0.0075            # −0.75 % hard stop loss (initial protection)
 
 # Neutral sentiment mock (no live news in historical data).
 # Increase toward +1.0 to open the ML sentiment gate for more BUY signals.
@@ -260,10 +262,10 @@ def _simulate(
             i += 1
             continue
 
-        # ── 5. Position sizing (fixed 15 % risk) ───────────────────────────
+        # ── 5. Position sizing (fixed fractional risk) ─────────────────────
         entry_price      = float(closes_15m[i])
-        position_usdt    = balance * _RISK_PER_TRADE
-        initial_sl_price = entry_price * (1.0 - _INITIAL_SL_PCT)
+        position_usdt    = balance * RISK_PER_TRADE
+        initial_sl_price = entry_price * (1.0 - INITIAL_SL)
         # Active SL starts at the hard initial stop and can only move up
         active_sl        = initial_sl_price
         highest_seen     = entry_price
@@ -285,8 +287,8 @@ def _simulate(
                 highest_seen = high_j
 
             # Activate trailing stop once ACTIVATION_PCT profit is reached
-            if (highest_seen - entry_price) / entry_price >= _ACTIVATION_PCT:
-                tsl = highest_seen * (1.0 - _TRAILING_DISTANCE)
+            if (highest_seen - entry_price) / entry_price >= ACTIVATION_PCT:
+                tsl = highest_seen * (1.0 - TRAILING_DISTANCE)
                 if tsl > active_sl:
                     active_sl = tsl
 
@@ -365,9 +367,9 @@ def _print_report(stats: dict, train_rows: int, test_rows: int, symbol: str = ""
     print(f"  {_DIM}Symbol       :{_RESET}  {_BOLD}{symbol}  (15m / 1H / 4H MTA){_RESET}")
     print(f"  {_DIM}Train candles:{_RESET}  {train_rows:,}")
     print(f"  {_DIM}Test candles :{_RESET}  {test_rows:,}")
-    print(f"  {_DIM}Risk / trade :{_RESET}  {_RISK_PER_TRADE * 100:.0f} %  "
-          f"(activation {_ACTIVATION_PCT * 100:.1f} % / trailing {_TRAILING_DISTANCE * 100:.1f} % / "
-          f"initial SL {_INITIAL_SL_PCT * 100:.2f} %)")
+    print(f"  {_DIM}Risk / trade :{_RESET}  {RISK_PER_TRADE * 100:.0f} %  "
+          f"(activation {ACTIVATION_PCT * 100:.1f} % / trailing {TRAILING_DISTANCE * 100:.1f} % / "
+          f"initial SL {INITIAL_SL * 100:.2f} %)")
     print(f"  {_DIM}Starting cap :{_RESET}  {_STARTING_CAPITAL:,.2f} USDT")
     print(f"{_CYAN}{'─' * w}{_RESET}")
     print(f"  {_DIM}Total trades :{_RESET}  {_BOLD}{stats['total_trades']}{_RESET}")
