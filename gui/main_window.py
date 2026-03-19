@@ -16,17 +16,19 @@ that polls TimescaleDB every 2 seconds and delivers data via Qt signals.
 
 from __future__ import annotations
 
+import math
 import sys
 from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, pyqtProperty
+from PyQt6.QtGui import QColor, QFont, QLinearGradient
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -263,29 +265,60 @@ class CandlestickItem(pg.GraphicsObject):
     def generatePicture(self) -> None:  # noqa: N802
         self._picture = pg.QtGui.QPicture()
         p = pg.QtGui.QPainter(self._picture)
-        p.setPen(pg.mkPen("w", width=1))
+        p.setRenderHint(pg.QtGui.QPainter.RenderHint.Antialiasing)
         w = 0.4  # half-width of candle body in x-units (minutes)
         for c in self._data:
             t = c["t"]
-            # Wick
-            if c["close"] >= c["open"]:
-                p.setPen(pg.mkPen("#3fb950", width=1))
-                p.setBrush(pg.mkBrush("#3fb950"))
+            is_bull = c["close"] >= c["open"]
+
+            # ── Color theme ───────────────────────────────────────────────
+            if is_bull:
+                wick_color = QColor("#00FFFF")   # neon cyan
+                glow_color = QColor(0, 255, 255)
+                body_hi_color = QColor("#00FFFF")
+                body_lo_color = QColor("#006080")
             else:
-                p.setPen(pg.mkPen("#f85149", width=1))
-                p.setBrush(pg.mkBrush("#f85149"))
+                wick_color = QColor("#DC143C")   # crimson
+                glow_color = QColor(220, 20, 60)
+                body_hi_color = QColor("#FF44AA")  # magenta-glow
+                body_lo_color = QColor("#6B0000")  # deep crimson
+
+            # ── Wick glow (multi-pass softlight) ─────────────────────────
+            for gw, alpha in ((6, 18), (4, 40), (2, 80)):
+                gc = QColor(glow_color)
+                gc.setAlpha(alpha)
+                p.setPen(pg.mkPen(gc, width=gw))
+                p.drawLine(
+                    pg.QtCore.QPointF(t, c["low"]),
+                    pg.QtCore.QPointF(t, c["high"]),
+                )
+
+            # Main wick
+            p.setPen(pg.mkPen(wick_color, width=1))
             p.drawLine(
                 pg.QtCore.QPointF(t, c["low"]),
                 pg.QtCore.QPointF(t, c["high"]),
             )
-            p.drawRect(
-                pg.QtCore.QRectF(
-                    t - w,
-                    min(c["open"], c["close"]),
-                    2 * w,
-                    abs(c["close"] - c["open"]) or _MIN_CANDLE_HEIGHT,
-                )
-            )
+
+            # ── Candle body with gradient fill ───────────────────────────
+            body_top = max(c["open"], c["close"])
+            body_bottom = min(c["open"], c["close"])
+            body_height = body_top - body_bottom or _MIN_CANDLE_HEIGHT
+            body_rect = pg.QtCore.QRectF(t - w, body_bottom, 2 * w, body_height)
+
+            # Gradient runs from lo colour (visual bottom/lower-price) to hi colour
+            # (visual top/higher-price). ObjectMode maps (0,0)=rect top-left to
+            # (1,1)=rect bottom-right; because pyqtgraph replays the picture in a
+            # y-up data space, the rect's "bottom" (ObjectMode y=1) is the
+            # higher-priced (visually upper) end.
+            gradient = QLinearGradient(0.5, 0.0, 0.5, 1.0)
+            gradient.setCoordinateMode(QLinearGradient.CoordinateMode.ObjectMode)
+            gradient.setColorAt(0.0, body_lo_color)
+            gradient.setColorAt(1.0, body_hi_color)
+
+            p.setPen(pg.mkPen(wick_color, width=1))
+            p.setBrush(pg.QtGui.QBrush(gradient))
+            p.drawRect(body_rect)
         p.end()
 
     def paint(  # noqa: D102
@@ -307,6 +340,241 @@ class CandlestickItem(pg.GraphicsObject):
             max(xs) - min(xs) + 2,
             max(ys) - min(ys),
         )
+
+
+# ---------------------------------------------------------------------------
+# PnLLabel – QLabel with a pyqtProperty-driven text colour
+# ---------------------------------------------------------------------------
+
+
+class PnLLabel(QLabel):
+    """QLabel subclass that exposes a :class:`~PyQt6.QtGui.QColor` Qt property.
+
+    The ``textColor`` property drives the displayed text color so that Qt's
+    stylesheet engine can target it directly.  ``setPnlValue`` updates both the
+    displayed text **and** the colour atomically via the property setter.
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._text_color: QColor = QColor("#e6edf3")
+        self._apply_color()
+
+    # ── Qt property ──────────────────────────────────────────────────────
+
+    def _get_text_color(self) -> QColor:
+        return self._text_color
+
+    def _set_text_color(self, color: QColor) -> None:
+        self._text_color = color
+        self._apply_color()
+
+    textColor: QColor = pyqtProperty(  # type: ignore[assignment]
+        QColor, fget=_get_text_color, fset=_set_text_color
+    )
+
+    def _apply_color(self) -> None:
+        r, g, b = self._text_color.red(), self._text_color.green(), self._text_color.blue()
+        self.setStyleSheet(f"color: rgb({r},{g},{b});")
+
+    # ── Convenience ──────────────────────────────────────────────────────
+
+    def setPnlValue(self, value: float) -> None:  # noqa: N802
+        """Update text and colour for a PnL value (neon-green ≥ 0, crimson < 0)."""
+        sign = "+" if value >= 0 else ""
+        self.setText(f"{sign}{value:.2f}")
+        self.textColor = QColor("#00FF88") if value >= 0 else QColor("#DC143C")
+
+
+def _make_pnl_card(label: str, initial_value: str = "0.00") -> tuple[QFrame, PnLLabel]:
+    """Return a dark card frame with a :class:`PnLLabel` value widget."""
+    frame = QFrame()
+    frame.setObjectName("card")
+    card_layout = QVBoxLayout(frame)
+    card_layout.setContentsMargins(12, 8, 12, 8)
+    card_layout.setSpacing(2)
+
+    val_lbl = PnLLabel(initial_value)
+    val_lbl.setObjectName("card_value")
+
+    cap_lbl = QLabel(label)
+    cap_lbl.setObjectName("card_label")
+
+    card_layout.addWidget(val_lbl)
+    card_layout.addWidget(cap_lbl)
+    return frame, val_lbl
+
+
+# ---------------------------------------------------------------------------
+# SentimentGaugeItem – arc-gauge / speedometer (pg.GraphicsObject)
+# ---------------------------------------------------------------------------
+
+
+class SentimentGaugeItem(pg.GraphicsObject):
+    """Dynamic arc-gauge / speedometer for sentiment score in the range [-1, +1].
+
+    The gauge is drawn as a semicircle (top half of a unit circle centred at
+    the origin) with three colour-coded zones:
+
+    * 0° – 60°   → green  (positive sentiment)
+    * 60° – 120° → yellow (neutral)
+    * 120° – 180° → red   (negative sentiment)
+
+    A glowing needle rotates from 180° (most negative) through 90° (neutral)
+    to 0° (most positive).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._value: float = 0.0
+        self._picture: pg.QtGui.QPicture | None = None
+        self._rebuild()
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def setValue(self, value: float) -> None:  # noqa: N802
+        self._value = max(-1.0, min(1.0, float(value)))
+        self._picture = None
+        self._rebuild()
+        self.update()
+
+    # ── Internal drawing ─────────────────────────────────────────────────
+
+    def _rebuild(self) -> None:
+        self._picture = pg.QtGui.QPicture()
+        p = pg.QtGui.QPainter(self._picture)
+        p.setRenderHint(pg.QtGui.QPainter.RenderHint.Antialiasing)
+
+        r = 1.0
+        arc_rect = pg.QtCore.QRectF(-r, -r, 2 * r, 2 * r)
+
+        # ── Background track (dark, wide) ─────────────────────────────
+        p.setPen(pg.mkPen(QColor(40, 50, 60), width=8))
+        p.setBrush(pg.QtGui.QBrush(Qt.BrushStyle.NoBrush))
+        # Negative span = clockwise, which in pyqtgraph's y-up data space traces
+        # through y = +r (the visually-upper semicircle).
+        p.drawArc(arc_rect, 0 * 16, -180 * 16)
+
+        # ── Colour zones (slightly narrower, drawn on top) ─────────────
+        # Angles correspond to the arc's mathematical angle convention (y-up):
+        #   0° = right (most positive), 90° = top (neutral), 180° = left (most negative)
+        # In Qt clockwise terms, these map to: 0°→0°, 60°→-60°, 120°→-120°, 180°→-180°
+        p.setPen(pg.mkPen(QColor(0, 200, 80, 180), width=5))    # green  0°–60°
+        p.drawArc(arc_rect, 0 * 16, -60 * 16)
+
+        p.setPen(pg.mkPen(QColor(255, 220, 0, 180), width=5))   # yellow 60°–120°
+        p.drawArc(arc_rect, -60 * 16, -60 * 16)
+
+        p.setPen(pg.mkPen(QColor(220, 50, 50, 180), width=5))   # red    120°–180°
+        p.drawArc(arc_rect, -120 * 16, -60 * 16)
+
+        # ── Needle ────────────────────────────────────────────────────
+        # Map value [-1,+1] → angle [180°, 0°] in Qt counter-clockwise space
+        needle_deg = 90.0 * (1.0 - self._value)
+        needle_rad = math.radians(needle_deg)
+        nx = math.cos(needle_rad) * 0.78
+        ny = math.sin(needle_rad) * 0.78
+
+        needle_color = QColor(0, 255, 136) if self._value >= 0 else QColor(220, 20, 60)
+
+        # Glow passes (outer → inner)
+        for gw, alpha in ((12, 20), (8, 45), (5, 90)):
+            gc = QColor(needle_color)
+            gc.setAlpha(alpha)
+            p.setPen(pg.mkPen(gc, width=gw))
+            p.drawLine(pg.QtCore.QPointF(0.0, 0.0), pg.QtCore.QPointF(nx, ny))
+
+        # Solid needle
+        p.setPen(pg.mkPen(needle_color, width=2))
+        p.drawLine(pg.QtCore.QPointF(0.0, 0.0), pg.QtCore.QPointF(nx, ny))
+
+        # Pivot dot
+        piv = 0.07
+        p.setPen(pg.mkPen(QColor(200, 210, 225), width=1))
+        p.setBrush(pg.mkBrush(QColor(200, 210, 225)))
+        p.drawEllipse(pg.QtCore.QRectF(-piv, -piv, 2 * piv, 2 * piv))
+
+        p.end()
+
+    # ── QGraphicsObject interface ─────────────────────────────────────────
+
+    def paint(  # noqa: D102
+        self,
+        p: pg.QtGui.QPainter,
+        *args: Any,
+    ) -> None:
+        if self._picture is not None:
+            p.drawPicture(0, 0, self._picture)
+
+    def boundingRect(self) -> pg.QtCore.QRectF:  # noqa: N802, D102
+        return pg.QtCore.QRectF(-1.15, -0.15, 2.3, 1.25)
+
+
+# ---------------------------------------------------------------------------
+# SentimentGaugeWidget – thin QWidget wrapper embedding the gauge in a card
+# ---------------------------------------------------------------------------
+
+
+class SentimentGaugeWidget(QWidget):
+    """Compact card-style widget that hosts a :class:`SentimentGaugeItem`."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        frame = QFrame()
+        frame.setObjectName("card")
+        outer.addWidget(frame)
+
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(12, 8, 12, 8)
+        inner.setSpacing(2)
+
+        cap = QLabel("Sentiment Score")
+        cap.setObjectName("card_label")
+        inner.addWidget(cap)
+
+        # pyqtgraph graphics container
+        self._gfx = pg.GraphicsLayoutWidget()
+        self._gfx.setBackground("#161b22")
+        self._gfx.setFixedHeight(130)
+        inner.addWidget(self._gfx)
+
+        self._plot = self._gfx.addPlot()
+        self._plot.hideAxis("left")
+        self._plot.hideAxis("bottom")
+        self._plot.setMenuEnabled(False)
+        self._plot.setMouseEnabled(x=False, y=False)
+        self._plot.setDefaultPadding(0.0)
+        self._plot.setRange(xRange=(-1.35, 1.35), yRange=(-0.4, 1.25), padding=0)
+
+        self._gauge = SentimentGaugeItem()
+        self._plot.addItem(self._gauge)
+
+        self._value_text = pg.TextItem(text="—", anchor=(0.5, 0.5), color="#8b949e")
+        self._value_text.setFont(QFont("Consolas", 9))
+        self._value_text.setPos(0.0, -0.22)
+        self._plot.addItem(self._value_text)
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def setValue(self, value: float | None) -> None:  # noqa: N802
+        if value is None:
+            self._gauge.setValue(0.0)
+            self._value_text.setText("—")
+            self._value_text.setColor("#8b949e")
+        else:
+            self._gauge.setValue(value)
+            sign = "+" if value >= 0 else ""
+            self._value_text.setText(f"{sign}{value:.4f}")
+            if value >= 0.05:
+                self._value_text.setColor("#00FF88")
+            elif value <= -0.05:
+                self._value_text.setColor("#DC143C")
+            else:
+                self._value_text.setColor("#e6edf3")
 
 
 # ---------------------------------------------------------------------------
@@ -335,14 +603,14 @@ class WatchlistPane(QWidget):
 
         layout.addWidget(_make_section_label("Status"))
 
-        _, self.pnl_label = _make_card("Total PnL (USDT)", "0.00")
-        layout.addWidget(self.pnl_label.parent())
+        _pnl_frame, self.pnl_label = _make_pnl_card("Total PnL (USDT)", "0.00")
+        layout.addWidget(_pnl_frame)
 
         _, self.trades_label = _make_card("Open Trades", "0")
         layout.addWidget(self.trades_label.parent())
 
-        _, self.sentiment_label = _make_card("Sentiment Score", "—")
-        layout.addWidget(self.sentiment_label.parent())
+        self.sentiment_gauge = SentimentGaugeWidget()
+        layout.addWidget(self.sentiment_gauge)
 
         layout.addStretch()
 
@@ -360,24 +628,11 @@ class WatchlistPane(QWidget):
         active_trades: list[dict[str, Any]],
         sentiment: float | None,
     ) -> None:
-        sign = "+" if total_pnl >= 0 else ""
-        self.pnl_label.setText(f"{sign}{total_pnl:.2f}")
-        self.pnl_label.setStyleSheet(
-            "color: #3fb950;" if total_pnl >= 0 else "color: #f85149;"
-        )
+        self.pnl_label.setPnlValue(total_pnl)
 
         self.trades_label.setText(str(len(active_trades)))
 
-        if sentiment is not None:
-            self.sentiment_label.setText(f"{sentiment:+.4f}")
-            if sentiment >= 0.05:
-                self.sentiment_label.setStyleSheet("color: #3fb950;")
-            elif sentiment <= -0.05:
-                self.sentiment_label.setStyleSheet("color: #f85149;")
-            else:
-                self.sentiment_label.setStyleSheet("color: #e6edf3;")
-        else:
-            self.sentiment_label.setText("—")
+        self.sentiment_gauge.setValue(sentiment)
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +669,12 @@ class ChartPane(QWidget):
         self._price_plot.getAxis("left").setStyle(tickFont=QFont("Consolas", 9))
 
         self._candles = CandlestickItem()
+        # Subtle neon glow on the whole candlestick item
+        _candle_glow = QGraphicsDropShadowEffect()
+        _candle_glow.setBlurRadius(14)
+        _candle_glow.setColor(QColor(0, 200, 220, 130))
+        _candle_glow.setOffset(0, 0)
+        self._candles.setGraphicsEffect(_candle_glow)
         self._price_plot.addItem(self._candles)
 
         # Sniper-point scatter items: BUY (green ▲) and SELL (red ▼).
@@ -432,9 +693,13 @@ class ChartPane(QWidget):
         self._price_plot.addItem(self._buy_markers)
         self._price_plot.addItem(self._sell_markers)
 
-        # Volume chart (smaller, below price)
+        # Volume chart (smaller, below price) – use TimeAxisItem for HH:MM labels
         self._graphics_layout.nextRow()
-        self._vol_plot: pg.PlotItem = self._graphics_layout.addPlot(row=1, col=0)
+        vol_time_axis = TimeAxisItem(orientation="bottom")
+        vol_time_axis.setStyle(tickFont=QFont("Consolas", 9))
+        self._vol_plot: pg.PlotItem = self._graphics_layout.addPlot(
+            row=1, col=0, axisItems={"bottom": vol_time_axis}
+        )
         self._vol_plot.showGrid(x=False, y=True, alpha=0.10)
         self._vol_plot.setMaximumHeight(80)
         self._vol_bars = pg.BarGraphItem(x=[], height=[], width=0.6, brush="#1f6feb")
