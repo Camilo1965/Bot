@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 
 # ── Trade parameters ──────────────────────────────────────────────────────────
 INITIAL_SL: float = 0.0075          # 0.75 % hard stop loss for initial protection
-ACTIVATION_PCT: float = 0.015       # 1.5 % profit required to activate trailing stop
-TRAILING_DISTANCE: float = 0.005    # 0.5 % trailing distance from the highest peak
+ACTIVATION_PCT: float = 0.01       # 1.5 % profit required to activate trailing stop
+TRAILING_DISTANCE: float = 0.01   # 0.5 % trailing distance from the highest peak
 _REWARD_RISK_RATIO: float = ACTIVATION_PCT / INITIAL_SL   # 2.0
 _HALF_KELLY: float = 0.5            # Half-Kelly multiplier
 
