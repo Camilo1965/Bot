@@ -14,7 +14,7 @@ where:
 
 Trailing stop parameters
 ------------------------
-* ``INITIAL_SL``:        Hard stop loss during the entry phase (0.75 %).
+* ``INITIAL_SL``:        Hard stop loss during the entry phase (1.5 %).
 * ``ACTIVATION_PCT``:    Minimum profit required to activate the trailing
                          stop (3 %).  Once this threshold is reached the
                          active stop loss updates dynamically.
@@ -45,7 +45,7 @@ from datetime import datetime, timedelta, timezone
 logger = logging.getLogger(__name__)
 
 # ── Trade parameters ──────────────────────────────────────────────────────────
-INITIAL_SL: float = 0.0075          # 0.75 % hard stop loss for initial protection
+INITIAL_SL: float = 0.015           # 1.5 % hard stop loss for initial protection
 ACTIVATION_PCT: float = 0.03       # 3 % profit required to activate trailing stop
 TRAILING_DISTANCE: float = 0.02    # 2 % trailing distance from the highest peak
 
