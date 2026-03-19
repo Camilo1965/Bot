@@ -29,7 +29,8 @@ import logging
 import os
 import re
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -47,21 +48,17 @@ _SYSTEM_INSTRUCTION = (
     "Return ONLY the raw number."
 )
 
-_model: genai.GenerativeModel | None = None
+_client: genai.Client | None = None
 
 
-def _get_model() -> genai.GenerativeModel:
-    """Return (and lazily initialise) the shared Gemini model."""
-    global _model  # noqa: PLW0603
-    if _model is None:
+def _get_client() -> genai.Client:
+    """Return (and lazily initialise) the shared Gemini client."""
+    global _client  # noqa: PLW0603
+    if _client is None:
         api_key = os.environ.get("GEMINI_API_KEY", "")
-        genai.configure(api_key=api_key)
-        _model = genai.GenerativeModel(
-            model_name=_MODEL_NAME,
-            system_instruction=_SYSTEM_INSTRUCTION,
-        )
-        logger.info("Gemini model '%s' initialised.", _MODEL_NAME)
-    return _model
+        _client = genai.Client(api_key=api_key)
+        logger.info("Gemini client initialised for model '%s'.", _MODEL_NAME)
+    return _client
 
 
 def get_gemini_sentiment(headlines: list[str]) -> float:
@@ -84,8 +81,14 @@ def get_gemini_sentiment(headlines: list[str]) -> float:
 
     prompt = "\n".join(f"- {h}" for h in headlines)
     try:
-        model = _get_model()
-        response = model.generate_content(prompt)
+        client = _get_client()
+        response = client.models.generate_content(
+            model=_MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=_SYSTEM_INSTRUCTION,
+            ),
+        )
         raw = response.text.strip()
         # Extract the first float-like token, supporting scientific notation
         # (e.g. 1e-2) and an explicit leading '+' sign.

@@ -20,7 +20,7 @@ transformers
 vaderSentiment
 
 # LLM sentiment (Gemini)
-google-generativeai
+google-genai
 feedparser
 
 # Storage / caching
