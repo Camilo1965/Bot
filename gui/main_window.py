@@ -578,6 +578,92 @@ class SentimentGaugeWidget(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# TrendRadarWidget – LED indicators for the MTA Trend Radar
+# ---------------------------------------------------------------------------
+
+
+class TrendLedWidget(QWidget):
+    """Single LED indicator (coloured circle + label) for one timeframe trend."""
+
+    _COLORS: dict[str, str] = {
+        "bullish": "#00FF88",  # neon green
+        "bearish": "#DC143C",  # crimson red
+        "neutral": "#555555",  # dark grey
+    }
+
+    def __init__(self, label: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
+        self._led = QLabel("●")
+        self._led.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        font = QFont()
+        font.setPointSize(16)
+        self._led.setFont(font)
+        self._led.setStyleSheet(f"color: {self._COLORS['neutral']};")
+
+        lbl = QLabel(label)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setObjectName("card_label")
+
+        layout.addWidget(self._led)
+        layout.addWidget(lbl)
+
+    def set_trend(self, trend: str) -> None:
+        """Update the LED colour to reflect *trend* (bullish/bearish/neutral)."""
+        color = self._COLORS.get(trend, self._COLORS["neutral"])
+        self._led.setStyleSheet(f"color: {color};")
+
+
+class TrendRadarWidget(QWidget):
+    """Compact card showing three LED indicators: [4H] [1H] [15M].
+
+    Green  = Bullish trend
+    Red    = Bearish trend
+    Grey   = Neutral / insufficient data
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        frame = QFrame()
+        frame.setObjectName("card")
+        outer.addWidget(frame)
+
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(12, 8, 12, 8)
+        inner.setSpacing(4)
+
+        inner.addWidget(_make_section_label("Trend Radar"))
+
+        leds_row = QHBoxLayout()
+        leds_row.setSpacing(4)
+        self._led_4h = TrendLedWidget("4H")
+        self._led_1h = TrendLedWidget("1H")
+        self._led_15m = TrendLedWidget("15M")
+        leds_row.addWidget(self._led_4h)
+        leds_row.addWidget(self._led_1h)
+        leds_row.addWidget(self._led_15m)
+        inner.addLayout(leds_row)
+
+    def set_trends(
+        self,
+        trend_4h: str = "neutral",
+        trend_1h: str = "neutral",
+        trend_15m: str = "neutral",
+    ) -> None:
+        """Update all three LED indicators."""
+        self._led_4h.set_trend(trend_4h)
+        self._led_1h.set_trend(trend_1h)
+        self._led_15m.set_trend(trend_15m)
+
+
+# ---------------------------------------------------------------------------
 # Left pane – watchlist
 # ---------------------------------------------------------------------------
 
@@ -612,6 +698,9 @@ class WatchlistPane(QWidget):
         self.sentiment_gauge = SentimentGaugeWidget()
         layout.addWidget(self.sentiment_gauge)
 
+        self.trend_radar = TrendRadarWidget()
+        layout.addWidget(self.trend_radar)
+
         layout.addStretch()
 
         # Emergency kill switch
@@ -627,12 +716,29 @@ class WatchlistPane(QWidget):
         total_pnl: float,
         active_trades: list[dict[str, Any]],
         sentiment: float | None,
+        htf_trends: dict[str, dict[str, str]] | None = None,
     ) -> None:
         self.pnl_label.setPnlValue(total_pnl)
 
         self.trades_label.setText(str(len(active_trades)))
 
         self.sentiment_gauge.setValue(sentiment)
+
+        # Update Trend Radar using the currently selected symbol's trends.
+        if htf_trends:
+            # Try to find trends for the currently visible symbol (first entry
+            # if nothing more specific is available).
+            symbol_trends: dict[str, str] = {}
+            if htf_trends:
+                # Use the first available symbol's data as a fallback.
+                first_sym = next(iter(htf_trends), None)
+                if first_sym:
+                    symbol_trends = htf_trends[first_sym]
+            self.trend_radar.set_trends(
+                trend_4h=symbol_trends.get("4h", "neutral"),
+                trend_1h=symbol_trends.get("1h", "neutral"),
+                trend_15m=symbol_trends.get("15m", "neutral"),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -961,10 +1067,18 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_data_ready(self, payload: dict[str, Any]) -> None:
+        # Pass the currently selected symbol's HTF trends to the Trend Radar.
+        htf_trends: dict[str, dict[str, str]] = payload.get("htf_trends", {})
+        current_symbol = self._watchlist_pane.symbol_list.currentItem()
+        symbol = current_symbol.text() if current_symbol else DEFAULT_SYMBOL
+        # Build a single-symbol dict so update_status can find the right entry.
+        symbol_htf = {symbol: htf_trends.get(symbol, {})} if htf_trends else None
+
         self._watchlist_pane.update_status(
             total_pnl=payload["total_pnl"],
             active_trades=payload["active_trades"],
             sentiment=payload["sentiment"],
+            htf_trends=symbol_htf,
         )
         self._chart_pane.update_chart(
             ohlcv=payload["ohlcv"],

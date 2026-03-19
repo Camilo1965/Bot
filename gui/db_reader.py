@@ -83,6 +83,12 @@ WHERE symbol = $1
 ORDER BY entry_time ASC;
 """
 
+# Fetch all HTF trend statuses for the Trend Radar widget.
+_HTF_TRENDS_QUERY = """
+SELECT symbol, timeframe, trend
+FROM htf_trend_status;
+"""
+
 # DDL and write query for the emergency commands table.
 _CREATE_COMMANDS_TABLE = """
 CREATE TABLE IF NOT EXISTS commands (
@@ -241,6 +247,14 @@ class DBReaderThread(QThread):
         sentiment_row = await conn.fetchrow(_LATEST_SENTIMENT_QUERY)
         marker_rows = await conn.fetch(_TRADES_MARKERS_QUERY, self.symbol)
 
+        # HTF trend statuses – may not exist if the trading engine has not
+        # written any rows yet, so we handle missing tables gracefully.
+        htf_trend_rows: list[Any] = []
+        try:
+            htf_trend_rows = await conn.fetch(_HTF_TRENDS_QUERY)
+        except Exception:  # noqa: BLE001
+            pass
+
         ohlcv = [
             {
                 "bucket": row["bucket"],
@@ -282,6 +296,13 @@ class DBReaderThread(QThread):
             for row in marker_rows
         ]
 
+        # Build htf_trends: { symbol: { "4h": trend, "1h": trend, "15m": trend } }
+        htf_trends: dict[str, dict[str, str]] = {}
+        for row in htf_trend_rows:
+            sym = row["symbol"]
+            tf = row["timeframe"]
+            htf_trends.setdefault(sym, {})[tf] = row["trend"]
+
         ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
         self.log_message.emit(
             f"[{ts}] Fetched {len(ohlcv)} candles | PnL={total_pnl:+.2f} | "
@@ -294,4 +315,5 @@ class DBReaderThread(QThread):
             "active_trades": active_trades,
             "sentiment": sentiment,
             "trades": trades,
+            "htf_trends": htf_trends,
         }

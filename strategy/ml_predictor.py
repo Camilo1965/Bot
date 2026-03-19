@@ -91,6 +91,14 @@ _MIN_PRICES_FOR_INFERENCE = _SMA_PERIOD
 # Default ADX value used when OHLCV data is unavailable (neutral – no regime)
 _ADX_NEUTRAL_DEFAULT = 25.0
 
+# HTF trend labels
+HTF_TREND_BULLISH = "bullish"
+HTF_TREND_BEARISH = "bearish"
+HTF_TREND_NEUTRAL = "neutral"
+
+# Minimum number of HTF candles required to compute a trend
+_HTF_MIN_CANDLES = 3
+
 # Feature column order expected by the model
 _FEATURE_COLS = [
     "sentiment",
@@ -104,6 +112,63 @@ _FEATURE_COLS = [
 ]
 
 Signal = str  # literal: "BUY" | "SELL" | "HOLD"
+TrendStatus = str  # literal: "bullish" | "bearish" | "neutral"
+
+
+def compute_htf_trend(
+    closes: list[float],
+    opens: list[float] | None = None,
+) -> TrendStatus:
+    """Determine the higher-timeframe trend direction.
+
+    The trend is considered **bullish** when either of the following holds:
+    * The latest close is above the 20-period EMA of all available close prices.
+    * The last two candles are individually bullish (close ≥ open).
+
+    The trend is considered **bearish** when:
+    * The latest close is below the 20-period EMA, AND
+    * At least the last candle is bearish (close < open).
+
+    Returns ``"neutral"`` when there is insufficient data.
+
+    Parameters
+    ----------
+    closes: Close prices in chronological order (oldest first).
+    opens:  Open prices in chronological order (same length as *closes*).
+            When ``None`` or empty the candle-body check is skipped.
+
+    Returns
+    -------
+    ``"bullish"``, ``"bearish"``, or ``"neutral"``.
+    """
+    if len(closes) < _HTF_MIN_CANDLES:
+        return HTF_TREND_NEUTRAL
+
+    series = pd.Series(closes, dtype=float)
+    ema_period = min(_SMA_PERIOD, len(closes))
+    ema = series.ewm(span=ema_period, adjust=False).mean()
+    current_close = float(series.iloc[-1])
+    current_ema = float(ema.iloc[-1])
+
+    above_ema = current_close > current_ema
+
+    # Check whether the last two candles are bullish (close ≥ open)
+    last_two_bullish = False
+    if opens and len(opens) >= 2 and len(closes) >= 2:
+        last_two_bullish = (
+            closes[-1] >= opens[-1]
+            and closes[-2] >= opens[-2]
+        )
+
+    if above_ema or last_two_bullish:
+        return HTF_TREND_BULLISH
+
+    # Bearish: below EMA and last candle is bearish
+    last_candle_bearish = bool(opens and len(opens) >= 1 and closes[-1] < opens[-1])
+    if not above_ema and last_candle_bearish:
+        return HTF_TREND_BEARISH
+
+    return HTF_TREND_NEUTRAL
 
 
 class MLPredictor:
@@ -550,6 +615,8 @@ class MLPredictor:
         lows: list[float] | None = None,
         obi_ratio: float = 1.0,
         funding_rate: float = 0.0,
+        htf_trend_4h: TrendStatus = HTF_TREND_NEUTRAL,
+        htf_trend_1h: TrendStatus = HTF_TREND_NEUTRAL,
     ) -> Signal:
         """Generate a trading signal (BUY / SELL / HOLD).
 
@@ -562,6 +629,11 @@ class MLPredictor:
         obi_ratio:       Order Book Imbalance ratio (bid_vol / ask_vol, top-5).
         funding_rate:    Current perpetual-futures funding rate as a decimal
                          (e.g. 0.0001 = 0.01 % per 8-hour window).
+        htf_trend_4h:    4-hour trend status (``"bullish"``, ``"bearish"``, or
+                         ``"neutral"``).  A ``"bearish"`` value causes any BUY
+                         signal to be muted to HOLD ("General" filter).
+        htf_trend_1h:    1-hour trend status (same values).  A ``"bearish"``
+                         value also mutes BUY signals ("Colonel" filter).
 
         Returns
         -------
@@ -571,6 +643,10 @@ class MLPredictor:
           * probability > 0.65 AND sentiment > 0.3   → BUY
           * probability < 0.3  AND sentiment < -0.3  → SELL
           * otherwise                                → HOLD
+
+        HTF Filter ("General" + "Colonel"):
+          * 4H trend bearish                         → BUY → HOLD
+          * 1H trend bearish                         → BUY → HOLD
 
         Market Regime override (ADX-based):
           * ADX > 25 (trending): BUY only when RSI > 50 AND momentum > 0;
@@ -653,22 +729,38 @@ class MLPredictor:
                 f"Funding rate={funding_rate:.6f} < -0.03% extreme fear: Long-Bias bonus"
             )
 
+        # ── HTF Trend Filter ("General" 4H + "Colonel" 1H) ───────────────
+        if signal == "BUY" and htf_trend_4h == HTF_TREND_BEARISH:
+            signal = "HOLD"
+            elite_factors.append(
+                f"[MTA] General filter: 4H trend is bearish – BUY muted to HOLD"
+            )
+        elif signal == "BUY" and htf_trend_1h == HTF_TREND_BEARISH:
+            signal = "HOLD"
+            elite_factors.append(
+                f"[MTA] Colonel filter: 1H trend is bearish – BUY muted to HOLD"
+            )
+
         # ── Logging ───────────────────────────────────────────────────────
         if elite_factors:
             logger.info(
                 "[ELITE] Signal=%s (base=%s)  probability=%.4f  sentiment=%.4f  "
-                "factors=[%s]",
+                "4H=%s  1H=%s  factors=[%s]",
                 signal,
                 base_signal,
                 probability,
                 sentiment_score,
+                htf_trend_4h,
+                htf_trend_1h,
                 " | ".join(elite_factors),
             )
         else:
             logger.info(
-                "Signal=%s  probability=%.4f  sentiment=%.4f",
+                "Signal=%s  probability=%.4f  sentiment=%.4f  4H=%s  1H=%s",
                 signal,
                 probability,
                 sentiment_score,
+                htf_trend_4h,
+                htf_trend_1h,
             )
         return signal
