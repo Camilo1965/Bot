@@ -10,10 +10,11 @@ Multi-Timeframe Analysis (MTA) strategy on the remaining 30 %.
 
 Risk parameters
 ---------------
-* Starting capital : 10,000 USDT
-* Risk per trade   : 2 % of current balance  (fixed fractional)
-* Take Profit      : +1.5 %
-* Stop Loss        : −0.75 %
+* Starting capital    : 10,000 USDT
+* Risk per trade      : 2 % of current balance  (fixed fractional)
+* Initial Stop Loss   : −0.75 %  (hard floor from entry)
+* Trailing activation : +1.5 % profit activates the trailing stop
+* Trailing distance   : 0.5 % below the running price peak
 
 Sentiment mock
 --------------
@@ -58,8 +59,9 @@ _SIX_MONTHS_MS    = 183 * 24 * 60 * 60 * 1_000
 _TRAIN_RATIO      = 0.70               # 70 % train / 30 % test  (chronological)
 _STARTING_CAPITAL = 10_000.0           # USDT
 _RISK_PER_TRADE   = 0.02               # 2 % of current balance per trade
-_TAKE_PROFIT_PCT  = 0.015             # +1.5 %
-_STOP_LOSS_PCT    = 0.0075            # −0.75 %
+_ACTIVATION_PCT   = 0.015             # +1.5 % profit activates trailing stop
+_TRAILING_DISTANCE = 0.005            # 0.5 % trailing gap below running peak
+_INITIAL_SL_PCT   = 0.0075            # −0.75 % hard stop loss (initial protection)
 
 # Neutral sentiment mock (no live news in historical data).
 # Increase toward +1.0 to open the ML sentiment gate for more BUY signals.
@@ -176,7 +178,9 @@ def _simulate(
     * HTF buffers are capped at timestamps ≤ the current 15m candle
       timestamp, eliminating look-ahead bias on higher timeframes.
     * After a BUY signal the loop advances directly to the exit candle
-      (TP, SL, or end-of-data), so trades never overlap.
+      (SL, trailing SL, or end-of-data), so trades never overlap.
+    * Intra-candle highs and lows are used to update the highest price
+      seen and to detect stop-loss triggers accurately within each bar.
 
     Parameters
     ----------
@@ -257,15 +261,17 @@ def _simulate(
             continue
 
         # ── 5. Position sizing (fixed 2 % risk) ────────────────────────────
-        entry_price   = float(closes_15m[i])
-        position_usdt = balance * _RISK_PER_TRADE
-        tp_price      = entry_price * (1.0 + _TAKE_PROFIT_PCT)
-        sl_price      = entry_price * (1.0 - _STOP_LOSS_PCT)
+        entry_price      = float(closes_15m[i])
+        position_usdt    = balance * _RISK_PER_TRADE
+        initial_sl_price = entry_price * (1.0 - _INITIAL_SL_PCT)
+        # Active SL starts at the hard initial stop and can only move up
+        active_sl        = initial_sl_price
+        highest_seen     = entry_price
 
         # ── 6. Scan subsequent candles for exit ─────────────────────────────
-        # Use the candle's high to check TP and its low to check SL so that
-        # intrabar moves that hit the level are captured, even when the close
-        # settles between the two levels.
+        # Use the candle's high to update the highest price seen and to
+        # potentially raise the trailing SL, then use the candle's low to
+        # check whether the active stop loss has been breached.
         outcome_pnl = None
         exit_idx    = len(df_15m) - 1
         exit_reason = "EOD"
@@ -273,14 +279,25 @@ def _simulate(
         for j in range(i + 1, len(df_15m)):
             high_j = float(highs_15m[j])
             low_j  = float(lows_15m[j])
-            if high_j >= tp_price:
-                outcome_pnl = position_usdt * _TAKE_PROFIT_PCT
-                exit_reason = "TP"
-                exit_idx    = j
-                break
-            if low_j <= sl_price:
-                outcome_pnl = -(position_usdt * _STOP_LOSS_PCT)
-                exit_reason = "SL"
+
+            # Track intra-candle high for trailing stop calculation
+            if high_j > highest_seen:
+                highest_seen = high_j
+
+            # Activate trailing stop once ACTIVATION_PCT profit is reached
+            if (highest_seen - entry_price) / entry_price >= _ACTIVATION_PCT:
+                tsl = highest_seen * (1.0 - _TRAILING_DISTANCE)
+                if tsl > active_sl:
+                    active_sl = tsl
+
+            # Exit when the candle's low falls to or below the active SL
+            if low_j <= active_sl:
+                exit_price  = active_sl
+                pnl_pct     = (exit_price - entry_price) / entry_price
+                outcome_pnl = position_usdt * pnl_pct
+                # Label the exit: TSL when the trailing stop has moved above
+                # the initial SL; plain SL otherwise.
+                exit_reason = "TSL" if active_sl > initial_sl_price else "SL"
                 exit_idx    = j
                 break
 
@@ -349,7 +366,8 @@ def _print_report(stats: dict, train_rows: int, test_rows: int) -> None:
     print(f"  {_DIM}Train candles:{_RESET}  {train_rows:,}")
     print(f"  {_DIM}Test candles :{_RESET}  {test_rows:,}")
     print(f"  {_DIM}Risk / trade :{_RESET}  {_RISK_PER_TRADE * 100:.0f} %  "
-          f"(TP {_TAKE_PROFIT_PCT * 100:.1f} % / SL {_STOP_LOSS_PCT * 100:.2f} %)")
+          f"(activation {_ACTIVATION_PCT * 100:.1f} % / trailing {_TRAILING_DISTANCE * 100:.1f} % / "
+          f"initial SL {_INITIAL_SL_PCT * 100:.2f} %)")
     print(f"  {_DIM}Starting cap :{_RESET}  {_STARTING_CAPITAL:,.2f} USDT")
     print(f"{_CYAN}{'─' * w}{_RESET}")
     print(f"  {_DIM}Total trades :{_RESET}  {_BOLD}{stats['total_trades']}{_RESET}")

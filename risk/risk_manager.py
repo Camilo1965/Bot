@@ -4,12 +4,14 @@ risk.risk_manager
 
 Position sizing via Fractional (Half) Kelly Criterion.
 
-Every trade uses a static Stop Loss of 0.75 % and a Take Profit of 1.5 %,
-giving a reward-to-risk ratio of 2.  The Kelly fraction is computed as::
+Trades use a trailing stop instead of a hard Take Profit to capture
+exponential crypto runs.  The Kelly reward-to-risk ratio is based on the
+activation threshold and the initial stop loss (2.0)::
 
     f* = (p * b - (1 - p)) / b
 
-where *b* = TP / SL = 2 and *p* is the ML-predicted win probability.
+where *b* = ACTIVATION_PCT / INITIAL_SL = 2 and *p* is the ML-predicted
+win probability.
 
 A half-Kelly multiplier (0.5) is applied to reduce variance::
 
@@ -17,6 +19,15 @@ A half-Kelly multiplier (0.5) is applied to reduce variance::
 
 When the Kelly fraction is zero or negative the trade has a non-positive
 expected value and no position is opened.
+
+Trailing stop parameters
+------------------------
+* ``INITIAL_SL``:        Hard stop loss during the entry phase (0.75 %).
+* ``ACTIVATION_PCT``:    Minimum profit required to activate the trailing
+                         stop (1.5 %).  Once this threshold is reached the
+                         active stop loss updates dynamically.
+* ``TRAILING_DISTANCE``: Gap maintained between the running peak price and
+                         the trailing stop level (0.5 %).
 
 Multi-asset risk controls:
 
@@ -33,10 +44,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ── Trade parameters ──────────────────────────────────────────────────────────
-STOP_LOSS_PCT: float = 0.0075   # 0.75 %
-TAKE_PROFIT_PCT: float = 0.015  # 1.5 %
-_REWARD_RISK_RATIO: float = TAKE_PROFIT_PCT / STOP_LOSS_PCT   # 2.0
-_HALF_KELLY: float = 0.5        # Half-Kelly multiplier
+INITIAL_SL: float = 0.0075          # 0.75 % hard stop loss for initial protection
+ACTIVATION_PCT: float = 0.015       # 1.5 % profit required to activate trailing stop
+TRAILING_DISTANCE: float = 0.005    # 0.5 % trailing distance from the highest peak
+_REWARD_RISK_RATIO: float = ACTIVATION_PCT / INITIAL_SL   # 2.0
+_HALF_KELLY: float = 0.5            # Half-Kelly multiplier
 
 MAX_POSITIONS: int = 3          # Maximum simultaneous open positions
 
