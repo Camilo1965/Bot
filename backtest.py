@@ -38,7 +38,7 @@ import ccxt
 import numpy as np
 import pandas as pd
 
-from risk.risk_manager import ACTIVATION_PCT, INITIAL_SL, RISK_PER_TRADE, TRAILING_DISTANCE
+from risk.risk_manager import ACTIVATION_PCT, INITIAL_SL, RISK_PER_TRADE, TRAILING_DISTANCE, LEVERAGE
 from strategy.ml_predictor import MLPredictor, compute_htf_trend
 
 # ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -291,7 +291,7 @@ def _simulate(
             if low_j <= active_sl:
                 exit_price  = active_sl
                 pnl_pct     = (exit_price - entry_price) / entry_price
-                outcome_pnl = position_usdt * pnl_pct
+                outcome_pnl = (position_usdt * LEVERAGE) * pnl_pct
                 # Label the exit: TSL when the trailing stop has moved above
                 # the initial SL; plain SL otherwise.
                 exit_reason = "TSL" if active_sl > initial_sl_price else "SL"
@@ -302,7 +302,7 @@ def _simulate(
             # Reached end of data without hitting TP or SL; close at last close
             last_price  = float(closes_15m[-1])
             pnl_pct     = (last_price - entry_price) / entry_price
-            outcome_pnl = position_usdt * pnl_pct
+            outcome_pnl = (position_usdt * LEVERAGE) * pnl_pct
 
         # ── 7. Update portfolio ─────────────────────────────────────────────
         balance += outcome_pnl
