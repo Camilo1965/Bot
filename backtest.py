@@ -58,7 +58,7 @@ _SIX_MONTHS_MS    = 183 * 24 * 60 * 60 * 1_000
 
 _TRAIN_RATIO      = 0.70               # 70 % train / 30 % test  (chronological)
 _STARTING_CAPITAL = 10_000.0           # USDT
-_RISK_PER_TRADE   = 0.02               # 2 % of current balance per trade
+_RISK_PER_TRADE   = 0.15               # 15 % of current balance per trade
 _ACTIVATION_PCT   = 0.015             # +1.5 % profit activates trailing stop
 _TRAILING_DISTANCE = 0.005            # 0.5 % trailing gap below running peak
 _INITIAL_SL_PCT   = 0.0075            # −0.75 % hard stop loss (initial protection)
@@ -260,7 +260,7 @@ def _simulate(
             i += 1
             continue
 
-        # ── 5. Position sizing (fixed 2 % risk) ────────────────────────────
+        # ── 5. Position sizing (fixed 15 % risk) ───────────────────────────
         entry_price      = float(closes_15m[i])
         position_usdt    = balance * _RISK_PER_TRADE
         initial_sl_price = entry_price * (1.0 - _INITIAL_SL_PCT)
