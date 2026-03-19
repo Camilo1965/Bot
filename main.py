@@ -492,7 +492,7 @@ async def preload_historical_data(
     state: dict[str, Any],
     watchlist: list[str],
     timeframe: str = "15m",
-    limit: int = 100,
+    limit: int = 1000,
 ) -> None:
     """[ELITE] Fast REST Warmup – populate price/high/low buffers before WebSocket starts.
 
@@ -502,8 +502,9 @@ async def preload_historical_data(
     the first live WebSocket kline arrives the buffer is already pre-filled,
     bypassing the ``[AI WARMUP]`` phase entirely.
 
-    Also fetches 1H and 4H candles to pre-fill the higher-timeframe buffers
-    used by the Multi-Timeframe Analysis (MTA) trend filter.
+    Also fetches 1H and 4H candles (up to *limit* each) to pre-fill the
+    higher-timeframe buffers used by the Multi-Timeframe Analysis (MTA) trend
+    filter, providing a deep history for fractal analysis.
     """
     log = logging.getLogger("clawdbot.preload")
     exchange = ccxt_async.binance({"enableRateLimit": True})
@@ -535,10 +536,9 @@ async def preload_historical_data(
 
             # ── 1H and 4H HTF buffers ──────────────────────────────────────
             for htf in ("1h", "4h"):
-                htf_limit = 100 if htf == "1h" else 50
                 try:
                     htf_ohlcv = await exchange.fetch_ohlcv(
-                        symbol, timeframe=htf, limit=htf_limit
+                        symbol, timeframe=htf, limit=limit
                     )
                     htf_closes = state.get("htf_closes", {}).get(symbol, {})
                     htf_opens = state.get("htf_opens", {}).get(symbol, {})
@@ -595,10 +595,10 @@ async def main() -> None:
     news_queue: asyncio.Queue[list[str]] = asyncio.Queue()
     shared_state: dict[str, Any] = {
         "sentiment": 0.0,
-        "prices": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
+        "prices": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         # [ELITE] OHLCV buffers for ADX / ATR computation
-        "highs": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
-        "lows": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
+        "highs": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
+        "lows": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         # [ELITE] Latest Order Book Imbalance ratio per symbol
         "obi_ratios": {symbol: 1.0 for symbol in WATCHLIST},
         # [ELITE] Latest perpetual-futures funding rate per symbol
@@ -610,11 +610,11 @@ async def main() -> None:
         "last_kline_ts": {symbol: None for symbol in WATCHLIST},
         # [MTA] Higher-timeframe OHLCV buffers (1h and 4h)
         "htf_closes": {
-            symbol: {"1h": deque(maxlen=200), "4h": deque(maxlen=100)}
+            symbol: {"1h": deque(maxlen=1000), "4h": deque(maxlen=1000)}
             for symbol in WATCHLIST
         },
         "htf_opens": {
-            symbol: {"1h": deque(maxlen=200), "4h": deque(maxlen=100)}
+            symbol: {"1h": deque(maxlen=1000), "4h": deque(maxlen=1000)}
             for symbol in WATCHLIST
         },
         "htf_last_ts": {
@@ -646,7 +646,7 @@ async def main() -> None:
         logger.info("ℹ️ No pre-trained model found – will warm-start from historical DB data.")
         for sym in WATCHLIST:
             try:
-                historical_prices = await db.fetch_market_data(symbol=sym, limit=500)
+                historical_prices = await db.fetch_market_data(symbol=sym, limit=1000)
                 if historical_prices:
                     shared_state["prices"][sym].extend(historical_prices)
                     # Train the model once using the first available symbol's data
