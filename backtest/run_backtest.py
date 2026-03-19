@@ -2,12 +2,13 @@
 backtest.run_backtest
 ~~~~~~~~~~~~~~~~~~~~~
 
-Downloads 1 year of 15-minute BTC/USDT OHLCV data from Binance via ccxt,
-engineers the same features used by MLPredictor, trains an XGBoost model
-on the first 70 % of data, evaluates on the remaining 30 %, prints
-backtest performance metrics (Total Return, Win Rate), and saves the
-trained model to ``models/xgb_live.json`` so that ``main.py`` can load
-it at startup instead of training from scratch.
+Downloads 1 year of 15-minute OHLCV data from Binance via ccxt for each
+symbol in ``_SYMBOLS``, engineers the same features used by MLPredictor,
+trains an XGBoost model on the first 70 % of data, evaluates on the
+remaining 30 %, prints per-coin and global portfolio backtest performance
+metrics (Total Return, Win Rate), and saves the trained model for BTC/USDT
+to ``models/xgb_live.json`` so that ``main.py`` can load it at startup
+instead of training from scratch.
 
 Usage
 -----
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Constants (must mirror strategy/ml_predictor.py)
 # ---------------------------------------------------------------------------
 
-_SYMBOL = "BTC/USDT"
+_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 _TIMEFRAME = "15m"
 _FETCH_LIMIT = 1000         # ccxt max per request
 _PREDICTION_HORIZON = 5     # ticks ahead used as the label
@@ -70,7 +71,7 @@ _MAX_HOLDING_PERIOD = 50
 # Data download
 # ---------------------------------------------------------------------------
 
-def fetch_ohlcv(symbol: str = _SYMBOL, timeframe: str = _TIMEFRAME) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str = "BTC/USDT", timeframe: str = _TIMEFRAME) -> pd.DataFrame:
     """Download ~1 year of 15-minute OHLCV data from Binance.
 
     Returns a DataFrame with columns:
@@ -315,67 +316,96 @@ def save_model(model: XGBClassifier, path: Path = _MODEL_PATH) -> None:
 # ---------------------------------------------------------------------------
 
 def run() -> None:
-    """End-to-end backtest: download → features → train → evaluate → save."""
+    """End-to-end backtest: download → features → train → evaluate → save (all symbols)."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # 1. Download data
-    df = fetch_ohlcv()
+    all_stats: list[dict] = []
 
-    # 2. Build features & labels
-    feat_df = build_features(df)
-    logger.info("Feature matrix shape: %s", feat_df.shape)
+    for symbol in _SYMBOLS:
+        logger.info("=" * 55)
+        logger.info("Starting backtest for %s", symbol)
+        logger.info("=" * 55)
 
-    # 3. Train / test split (70 / 30, chronological)
-    split_idx = int(len(feat_df) * _TRAIN_RATIO)
-    train_df = feat_df.iloc[:split_idx]
-    test_df = feat_df.iloc[split_idx:].reset_index(drop=True)
+        # 1. Download data
+        df = fetch_ohlcv(symbol)
 
-    X_train = train_df[_FEATURE_COLS]
-    y_train = train_df["label"].astype(int)
-    X_test = test_df[_FEATURE_COLS]
-    y_test = test_df["label"].astype(int)
+        # 2. Build features & labels
+        feat_df = build_features(df)
+        logger.info("Feature matrix shape: %s", feat_df.shape)
 
-    logger.info(
-        "Train samples: %d  |  Test samples: %d",
-        len(X_train),
-        len(X_test),
-    )
+        # 3. Train / test split (70 / 30, chronological)
+        split_idx = int(len(feat_df) * _TRAIN_RATIO)
+        train_df = feat_df.iloc[:split_idx]
+        test_df = feat_df.iloc[split_idx:].reset_index(drop=True)
 
-    # 4. Train XGBoost
-    model = XGBClassifier(
-        n_estimators=100,
-        max_depth=4,
-        learning_rate=0.1,
-        eval_metric="logloss",
-        random_state=42,
-    )
-    model.fit(X_train, y_train)
+        X_train = train_df[_FEATURE_COLS]
+        y_train = train_df["label"].astype(int)
+        X_test = test_df[_FEATURE_COLS]
+        y_test = test_df["label"].astype(int)
 
-    # 5. Evaluate on test set
-    y_pred = model.predict(X_test)
-    accuracy = float(np.mean(y_pred == y_test.values))
+        logger.info(
+            "Train samples: %d  |  Test samples: %d",
+            len(X_train),
+            len(X_test),
+        )
 
-    backtest_stats = simulate_backtest(test_df, model)
+        # 4. Train XGBoost
+        model = XGBClassifier(
+            n_estimators=100,
+            max_depth=4,
+            learning_rate=0.1,
+            eval_metric="logloss",
+            random_state=42,
+        )
+        model.fit(X_train, y_train)
 
-    print("\n" + "=" * 55)
-    print("          BACKTEST PERFORMANCE REPORT")
-    print("=" * 55)
-    print(f"  Symbol        : {_SYMBOL}  ({_TIMEFRAME} candles)")
-    print(f"  Training rows : {len(X_train)}")
-    print(f"  Test rows     : {len(X_test)}")
-    print(f"  Label accuracy: {accuracy * 100:.2f} %")
-    print("-" * 55)
-    print(f"  Total trades  : {backtest_stats['total_trades']}")
-    print(f"  Winning trades: {backtest_stats['winning_trades']}")
-    print(f"  Win Rate      : {backtest_stats['win_rate_pct']:.2f} %")
-    print(f"  Total Return  : {backtest_stats['total_return_pct']:.2f} %")
-    print("=" * 55 + "\n")
+        # 5. Evaluate on test set
+        y_pred = model.predict(X_test)
+        accuracy = float(np.mean(y_pred == y_test.values))
 
-    # 6. Save the trained model
-    save_model(model)
+        backtest_stats = simulate_backtest(test_df, model)
+
+        # Per-coin report
+        print("\n" + "=" * 55)
+        print(f"     BACKTEST PERFORMANCE REPORT  –  {symbol}")
+        print("=" * 55)
+        print(f"  Symbol        : {symbol}  ({_TIMEFRAME} candles)")
+        print(f"  Training rows : {len(X_train)}")
+        print(f"  Test rows     : {len(X_test)}")
+        print(f"  Label accuracy: {accuracy * 100:.2f} %")
+        print("-" * 55)
+        print(f"  Total trades  : {backtest_stats['total_trades']}")
+        print(f"  Winning trades: {backtest_stats['winning_trades']}")
+        print(f"  Win Rate      : {backtest_stats['win_rate_pct']:.2f} %")
+        print(f"  Total Return  : {backtest_stats['total_return_pct']:.2f} %")
+        print("=" * 55 + "\n")
+
+        all_stats.append({"symbol": symbol, **backtest_stats})
+
+        # Save model for BTC/USDT (the primary live-trading model)
+        if symbol == _SYMBOLS[0]:
+            save_model(model)
+
+    # Global portfolio report
+    if all_stats:
+        total_trades = sum(s["total_trades"]   for s in all_stats)
+        total_wins   = sum(s["winning_trades"] for s in all_stats)
+        total_return = sum(s["total_return_pct"] for s in all_stats)
+        combined_wr  = (total_wins / total_trades * 100.0) if total_trades > 0 else 0.0
+
+        print("\n" + "=" * 55)
+        print("        GLOBAL PORTFOLIO REPORT")
+        print("=" * 55)
+        print(f"  Symbols       : {', '.join(s['symbol'] for s in all_stats)}")
+        print(f"  Starting cap  : 10,000.00 USDT  (shared / simulated)")
+        print("-" * 55)
+        print(f"  Total trades  : {total_trades}")
+        print(f"  Combined WR   : {combined_wr:.2f} %")
+        print(f"  Combined Ret. : {total_return:.2f} %")
+        print("=" * 55 + "\n")
 
 
 if __name__ == "__main__":

@@ -1,16 +1,16 @@
 """
 backtest.py
 ~~~~~~~~~~~
-Historical backtesting engine for the BTC/USDT XGBoost + MTA strategy.
+Historical backtesting engine for a multi-symbol XGBoost + MTA strategy.
 
-Downloads the last 6 months of 15-minute, 1-hour and 4-hour BTC/USDT
-OHLCV data from Binance via ccxt, trains an XGBoost model on the first
-70 % of the 15-minute series, and simulates the full XGBoost +
-Multi-Timeframe Analysis (MTA) strategy on the remaining 30 %.
+Downloads the last 6 months of 15-minute, 1-hour and 4-hour OHLCV data
+from Binance via ccxt for each symbol in ``_SYMBOLS``, trains an XGBoost
+model on the first 70 % of the 15-minute series, and simulates the full
+XGBoost + Multi-Timeframe Analysis (MTA) strategy on the remaining 30 %.
 
 Risk parameters
 ---------------
-* Starting capital    : 10,000 USDT
+* Starting capital    : 10,000 USDT  (shared across the portfolio)
 * Risk per trade      : 2 % of current balance  (fixed fractional)
 * Initial Stop Loss   : −0.75 %  (hard floor from entry)
 * Trailing activation : +1.5 % profit activates the trailing stop
@@ -52,7 +52,7 @@ _RESET  = "\033[0m"
 logger = logging.getLogger(__name__)
 
 # ── Back-test parameters ──────────────────────────────────────────────────────
-_SYMBOL           = "BTC/USDT"
+_SYMBOLS          = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 _FETCH_LIMIT      = 1_000              # max candles per ccxt request
 _SIX_MONTHS_MS    = 183 * 24 * 60 * 60 * 1_000
 
@@ -346,7 +346,7 @@ def _simulate(
 
 # ── Performance report ────────────────────────────────────────────────────────
 
-def _print_report(stats: dict, train_rows: int, test_rows: int) -> None:
+def _print_report(stats: dict, train_rows: int, test_rows: int, symbol: str = "") -> None:
     """Print a colorized performance summary to the terminal."""
     pnl     = stats["total_pnl_usdt"]
     pnl_pct = stats["total_pnl_pct"]
@@ -362,7 +362,7 @@ def _print_report(stats: dict, train_rows: int, test_rows: int) -> None:
     print(f"{_BOLD}{_CYAN}{'═' * w}{_RESET}")
     print(f"{_BOLD}{_CYAN}{'  BACKTEST PERFORMANCE REPORT':^{w}}{_RESET}")
     print(f"{_BOLD}{_CYAN}{'═' * w}{_RESET}")
-    print(f"  {_DIM}Symbol       :{_RESET}  {_BOLD}{_SYMBOL}  (15m / 1H / 4H MTA){_RESET}")
+    print(f"  {_DIM}Symbol       :{_RESET}  {_BOLD}{symbol}  (15m / 1H / 4H MTA){_RESET}")
     print(f"  {_DIM}Train candles:{_RESET}  {train_rows:,}")
     print(f"  {_DIM}Test candles :{_RESET}  {test_rows:,}")
     print(f"  {_DIM}Risk / trade :{_RESET}  {_RISK_PER_TRADE * 100:.0f} %  "
@@ -384,10 +384,60 @@ def _print_report(stats: dict, train_rows: int, test_rows: int) -> None:
     print()
 
 
+def _print_coin_summary(symbol: str, stats: dict) -> None:
+    """Print a compact per-coin mini-summary."""
+    pnl    = stats["total_pnl_usdt"]
+    wr     = stats["win_rate_pct"]
+    trades = stats["total_trades"]
+
+    pnl_color = _GREEN if pnl >= 0 else _RED
+    wr_color  = _GREEN if wr >= 50 else _RED
+
+    w = 60
+    print(f"{_BOLD}{_CYAN}{'─' * w}{_RESET}")
+    print(
+        f"  {_BOLD}{symbol:<12}{_RESET}"
+        f"  Trades: {_BOLD}{trades:>4}{_RESET}"
+        f"  Win Rate: {wr_color}{_BOLD}{wr:>6.2f} %{_RESET}"
+        f"  PnL: {pnl_color}{_BOLD}{pnl:>+10,.2f} USDT{_RESET}"
+    )
+
+
+def _print_portfolio_report(symbol_stats: list[tuple[str, dict]]) -> None:
+    """Print a global aggregated portfolio report across all symbols."""
+    total_pnl    = sum(s["total_pnl_usdt"] for _, s in symbol_stats)
+    total_trades = sum(s["total_trades"]    for _, s in symbol_stats)
+    total_wins   = sum(s["wins"]            for _, s in symbol_stats)
+    combined_wr  = (total_wins / total_trades * 100.0) if total_trades > 0 else 0.0
+    max_dd       = max(s["max_drawdown_pct"] for _, s in symbol_stats)
+
+    pnl_color = _GREEN if total_pnl >= 0 else _RED
+    wr_color  = _GREEN if combined_wr >= 50 else _RED
+    dd_color  = _GREEN if max_dd < 10 else (_YELLOW if max_dd < 20 else _RED)
+
+    w = 60
+    print()
+    print(f"{_BOLD}{_CYAN}{'═' * w}{_RESET}")
+    print(f"{_BOLD}{_CYAN}{'  GLOBAL PORTFOLIO REPORT':^{w}}{_RESET}")
+    print(f"{_BOLD}{_CYAN}{'═' * w}{_RESET}")
+    print(f"  {_DIM}Symbols      :{_RESET}  {', '.join(s for s, _ in symbol_stats)}")
+    print(f"  {_DIM}Starting cap :{_RESET}  {_STARTING_CAPITAL:,.2f} USDT  (shared / simulated)")
+    print(f"{_CYAN}{'─' * w}{_RESET}")
+    print(f"  {_DIM}Total trades :{_RESET}  {_BOLD}{total_trades}{_RESET}")
+    print(f"  {_DIM}Combined WR  :{_RESET}  "
+          f"{wr_color}{_BOLD}{combined_wr:.2f} %{_RESET}")
+    print(f"  {_DIM}Total PnL    :{_RESET}  "
+          f"{pnl_color}{_BOLD}{total_pnl:+,.2f} USDT{_RESET}")
+    print(f"  {_DIM}Max Port. DD :{_RESET}  "
+          f"{dd_color}{_BOLD}{max_dd:.2f} %{_RESET}")
+    print(f"{_BOLD}{_CYAN}{'═' * w}{_RESET}")
+    print()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """End-to-end backtest: download → train → simulate → report."""
+    """End-to-end backtest: download → train → simulate → report (all symbols)."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -395,46 +445,69 @@ def main() -> None:
 
     exchange = ccxt.binance({"enableRateLimit": True})
 
-    # 1. Download 6 months of OHLCV data for all three timeframes
-    df_15m = _fetch_ohlcv(exchange, _SYMBOL, "15m")
-    df_1h  = _fetch_ohlcv(exchange, _SYMBOL, "1h")
-    df_4h  = _fetch_ohlcv(exchange, _SYMBOL, "4h")
+    symbol_stats: list[tuple[str, dict]] = []
 
-    # 2. Chronological 70/30 train/test split on the 15m series
-    split_idx  = int(len(df_15m) * _TRAIN_RATIO)
-    train_15m  = df_15m.iloc[:split_idx]
-    test_count = len(df_15m) - split_idx
+    w = 60
+    print()
+    print(f"{_BOLD}{_CYAN}{'═' * w}{_RESET}")
+    print(f"{_BOLD}{_CYAN}{'  MULTI-SYMBOL BACKTEST':^{w}}{_RESET}")
+    print(f"{_BOLD}{_CYAN}{'  Symbols: ' + ', '.join(_SYMBOLS):^{w}}{_RESET}")
+    print(f"{_BOLD}{_CYAN}{'═' * w}{_RESET}")
 
-    logger.info(
-        "Data split: train=%d  test=%d (15m candles)",
-        len(train_15m),
-        test_count,
-    )
+    for symbol in _SYMBOLS:
+        logger.info("=" * 60)
+        logger.info("Starting backtest for %s", symbol)
+        logger.info("=" * 60)
 
-    # 3. Train the XGBoost model on the training portion
-    predictor = MLPredictor()
-    ok = predictor.warm_start(
-        prices=train_15m["close"].tolist(),
-        highs=train_15m["high"].tolist(),
-        lows=train_15m["low"].tolist(),
-    )
-    if not ok:
-        logger.error("MLPredictor training failed – insufficient data.")
-        return
+        # 1. Download 6 months of OHLCV data for all three timeframes
+        df_15m = _fetch_ohlcv(exchange, symbol, "15m")
+        df_1h  = _fetch_ohlcv(exchange, symbol, "1h")
+        df_4h  = _fetch_ohlcv(exchange, symbol, "4h")
 
-    logger.info("MLPredictor trained.  Starting simulation …")
+        # 2. Chronological 70/30 train/test split on the 15m series
+        split_idx  = int(len(df_15m) * _TRAIN_RATIO)
+        train_15m  = df_15m.iloc[:split_idx]
+        test_count = len(df_15m) - split_idx
 
-    # 4. Run the portfolio simulation on the test portion
-    stats = _simulate(
-        df_15m,
-        df_1h,
-        df_4h,
-        predictor,
-        split_idx=split_idx,
-    )
+        logger.info(
+            "Data split: train=%d  test=%d (15m candles)",
+            len(train_15m),
+            test_count,
+        )
 
-    # 5. Print the colorized performance report
-    _print_report(stats, train_rows=len(train_15m), test_rows=test_count)
+        # 3. Train the XGBoost model on the training portion
+        predictor = MLPredictor()
+        ok = predictor.warm_start(
+            prices=train_15m["close"].tolist(),
+            highs=train_15m["high"].tolist(),
+            lows=train_15m["low"].tolist(),
+        )
+        if not ok:
+            logger.error("MLPredictor training failed for %s – insufficient data.", symbol)
+            continue
+
+        logger.info("MLPredictor trained for %s.  Starting simulation …", symbol)
+
+        # 4. Run the portfolio simulation on the test portion
+        stats = _simulate(
+            df_15m,
+            df_1h,
+            df_4h,
+            predictor,
+            split_idx=split_idx,
+        )
+
+        # 5. Print the colorized per-symbol performance report
+        _print_report(stats, train_rows=len(train_15m), test_rows=test_count, symbol=symbol)
+
+        # 6. Print per-coin mini-summary
+        _print_coin_summary(symbol, stats)
+
+        symbol_stats.append((symbol, stats))
+
+    # 7. Print global portfolio report
+    if symbol_stats:
+        _print_portfolio_report(symbol_stats)
 
 
 if __name__ == "__main__":
