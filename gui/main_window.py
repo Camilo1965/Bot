@@ -22,8 +22,8 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -32,6 +32,8 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
+    QPushButton,
     QSplitter,
     QTextEdit,
     QVBoxLayout,
@@ -50,6 +52,9 @@ DEFAULT_SYMBOL = WATCHLIST[0]
 
 # Minimum rendered height for a doji (zero-body) candle, in price units
 _MIN_CANDLE_HEIGHT: float = 0.01
+
+# Fractional price offset (0.1 %) applied when placing trade markers above/below candles
+_MARKER_OFFSET_PCT: float = 0.001
 
 # ---------------------------------------------------------------------------
 # Dark-theme QSS stylesheet
@@ -147,6 +152,27 @@ QScrollBar::handle:vertical {
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0;
 }
+
+/* ── Emergency stop button ──────────────────────────────── */
+QPushButton#emergency_stop {
+    background-color: #b91c1c;
+    color: #ffffff;
+    border: 2px solid #ef4444;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: bold;
+    padding: 10px 8px;
+    letter-spacing: 0.02em;
+}
+
+QPushButton#emergency_stop:hover {
+    background-color: #dc2626;
+    border-color: #fca5a5;
+}
+
+QPushButton#emergency_stop:pressed {
+    background-color: #991b1b;
+}
 """
 
 
@@ -178,6 +204,34 @@ def _make_card(label: str, initial_value: str = "—") -> tuple[QFrame, QLabel]:
     layout.addWidget(val_lbl)
     layout.addWidget(cap_lbl)
     return frame, val_lbl
+
+
+# ---------------------------------------------------------------------------
+# TimeAxisItem – HH:MM labels for the X axis
+# ---------------------------------------------------------------------------
+
+
+class TimeAxisItem(pg.AxisItem):
+    """Custom bottom axis that formats UNIX-minutes as ``HH:MM`` strings.
+
+    The chart stores X values as ``epoch_seconds / 60`` (minutes since epoch).
+    ``tickStrings`` converts those back to a wall-clock ``HH:MM`` in UTC.
+    """
+
+    def tickStrings(  # noqa: N802
+        self,
+        values: list[float],
+        scale: float,
+        spacing: float,
+    ) -> list[str]:
+        result: list[str] = []
+        for v in values:
+            try:
+                dt = datetime.fromtimestamp(v * 60.0, tz=timezone.utc)
+                result.append(dt.strftime("%H:%M"))
+            except (OSError, OverflowError, ValueError):
+                result.append("")
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +346,12 @@ class WatchlistPane(QWidget):
 
         layout.addStretch()
 
+        # Emergency kill switch
+        self.emergency_btn = QPushButton("🛑  EMERGENCY STOP / LIQUIDATE")
+        self.emergency_btn.setObjectName("emergency_stop")
+        self.emergency_btn.setMinimumHeight(48)
+        layout.addWidget(self.emergency_btn)
+
     # ------------------------------------------------------------------ #
 
     def update_status(
@@ -326,7 +386,7 @@ class WatchlistPane(QWidget):
 
 
 class ChartPane(QWidget):
-    """pyqtgraph-based candlestick chart with volume bars."""
+    """pyqtgraph-based candlestick chart with volume bars and trade markers."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -344,16 +404,33 @@ class ChartPane(QWidget):
         self._graphics_layout = pg.GraphicsLayoutWidget()
         layout.addWidget(self._graphics_layout)
 
-        # Price chart
+        # Price chart – use a custom TimeAxisItem for the bottom axis.
+        time_axis = TimeAxisItem(orientation="bottom")
+        time_axis.setStyle(tickFont=QFont("Consolas", 9))
         self._price_plot: pg.PlotItem = self._graphics_layout.addPlot(
-            row=0, col=0, title=""
+            row=0, col=0, title="", axisItems={"bottom": time_axis}
         )
         self._price_plot.showGrid(x=True, y=True, alpha=0.15)
         self._price_plot.getAxis("left").setStyle(tickFont=QFont("Consolas", 9))
-        self._price_plot.getAxis("bottom").setStyle(tickFont=QFont("Consolas", 9))
 
         self._candles = CandlestickItem()
         self._price_plot.addItem(self._candles)
+
+        # Sniper-point scatter items: BUY (green ▲) and SELL (red ▼).
+        self._buy_markers = pg.ScatterPlotItem(
+            symbol="t1",  # upward-pointing triangle
+            size=14,
+            pen=pg.mkPen(None),
+            brush=pg.mkBrush("#00ff88"),
+        )
+        self._sell_markers = pg.ScatterPlotItem(
+            symbol="t",  # downward-pointing triangle
+            size=14,
+            pen=pg.mkPen(None),
+            brush=pg.mkBrush("#ff4444"),
+        )
+        self._price_plot.addItem(self._buy_markers)
+        self._price_plot.addItem(self._sell_markers)
 
         # Volume chart (smaller, below price)
         self._graphics_layout.nextRow()
@@ -378,7 +455,11 @@ class ChartPane(QWidget):
     def set_symbol(self, symbol: str) -> None:
         self._title_lbl.setText(f"{symbol}  •  15m".upper())
 
-    def update_chart(self, ohlcv: list[dict[str, Any]]) -> None:
+    def update_chart(
+        self,
+        ohlcv: list[dict[str, Any]],
+        trades: list[dict[str, Any]] | None = None,
+    ) -> None:
         if not ohlcv:
             self._no_data_text.setVisible(True)
             return
@@ -418,7 +499,76 @@ class ChartPane(QWidget):
                 brush="#1f6feb",
             )
 
+        # ── Trade marker (sniper-point) overlay ──────────────────────────
+        self._update_trade_markers(trades or [], candle_data)
+
         self._price_plot.autoRange()
+
+    def _update_trade_markers(
+        self,
+        trades: list[dict[str, Any]],
+        candle_data: list[dict[str, float]],
+    ) -> None:
+        """Plot BUY (▲) and SELL (▼) markers on the price chart.
+
+        A green upward triangle is drawn *below* the candle low at the BUY
+        entry time.  A red downward triangle is drawn *above* the candle high
+        at the SELL / trailing-stop exit time (or above the entry candle for
+        open trades whose exit_time is not yet known).
+        """
+        if not trades:
+            self._buy_markers.setData([], [])
+            self._sell_markers.setData([], [])
+            return
+
+        # Build a lookup from nearest candle t-value to its low/high.
+        candle_map: dict[float, dict[str, float]] = {c["t"]: c for c in candle_data}
+        candle_ts = sorted(candle_map.keys())
+
+        def _nearest_candle(time_val: Any) -> dict[str, float] | None:
+            if time_val is None:
+                return None
+            if isinstance(time_val, datetime):
+                t = time_val.timestamp() / 60.0
+            else:
+                t = float(time_val)
+            if not candle_ts:
+                return None
+            # Find the closest candle by absolute distance.
+            closest = min(candle_ts, key=lambda ct: abs(ct - t))
+            return candle_map[closest]
+
+        buy_xs: list[float] = []
+        buy_ys: list[float] = []
+        sell_xs: list[float] = []
+        sell_ys: list[float] = []
+
+        for trade in trades:
+            entry_time_val = trade.get("entry_time")
+            exit_time_val = trade.get("exit_time")
+            exit_price = trade.get("exit_price")
+
+            # BUY marker – below the candle low at entry time.
+            entry_candle = _nearest_candle(entry_time_val)
+            if entry_candle is not None:
+                buy_xs.append(entry_candle["t"])
+                buy_ys.append(entry_candle["low"] * (1.0 - _MARKER_OFFSET_PCT))
+
+            # SELL / trailing-stop marker – above the candle high at exit time.
+            if exit_time_val is not None and exit_price is not None:
+                exit_candle = _nearest_candle(exit_time_val)
+                if exit_candle is not None:
+                    sell_xs.append(exit_candle["t"])
+                    sell_ys.append(exit_candle["high"] * (1.0 + _MARKER_OFFSET_PCT))
+
+        self._buy_markers.setData(
+            x=np.array(buy_xs, dtype=float),
+            y=np.array(buy_ys, dtype=float),
+        )
+        self._sell_markers.setData(
+            x=np.array(sell_xs, dtype=float),
+            y=np.array(sell_ys, dtype=float),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +672,11 @@ class MainWindow(QMainWindow):
             self._on_symbol_changed
         )
 
+        # Emergency kill switch
+        self._watchlist_pane.emergency_btn.clicked.connect(
+            self._on_emergency_stop
+        )
+
     # ------------------------------------------------------------------
     # DB reader
     # ------------------------------------------------------------------
@@ -546,7 +701,10 @@ class MainWindow(QMainWindow):
             active_trades=payload["active_trades"],
             sentiment=payload["sentiment"],
         )
-        self._chart_pane.update_chart(payload["ohlcv"])
+        self._chart_pane.update_chart(
+            ohlcv=payload["ohlcv"],
+            trades=payload.get("trades", []),
+        )
 
     def _on_symbol_changed(self, symbol: str) -> None:
         if symbol:
@@ -554,6 +712,23 @@ class MainWindow(QMainWindow):
             self._chart_pane.set_symbol(symbol)
             ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
             self._log_pane.append(f"[{ts}] Symbol switched to {symbol}")
+
+    def _on_emergency_stop(self) -> None:
+        """Show a confirmation dialog; if confirmed, flag emergency stop in the DB."""
+        reply = QMessageBox.warning(
+            self,
+            "⚠  Emergency Stop Confirmation",
+            "This will LIQUIDATE ALL ACTIVE POSITIONS and halt the trading engine.\n\n"
+            "Are you absolutely sure?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._db_reader.request_emergency_stop()
+            ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
+            self._log_pane.append_error(
+                f"[{ts}] ⚠ EMERGENCY STOP issued – liquidating all positions…"
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle

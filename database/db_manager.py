@@ -103,6 +103,25 @@ CREATE TABLE IF NOT EXISTS trades_history (
 );
 """
 
+_CREATE_COMMANDS = """
+CREATE TABLE IF NOT EXISTS commands (
+    id         SERIAL       PRIMARY KEY,
+    command    TEXT         NOT NULL,
+    issued_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    consumed   BOOLEAN      NOT NULL DEFAULT FALSE
+);
+"""
+
+_FETCH_PENDING_COMMANDS = """
+SELECT id, command FROM commands
+WHERE consumed = FALSE
+ORDER BY issued_at ASC;
+"""
+
+_MARK_COMMAND_CONSUMED = """
+UPDATE commands SET consumed = TRUE WHERE id = $1;
+"""
+
 _INSERT_OPEN_TRADE = """
 INSERT INTO trades_history
     (symbol, entry_price, position_size, entry_time, status)
@@ -304,6 +323,30 @@ class DatabaseManager:
             row = await conn.fetchrow(_FETCH_TOTAL_PNL)
         return float(row["total_pnl"])  # type: ignore[index]
 
+    async def fetch_pending_commands(self) -> list[dict]:
+        """Return all unread rows from the *commands* table.
+
+        Each dict contains ``id`` (int) and ``command`` (str).  The caller is
+        responsible for marking consumed rows via :meth:`mark_command_consumed`.
+        """
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_FETCH_PENDING_COMMANDS)
+        return [{"id": r["id"], "command": r["command"]} for r in rows]
+
+    async def mark_command_consumed(self, command_id: int) -> None:
+        """Mark a command row as consumed so it is not processed again.
+
+        Parameters
+        ----------
+        command_id: Primary key of the row in the *commands* table.
+        """
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            await conn.execute(_MARK_COMMAND_CONSUMED, command_id)
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -315,6 +358,7 @@ class DatabaseManager:
             await conn.execute(_CREATE_MARKET_DATA)
             await conn.execute(_CREATE_NEWS_SENTIMENT)
             await conn.execute(_CREATE_TRADES_HISTORY)
+            await conn.execute(_CREATE_COMMANDS)
             await conn.execute(_CREATE_HYPERTABLE_MARKET)
             await conn.execute(_CREATE_HYPERTABLE_SENTIMENT)
         logger.info("TimescaleDB schema initialised.")
