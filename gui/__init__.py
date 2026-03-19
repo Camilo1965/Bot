@@ -1,0 +1,1 @@
+"""ClawdBot desktop GUI package."""

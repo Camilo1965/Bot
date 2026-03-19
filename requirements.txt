@@ -28,3 +28,7 @@ vectorbt
 
 # Configuration
 python-dotenv
+
+# Desktop GUI
+PyQt6
+pyqtgraph
