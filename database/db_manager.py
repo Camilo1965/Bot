@@ -144,6 +144,28 @@ FROM trades_history
 WHERE status = 'closed';
 """
 
+_CREATE_HTF_TREND_STATUS = """
+CREATE TABLE IF NOT EXISTS htf_trend_status (
+    symbol      TEXT         NOT NULL,
+    timeframe   TEXT         NOT NULL,
+    trend       TEXT         NOT NULL DEFAULT 'neutral',
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (symbol, timeframe)
+);
+"""
+
+_UPSERT_HTF_TREND = """
+INSERT INTO htf_trend_status (symbol, timeframe, trend, updated_at)
+VALUES ($1, $2, $3, NOW())
+ON CONFLICT (symbol, timeframe) DO UPDATE
+SET trend = EXCLUDED.trend, updated_at = NOW();
+"""
+
+_FETCH_HTF_TRENDS = """
+SELECT symbol, timeframe, trend
+FROM htf_trend_status;
+"""
+
 
 # ---------------------------------------------------------------------------
 # Manager class
@@ -312,6 +334,42 @@ class DatabaseManager:
         async with self._pool.acquire() as conn:
             await conn.execute(_CLOSE_TRADE, trade_id, exit_price, ts, pnl)
 
+    async def upsert_htf_trend(
+        self,
+        symbol: str,
+        timeframe: str,
+        trend: str,
+    ) -> None:
+        """Insert or update the HTF trend status for a symbol/timeframe pair.
+
+        Parameters
+        ----------
+        symbol:    Trading pair, e.g. ``"BTC/USDT"``.
+        timeframe: Candle timeframe, e.g. ``"4h"``, ``"1h"``, ``"15m"``.
+        trend:     Trend direction: ``"bullish"``, ``"bearish"``, or ``"neutral"``.
+        """
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            await conn.execute(_UPSERT_HTF_TREND, symbol, timeframe, trend)
+
+    async def fetch_htf_trends(self) -> dict[str, dict[str, str]]:
+        """Return all HTF trend statuses keyed by ``symbol → timeframe → trend``.
+
+        Returns an empty dict when no entries exist yet.
+        """
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_FETCH_HTF_TRENDS)
+        result: dict[str, dict[str, str]] = {}
+        for row in rows:
+            sym = row["symbol"]
+            tf = row["timeframe"]
+            trend = row["trend"]
+            result.setdefault(sym, {})[tf] = trend
+        return result
+
     async def fetch_total_pnl(self) -> float:
         """Return the sum of all realised PnL from closed trades.
 
@@ -359,6 +417,7 @@ class DatabaseManager:
             await conn.execute(_CREATE_NEWS_SENTIMENT)
             await conn.execute(_CREATE_TRADES_HISTORY)
             await conn.execute(_CREATE_COMMANDS)
+            await conn.execute(_CREATE_HTF_TREND_STATUS)
             await conn.execute(_CREATE_HYPERTABLE_MARKET)
             await conn.execute(_CREATE_HYPERTABLE_SENTIMENT)
         logger.info("TimescaleDB schema initialised.")

@@ -36,7 +36,7 @@ from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
-from strategy.ml_predictor import MLPredictor
+from strategy.ml_predictor import MLPredictor, compute_htf_trend
 from strategy.sentiment_analyzer import SentimentAnalyzer
 
 load_dotenv()
@@ -151,34 +151,58 @@ async def market_consumer(
 
         elif message.get("type") == "kline":
             # ----------------------------------------------------------------
-            # Update the prices buffer with 15-minute candle close prices.
-            # Also store high and low for ADX / ATR computation.
-            # Deduplicate by timestamp so each completed candle contributes
-            # exactly one entry – matching the backtester's OHLCV data.
+            # Route kline messages by timeframe.
+            # 15m candles update the primary price/high/low buffers used by
+            # the ML model.  1H and 4H candles update the HTF buffers used by
+            # the Multi-Timeframe Analysis (MTA) trend filter.
+            # All timeframes are deduplicated by timestamp.
             # ----------------------------------------------------------------
+            timeframe: str = message.get("timeframe", "15m")
             close_price = message.get("close")
+            open_price = message.get("open")
             high_price = message.get("high")
             low_price = message.get("low")
             candle_ts = message.get("timestamp")
-            if close_price is not None and candle_ts is not None:
-                last_ts = state["last_kline_ts"].get(symbol)
-                if candle_ts != last_ts:
-                    state["last_kline_ts"][symbol] = candle_ts
-                    prices_dict: dict[str, deque[float]] = state["prices"]
-                    if symbol in prices_dict:
-                        prices_dict[symbol].append(float(close_price))
-                    # [ELITE] Store high / low for ADX/ATR features
-                    if high_price is not None and symbol in state.get("highs", {}):
-                        state["highs"][symbol].append(float(high_price))
-                    if low_price is not None and symbol in state.get("lows", {}):
-                        state["lows"][symbol].append(float(low_price))
-                    logger.info(
-                        "📊 [KLINE] %s – new 15m candle close=%.2f | Buffer: %d/%d",
-                        symbol,
-                        float(close_price),
-                        len(prices_dict.get(symbol, [])),
-                        prices_dict[symbol].maxlen if symbol in prices_dict else 0,
-                    )
+
+            if timeframe == "15m":
+                if close_price is not None and candle_ts is not None:
+                    last_ts = state["last_kline_ts"].get(symbol)
+                    if candle_ts != last_ts:
+                        state["last_kline_ts"][symbol] = candle_ts
+                        prices_dict: dict[str, deque[float]] = state["prices"]
+                        if symbol in prices_dict:
+                            prices_dict[symbol].append(float(close_price))
+                        # [ELITE] Store high / low for ADX/ATR features
+                        if high_price is not None and symbol in state.get("highs", {}):
+                            state["highs"][symbol].append(float(high_price))
+                        if low_price is not None and symbol in state.get("lows", {}):
+                            state["lows"][symbol].append(float(low_price))
+                        logger.info(
+                            "📊 [KLINE] %s – new 15m candle close=%.2f | Buffer: %d/%d",
+                            symbol,
+                            float(close_price),
+                            len(prices_dict.get(symbol, [])),
+                            prices_dict[symbol].maxlen if symbol in prices_dict else 0,
+                        )
+
+            elif timeframe in ("1h", "4h"):
+                if close_price is not None and candle_ts is not None:
+                    htf_last = state.get("htf_last_ts", {}).get(symbol, {})
+                    last_htf_ts = htf_last.get(timeframe)
+                    if candle_ts != last_htf_ts:
+                        htf_last[timeframe] = candle_ts
+                        htf_closes = state.get("htf_closes", {}).get(symbol, {})
+                        htf_opens = state.get("htf_opens", {}).get(symbol, {})
+                        if timeframe in htf_closes and close_price is not None:
+                            htf_closes[timeframe].append(float(close_price))
+                        if timeframe in htf_opens and open_price is not None:
+                            htf_opens[timeframe].append(float(open_price))
+                        logger.info(
+                            "📊 [HTF KLINE] %s – new %s candle close=%.2f",
+                            symbol,
+                            timeframe.upper(),
+                            float(close_price),
+                        )
 
         elif message.get("type") == "order_book":
             bids: list[Any] = message.get("bids", [])
@@ -296,6 +320,42 @@ async def signal_emitter(
             obi_ratio: float = state.get("obi_ratios", {}).get(symbol, 1.0)
             funding_rate: float = state.get("funding_rates", {}).get(symbol, 0.0)
 
+            # [MTA] Compute higher-timeframe trend statuses
+            closes_4h: list[float] = list(
+                state.get("htf_closes", {}).get(symbol, {}).get("4h", [])
+            )
+            opens_4h: list[float] = list(
+                state.get("htf_opens", {}).get(symbol, {}).get("4h", [])
+            )
+            closes_1h: list[float] = list(
+                state.get("htf_closes", {}).get(symbol, {}).get("1h", [])
+            )
+            opens_1h: list[float] = list(
+                state.get("htf_opens", {}).get(symbol, {}).get("1h", [])
+            )
+
+            trend_4h = compute_htf_trend(closes_4h, opens_4h or None)
+            trend_1h = compute_htf_trend(closes_1h, opens_1h or None)
+            trend_15m = compute_htf_trend(prices, None)
+
+            # Update shared state and persist to DB
+            state.setdefault("htf_trend", {}).setdefault(symbol, {})
+            state["htf_trend"][symbol] = {
+                "4h": trend_4h,
+                "1h": trend_1h,
+                "15m": trend_15m,
+            }
+            for tf, trend in (("4h", trend_4h), ("1h", trend_1h), ("15m", trend_15m)):
+                try:
+                    await db.upsert_htf_trend(symbol, tf, trend)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[MTA] DB upsert_htf_trend failed for %s/%s: %s", symbol, tf, exc)
+
+            logger.info(
+                "🔭 [MTA RADAR] %s – 4H=%s | 1H=%s | 15M=%s",
+                symbol, trend_4h, trend_1h, trend_15m,
+            )
+
             signal = predictor.generate_signal(
                 prices,
                 sentiment,
@@ -303,6 +363,8 @@ async def signal_emitter(
                 lows=lows or None,
                 obi_ratio=obi_ratio,
                 funding_rate=funding_rate,
+                htf_trend_4h=trend_4h,
+                htf_trend_1h=trend_1h,
             )
             win_prob: float = predictor.predict_proba(
                 prices,
@@ -430,7 +492,7 @@ async def preload_historical_data(
     state: dict[str, Any],
     watchlist: list[str],
     timeframe: str = "15m",
-    limit: int = 100,
+    limit: int = 1000,
 ) -> None:
     """[ELITE] Fast REST Warmup – populate price/high/low buffers before WebSocket starts.
 
@@ -439,11 +501,16 @@ async def preload_historical_data(
     and low values to the respective shared-state deques.  This means that when
     the first live WebSocket kline arrives the buffer is already pre-filled,
     bypassing the ``[AI WARMUP]`` phase entirely.
+
+    Also fetches 1H and 4H candles (up to *limit* each) to pre-fill the
+    higher-timeframe buffers used by the Multi-Timeframe Analysis (MTA) trend
+    filter, providing a deep history for fractal analysis.
     """
     log = logging.getLogger("clawdbot.preload")
     exchange = ccxt_async.binance({"enableRateLimit": True})
     try:
         for symbol in watchlist:
+            # ── 15m primary buffer ─────────────────────────────────────────
             try:
                 ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
                 # ohlcv rows: [timestamp, open, high, low, close, volume]
@@ -466,6 +533,34 @@ async def preload_historical_data(
                     symbol,
                     exc,
                 )
+
+            # ── 1H and 4H HTF buffers ──────────────────────────────────────
+            for htf in ("1h", "4h"):
+                try:
+                    htf_ohlcv = await exchange.fetch_ohlcv(
+                        symbol, timeframe=htf, limit=limit
+                    )
+                    htf_closes = state.get("htf_closes", {}).get(symbol, {})
+                    htf_opens = state.get("htf_opens", {}).get(symbol, {})
+                    for candle in htf_ohlcv:
+                        _, open_price, _high, _low, close, _volume = candle
+                        if close is not None and htf in htf_closes:
+                            htf_closes[htf].append(float(close))
+                        if open_price is not None and htf in htf_opens:
+                            htf_opens[htf].append(float(open_price))
+                    log.info(
+                        "[MTA] Preloaded %d %s candles for %s.",
+                        len(htf_ohlcv),
+                        htf.upper(),
+                        symbol,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "[MTA] Could not preload %s candles for %s: %s",
+                        htf.upper(),
+                        symbol,
+                        exc,
+                    )
     finally:
         await exchange.close()
 
@@ -500,10 +595,10 @@ async def main() -> None:
     news_queue: asyncio.Queue[list[str]] = asyncio.Queue()
     shared_state: dict[str, Any] = {
         "sentiment": 0.0,
-        "prices": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
+        "prices": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         # [ELITE] OHLCV buffers for ADX / ATR computation
-        "highs": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
-        "lows": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
+        "highs": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
+        "lows": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         # [ELITE] Latest Order Book Imbalance ratio per symbol
         "obi_ratios": {symbol: 1.0 for symbol in WATCHLIST},
         # [ELITE] Latest perpetual-futures funding rate per symbol
@@ -513,6 +608,24 @@ async def main() -> None:
         "news_hold_until": None,       # datetime | None
         # Per-symbol last seen kline timestamp for deduplication
         "last_kline_ts": {symbol: None for symbol in WATCHLIST},
+        # [MTA] Higher-timeframe OHLCV buffers (1h and 4h)
+        "htf_closes": {
+            symbol: {"1h": deque(maxlen=1000), "4h": deque(maxlen=1000)}
+            for symbol in WATCHLIST
+        },
+        "htf_opens": {
+            symbol: {"1h": deque(maxlen=1000), "4h": deque(maxlen=1000)}
+            for symbol in WATCHLIST
+        },
+        "htf_last_ts": {
+            symbol: {"1h": None, "4h": None}
+            for symbol in WATCHLIST
+        },
+        # [MTA] Computed trend status per symbol/timeframe
+        "htf_trend": {
+            symbol: {"1h": "neutral", "4h": "neutral", "15m": "neutral"}
+            for symbol in WATCHLIST
+        },
     }
 
     analyzer = SentimentAnalyzer()
@@ -533,7 +646,7 @@ async def main() -> None:
         logger.info("ℹ️ No pre-trained model found – will warm-start from historical DB data.")
         for sym in WATCHLIST:
             try:
-                historical_prices = await db.fetch_market_data(symbol=sym, limit=500)
+                historical_prices = await db.fetch_market_data(symbol=sym, limit=1000)
                 if historical_prices:
                     shared_state["prices"][sym].extend(historical_prices)
                     # Train the model once using the first available symbol's data
