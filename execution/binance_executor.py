@@ -91,9 +91,9 @@ def create_exchange(
 async def fetch_usdt_balance(exchange: ccxt_async.binanceusdm) -> float | None:
     """Return the total USDT wallet balance from Binance Futures.
 
-    Queries :meth:`ccxt.Exchange.fetch_balance` and extracts
-    ``totalWalletBalance`` from the ``info`` payload (Binance Futures) or
-    falls back to the top-level ``USDT.total`` field.
+    Uses the Futures-specific ``/fapi/v2/account`` endpoint directly via
+    :meth:`ccxt.Exchange.fapiPrivateV2GetAccount` to avoid hitting any
+    Spot/SAPI endpoints that are not valid for Futures-only credentials.
 
     Parameters
     ----------
@@ -106,14 +106,13 @@ async def fetch_usdt_balance(exchange: ccxt_async.binanceusdm) -> float | None:
         Total wallet balance in USDT, or *None* if the request fails.
     """
     try:
-        balance = await exchange.fetch_balance({'type': 'future'})
-        # Binance Futures returns `totalWalletBalance` inside `info`.
-        total = balance.get("info", {}).get("totalWalletBalance")
-        if total is None:
-            # Fallback: ccxt normalised structure
-            total = (balance.get("USDT") or {}).get("total")
-        if total is not None:
-            return float(total)
+        response = await exchange.fapiPrivateV2GetAccount()
+        assets = response.get("assets", [])
+        for asset in assets:
+            if asset.get("asset") == "USDT":
+                total = asset.get("walletBalance")
+                if total is not None:
+                    return float(total)
         logger.warning(
             "fetch_usdt_balance: could not extract USDT balance from response."
         )
