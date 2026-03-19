@@ -58,8 +58,9 @@ _MODEL_DIR = Path(__file__).parent.parent / "models"
 _MODEL_PATH = _MODEL_DIR / "xgb_live.json"
 
 # Simulated trade parameters (must mirror risk/risk_manager.py)
-_TAKE_PROFIT_PCT = 0.015   # 1.5 %
-_STOP_LOSS_PCT = 0.0075    # 0.75 %
+_ACTIVATION_PCT = 0.015    # 1.5 % profit activates trailing stop
+_TRAILING_DISTANCE = 0.005 # 0.5 % trailing gap below running peak
+_INITIAL_SL_PCT = 0.0075   # 0.75 % initial hard stop loss
 
 # Maximum number of candles to hold a simulated position before closing at market
 _MAX_HOLDING_PERIOD = 50
@@ -108,6 +109,14 @@ def fetch_ohlcv(symbol: str = _SYMBOL, timeframe: str = _TIMEFRAME) -> pd.DataFr
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """Compute technical indicator features from OHLCV data.
 
+    Parameters
+    ----------
+    df:
+        OHLCV DataFrame with columns ``timestamp``, ``open``, ``high``,
+        ``low``, ``close``, and ``volume``.  The ``high`` and ``low``
+        columns are required both for indicator calculation (ATR, ADX) and
+        to support intra-candle trailing stop simulation.
+
     Adds the following columns (matching _FEATURE_COLS):
         sentiment  – always 0.0 (no live sentiment in historical data)
         rsi        – RSI-14 using Wilder's exponential smoothing
@@ -118,6 +127,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         adx        – Average Directional Index (14-period)
         atr        – Average True Range (14-period)
         label      – 1 if close rises after _PREDICTION_HORIZON ticks, else 0
+
+    Also passes through ``high`` and ``low`` columns for the trailing stop
+    simulation in :func:`simulate_backtest`.
 
     Rows without a complete window or future label are dropped.
     """
@@ -171,7 +183,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     # Label: 1 if price is higher after horizon steps
     label = (series.shift(-_PREDICTION_HORIZON) > series).astype(float)
 
-    feat_df = df[["timestamp", "close"]].copy()
+    feat_df = df[["timestamp", "close", "high", "low"]].copy()
     feat_df["sentiment"] = 0.0
     feat_df["rsi"] = rsi
     feat_df["sma_ratio"] = sma_ratio
@@ -201,16 +213,21 @@ def simulate_backtest(
     model: XGBClassifier,
     buy_threshold: float = 0.62,
 ) -> dict[str, float]:
-    """Simulate a simple long-only strategy on the test set.
+    """Simulate a simple long-only strategy on the test set using a trailing stop.
 
-    A BUY signal is generated when the model's upward-probability
-    exceeds ``buy_threshold``.  Each simulated trade is held until either
-    the Take-Profit (+1.5 %) or Stop-Loss (-0.75 %) is hit against the close
-    prices that follow the entry candle.
+    A BUY signal is generated when the model's upward-probability exceeds
+    ``buy_threshold``.  Each simulated trade is protected by an initial hard
+    stop loss (``_INITIAL_SL_PCT``) and, once the position gains
+    ``_ACTIVATION_PCT``, a trailing stop that follows the running price peak
+    at a distance of ``_TRAILING_DISTANCE``.
+
+    The intra-candle high is used to update the highest price seen and raise
+    the trailing SL; the intra-candle low is used to detect stop-loss hits.
 
     Parameters
     ----------
-    feat_df:        Feature DataFrame (test split) with a ``close`` column.
+    feat_df:        Feature DataFrame (test split) with ``close``, ``high``,
+                    and ``low`` columns.
     model:          Trained XGBClassifier.
     buy_threshold:  Minimum predicted probability to open a long trade.
 
@@ -222,6 +239,8 @@ def simulate_backtest(
     probas = model.predict_proba(X)[:, 1]
 
     closes = feat_df["close"].values
+    highs  = feat_df["high"].values
+    lows   = feat_df["low"].values
     total_return = 0.0
     wins = 0
     trades = 0
@@ -229,22 +248,32 @@ def simulate_backtest(
     i = 0
     while i < len(feat_df):
         if probas[i] > buy_threshold:
-            entry = closes[i]
-            tp = entry * (1 + _TAKE_PROFIT_PCT)
-            sl = entry * (1 - _STOP_LOSS_PCT)
+            entry        = closes[i]
+            active_sl    = entry * (1 - _INITIAL_SL_PCT)
+            highest_seen = entry
             exited = False
             # Scan subsequent candles for exit
             for j in range(i + 1, min(i + _MAX_HOLDING_PERIOD, len(feat_df))):
-                price = closes[j]
-                if price >= tp:
-                    total_return += _TAKE_PROFIT_PCT * 100
-                    wins += 1
-                    trades += 1
-                    i = j
-                    exited = True
-                    break
-                if price <= sl:
-                    total_return -= _STOP_LOSS_PCT * 100
+                high_j = highs[j]
+                low_j  = lows[j]
+
+                # Track intra-candle high for trailing stop calculation
+                if high_j > highest_seen:
+                    highest_seen = high_j
+
+                # Update trailing SL once activation threshold is reached
+                if (highest_seen - entry) / entry >= _ACTIVATION_PCT:
+                    tsl = highest_seen * (1 - _TRAILING_DISTANCE)
+                    if tsl > active_sl:
+                        active_sl = tsl
+
+                # Check if the candle's low hits the active stop loss
+                if low_j <= active_sl:
+                    exit_price = active_sl
+                    pct = (exit_price - entry) / entry * 100
+                    total_return += pct
+                    if pct > 0:
+                        wins += 1
                     trades += 1
                     i = j
                     exited = True
