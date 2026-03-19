@@ -10,7 +10,7 @@ Position size formula::
 
 where:
 * ``RISK_PER_TRADE`` is the fraction of the balance risked per trade (15 %).
-* ``LEVERAGE``       is the futures leverage multiplier (3×, conservative).
+* ``LEVERAGE``       is the futures leverage multiplier (5× – Elite Sniper).
 
 Trailing stop parameters
 ------------------------
@@ -50,7 +50,7 @@ ACTIVATION_PCT: float = 0.03       # 3 % profit required to activate trailing st
 TRAILING_DISTANCE: float = 0.02    # 2 % trailing distance from the highest peak
 
 # ── Futures / leverage parameters ─────────────────────────────────────────────
-LEVERAGE: int = 3                   # Conservative 3× futures leverage
+LEVERAGE: int = 5                   # 5× futures leverage (Elite Sniper)
 RISK_PER_TRADE: float = 0.15        # 15 % of balance risked per trade
 
 # ── Daily-loss safety break ───────────────────────────────────────────────────

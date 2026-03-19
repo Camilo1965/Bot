@@ -38,7 +38,7 @@ import ccxt
 import numpy as np
 import pandas as pd
 
-from risk.risk_manager import RISK_PER_TRADE
+from risk.risk_manager import ACTIVATION_PCT, INITIAL_SL, RISK_PER_TRADE, TRAILING_DISTANCE
 from strategy.ml_predictor import MLPredictor, compute_htf_trend
 
 # ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -59,13 +59,6 @@ _SIX_MONTHS_MS    = 183 * 24 * 60 * 60 * 1_000
 
 _TRAIN_RATIO      = 0.70               # 70 % train / 30 % test  (chronological)
 _STARTING_CAPITAL = 10_000.0           # USDT
-
-# Hard-coded risk parameters for the backtest simulation.
-# These values are intentionally defined here to ensure the simulation
-# always uses the correct constants regardless of risk_manager settings.
-ACTIVATION_PCT: float = 0.03     # 3 % profit required to activate trailing stop
-TRAILING_DISTANCE: float = 0.02  # 2 % trailing distance from the highest peak
-INITIAL_SL: float = 0.015        # 1.5 % hard initial stop loss
 
 # Neutral sentiment mock (no live news in historical data).
 # Increase toward +1.0 to open the ML sentiment gate for more BUY signals.
