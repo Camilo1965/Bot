@@ -106,7 +106,7 @@ async def fetch_usdt_balance(exchange: ccxt_async.binanceusdm) -> float | None:
         Total wallet balance in USDT, or *None* if the request fails.
     """
     try:
-        balance = await exchange.fetch_balance()
+        balance = await exchange.fetch_balance({'type': 'future'})
         # Binance Futures returns `totalWalletBalance` inside `info`.
         total = balance.get("info", {}).get("totalWalletBalance")
         if total is None:
