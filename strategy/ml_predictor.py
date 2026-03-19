@@ -7,7 +7,7 @@ next 5 price ticks (order-book snapshots).
 
 Signal generation rules
 -----------------------
-* probability > 0.62 AND sentiment_score >= 0.0  → **BUY**
+* probability > 0.75 AND sentiment_score > 0.3   → **BUY**
 * probability < 0.3 AND sentiment_score < -0.3   → **SELL**
 * otherwise                                      → **HOLD**
 
@@ -60,8 +60,8 @@ from xgboost import XGBClassifier
 logger = logging.getLogger(__name__)
 
 # Signal thresholds
-_BUY_PROB_THRESHOLD = 0.62
-_BUY_SENTIMENT_THRESHOLD = 0.0
+_BUY_PROB_THRESHOLD = 0.75
+_BUY_SENTIMENT_THRESHOLD = 0.3
 _SELL_PROB_THRESHOLD = 0.3
 _SELL_SENTIMENT_THRESHOLD = -0.3
 
@@ -643,7 +643,7 @@ class MLPredictor:
         ``"BUY"``, ``"SELL"``, or ``"HOLD"`` with the following logic:
 
         Base ML signal:
-          * probability > 0.62 AND sentiment >= 0.0  → BUY
+          * probability > 0.75 AND sentiment > 0.3   → BUY
           * probability < 0.3  AND sentiment < -0.3  → SELL
           * otherwise                                → HOLD
 
@@ -670,7 +670,7 @@ class MLPredictor:
             return "HOLD"
 
         # ── Base ML signal ────────────────────────────────────────────────
-        if probability > _BUY_PROB_THRESHOLD and sentiment_score >= _BUY_SENTIMENT_THRESHOLD:
+        if probability > _BUY_PROB_THRESHOLD and sentiment_score > _BUY_SENTIMENT_THRESHOLD:
             base_signal: Signal = "BUY"
         elif probability < _SELL_PROB_THRESHOLD and sentiment_score < _SELL_SENTIMENT_THRESHOLD:
             base_signal = "SELL"
@@ -700,7 +700,7 @@ class MLPredictor:
 
         elif adx < _ADX_RANGE_THRESHOLD:
             # Mean-Reversion mode: oversold/overbought bounces
-            if rsi < _RSI_OVERSOLD and sentiment_score >= 0:
+            if rsi < _RSI_OVERSOLD and sentiment_score > _BUY_SENTIMENT_THRESHOLD:
                 if signal != "BUY":
                     signal = "BUY"
                     elite_factors.append(
