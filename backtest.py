@@ -12,9 +12,9 @@ Risk parameters
 ---------------
 * Starting capital    : 10,000 USDT  (shared across the portfolio)
 * Risk per trade      : 15 % of current balance  (fixed fractional, from risk_manager)
-* Initial Stop Loss   : −0.75 %  (hard floor from entry, from risk_manager)
-* Trailing activation : +3 % profit activates the trailing stop (from risk_manager)
-* Trailing distance   : 2 % below the running price peak (from risk_manager)
+* Initial Stop Loss   : −1.5 %  (hard floor from entry)
+* Trailing activation : +3 % profit activates the trailing stop
+* Trailing distance   : 2 % below the running price peak
 
 Sentiment mock
 --------------
@@ -38,12 +38,7 @@ import ccxt
 import numpy as np
 import pandas as pd
 
-from risk.risk_manager import (
-    ACTIVATION_PCT,
-    INITIAL_SL,
-    RISK_PER_TRADE,
-    TRAILING_DISTANCE,
-)
+from risk.risk_manager import RISK_PER_TRADE
 from strategy.ml_predictor import MLPredictor, compute_htf_trend
 
 # ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -64,6 +59,13 @@ _SIX_MONTHS_MS    = 183 * 24 * 60 * 60 * 1_000
 
 _TRAIN_RATIO      = 0.70               # 70 % train / 30 % test  (chronological)
 _STARTING_CAPITAL = 10_000.0           # USDT
+
+# Hard-coded risk parameters for the backtest simulation.
+# These values are intentionally defined here to ensure the simulation
+# always uses the correct constants regardless of risk_manager settings.
+ACTIVATION_PCT: float = 0.03     # 3 % profit required to activate trailing stop
+TRAILING_DISTANCE: float = 0.02  # 2 % trailing distance from the highest peak
+INITIAL_SL: float = 0.015        # 1.5 % hard initial stop loss
 
 # Neutral sentiment mock (no live news in historical data).
 # Increase toward +1.0 to open the ML sentiment gate for more BUY signals.
