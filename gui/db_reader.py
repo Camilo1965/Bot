@@ -182,13 +182,11 @@ class DBReaderThread(QThread):
             await conn.close()
 
     async def _fetch_all(self, conn: Any) -> dict[str, Any]:
-        """Run all queries in parallel and assemble the payload dict."""
-        ohlcv_rows, pnl_row, trade_rows, sentiment_row = await asyncio.gather(
-            conn.fetch(_OHLCV_QUERY, self.symbol),
-            conn.fetchrow(_TOTAL_PNL_QUERY),
-            conn.fetch(_ACTIVE_TRADES_QUERY),
-            conn.fetchrow(_LATEST_SENTIMENT_QUERY),
-        )
+        """Run all queries sequentially and assemble the payload dict."""
+        ohlcv_rows = await conn.fetch(_OHLCV_QUERY, self.symbol)
+        pnl_row = await conn.fetchrow(_TOTAL_PNL_QUERY)
+        trade_rows = await conn.fetch(_ACTIVE_TRADES_QUERY)
+        sentiment_row = await conn.fetchrow(_LATEST_SENTIMENT_QUERY)
 
         ohlcv = [
             {
