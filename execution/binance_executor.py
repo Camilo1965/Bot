@@ -69,10 +69,19 @@ def create_exchange(
     if testnet:
         # set_sandbox_mode is deprecated for binanceusdm futures; point directly
         # to the Binance Futures Testnet base URL instead.
-        exchange.urls["api"] = "https://testnet.binancefuture.com"
+        # ccxt dispatches fetch_balance (and other calls) to sub-keys such as
+        # fapiPublic, fapiPrivate, and sapi.  Override all of them so that every
+        # request stays on the testnet and none fall back to the production sapi
+        # endpoint (which rejects testnet credentials).
+        testnet_base = "https://testnet.binancefuture.com/fapi/v1"
+        exchange.urls["api"] = {
+            "fapiPublic": testnet_base,
+            "fapiPrivate": testnet_base,
+            "sapi": testnet_base,
+        }
         logger.info(
             "[TESTNET] Binance Futures Testnet client created "
-            "(base URL -> https://testnet.binancefuture.com)."
+            "(all API sub-endpoints -> https://testnet.binancefuture.com/fapi/v1)."
         )
     else:
         logger.info("[LIVE] Binance Futures live client created.")
