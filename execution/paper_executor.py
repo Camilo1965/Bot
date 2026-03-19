@@ -2,7 +2,8 @@
 execution.paper_executor
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Simulates order execution and logs completed trades to TimescaleDB.
+Simulates order execution (paper trading) and, when a live Binance Futures
+exchange client is supplied, submits real market orders via the ccxt API.
 
 Opens and closes paper positions based on the trailing stop thresholds
 defined in :mod:`risk.risk_manager`.  Each completed trade is persisted to
@@ -13,13 +14,29 @@ A BUY position is protected as follows:
 * **Initial Stop Loss** (SL): price falls ≥ ``INITIAL_SL`` (0.75 %) below
   entry price.  This hard floor is active from the moment the trade opens.
 * **Trailing Stop** (TS): once the position gains ≥ ``ACTIVATION_PCT``
-  (1.5 %) the active stop loss updates dynamically to
-  ``peak_price * (1 - TRAILING_DISTANCE)`` (0.5 % below the running peak).
+  (2 %) the active stop loss updates dynamically to
+  ``peak_price * (1 - TRAILING_DISTANCE)`` (1.5 % below the running peak).
   The stop only moves up — it never retreats — allowing the trade to capture
   exponential crypto runs while locking in profit.
 
 The trade exits **only** when the current price drops below the active stop
 loss (initial SL before activation, trailing SL afterwards).
+
+Binance Futures live execution
+------------------------------
+Pass a ccxt ``binanceusdm`` (or equivalent Binance Futures) async client as
+the *exchange* constructor argument to enable live order placement.  Each
+trade open will call ``exchange.create_market_buy_order`` and each close will
+call ``exchange.create_market_sell_order``, both with
+``params={'leverage': LEVERAGE}`` so the exchange applies the configured
+leverage.
+
+Safety break
+------------
+Before opening a new position :meth:`try_open_trade` checks
+:meth:`~risk.risk_manager.RiskManager.is_trading_halted`.  If the daily loss
+limit (3 % of the day's opening balance) has been reached, the call is
+rejected until the 24-hour halt expires.
 
 Multi-asset support: up to ``risk_manager.max_positions`` independent
 positions may be open simultaneously, one per symbol.  Attempting to open a
@@ -31,9 +48,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from risk.risk_manager import INITIAL_SL, ACTIVATION_PCT, TRAILING_DISTANCE, RiskManager
+from risk.risk_manager import INITIAL_SL, ACTIVATION_PCT, TRAILING_DISTANCE, LEVERAGE, RiskManager
 
 if TYPE_CHECKING:
     from database.db_manager import DatabaseManager
@@ -60,7 +77,7 @@ class OpenPosition:
 
 
 class PaperExecutor:
-    """Simulate order execution for multiple symbols simultaneously.
+    """Simulate (and optionally live-execute) order execution for multiple symbols.
 
     Parameters
     ----------
@@ -74,6 +91,11 @@ class PaperExecutor:
     symbol:
         Default trading pair (e.g. ``"BTC/USDT"``).  Used when callers do
         not explicitly pass a *symbol* argument.
+    exchange:
+        Optional ccxt async Binance Futures client
+        (e.g. ``ccxt.pro.binanceusdm``).  When provided, real market orders
+        are placed on Binance Futures in addition to the paper simulation.
+        When ``None`` (default) the executor runs in pure paper-trading mode.
     """
 
     def __init__(
@@ -81,10 +103,12 @@ class PaperExecutor:
         db: DatabaseManager,
         risk_manager: RiskManager,
         symbol: str = "BTC/USDT",
+        exchange: Any | None = None,
     ) -> None:
         self._db = db
         self._risk = risk_manager
         self.symbol = symbol
+        self._exchange = exchange
         self.open_positions: dict[str, OpenPosition] = {}
         self.total_pnl: float = 0.0
 
@@ -99,13 +123,18 @@ class PaperExecutor:
         symbol: str | None = None,
         timestamp: datetime | None = None,
     ) -> bool:
-        """Size and open a new paper trade using the Kelly Criterion.
+        """Size and open a new trade using the leverage-based position formula.
 
         Returns *False* (and does nothing) if:
 
+        * Trading is currently halted due to the daily loss limit.
         * A position for *symbol* is already open.
         * The maximum number of concurrent positions has been reached.
         * The simulated balance is insufficient.
+
+        When an *exchange* client was provided at construction time a real
+        market buy order is placed on Binance Futures
+        (``create_market_buy_order`` with ``params={'leverage': LEVERAGE}``).
 
         Parameters
         ----------
@@ -119,6 +148,13 @@ class PaperExecutor:
             Trade entry time (UTC).  Defaults to *now*.
         """
         sym = symbol or self.symbol
+
+        if self._risk.is_trading_halted():
+            logger.warning(
+                "Trade skipped – trading is halted due to daily loss limit (symbol=%s).",
+                sym,
+            )
+            return False
 
         if sym in self.open_positions:
             logger.debug("Trade skipped – a position for %s is already open.", sym)
@@ -143,6 +179,32 @@ class PaperExecutor:
         ts = timestamp or datetime.now(tz=timezone.utc)
         self._risk.deduct(position_size)
         self._risk.register_open()
+
+        # ── Live Binance Futures order ─────────────────────────────────────
+        if self._exchange is not None:
+            try:
+                # Set leverage at the symbol level (required by Binance Futures).
+                await self._exchange.set_leverage(LEVERAGE, sym)
+                # position_size is the leveraged notional value; convert to base
+                # currency quantity by dividing by the entry price.
+                amount = position_size / entry_price
+                await self._exchange.create_market_buy_order(
+                    sym,
+                    amount,
+                    params={"leverage": LEVERAGE},
+                )
+                logger.info(
+                    "FUTURES BUY ORDER PLACED  symbol=%s  amount=%.6f  leverage=%d",
+                    sym,
+                    amount,
+                    LEVERAGE,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to place Binance Futures buy order for %s – "
+                    "position recorded in paper simulation only.",
+                    sym,
+                )
 
         trade_id = await self._db.insert_open_trade(
             symbol=sym,
@@ -270,6 +332,30 @@ class PaperExecutor:
             )
             return
 
+        # ── Live Binance Futures order ─────────────────────────────────────
+        if self._exchange is not None:
+            try:
+                # position_size is the leveraged notional value; convert to base
+                # currency quantity by dividing by the exit price.
+                amount = pos.position_size / exit_price
+                await self._exchange.create_market_sell_order(
+                    symbol,
+                    amount,
+                    params={"leverage": LEVERAGE},
+                )
+                logger.info(
+                    "FUTURES SELL ORDER PLACED  symbol=%s  amount=%.6f  leverage=%d",
+                    symbol,
+                    amount,
+                    LEVERAGE,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to place Binance Futures sell order for %s – "
+                    "position closed in paper simulation only.",
+                    symbol,
+                )
+
         if pos.trade_id is not None:
             await self._db.close_trade(
                 trade_id=pos.trade_id,
@@ -281,6 +367,9 @@ class PaperExecutor:
         # Credit back the original stake plus any PnL (positive or negative)
         self._risk.credit(pos.position_size + pnl)
         self._risk.register_close()
+        # Record realised losses so the safety break can trigger if needed
+        if pnl < 0.0:
+            self._risk.record_daily_loss(-pnl)
         self.total_pnl += pnl
         del self.open_positions[symbol]
 
