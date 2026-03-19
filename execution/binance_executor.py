@@ -44,8 +44,11 @@ def create_exchange(
     secret:
         Binance API secret (production or testnet).
     testnet:
-        When *True* the client is switched to the Binance Futures Testnet
-        via :meth:`ccxt.Exchange.set_sandbox_mode`.
+        When *True* the client is pointed at the Binance Futures Testnet
+        (``https://testnet.binancefuture.com``) by overriding the exchange
+        ``urls['api']`` directly.  The deprecated
+        :meth:`ccxt.Exchange.set_sandbox_mode` call is intentionally avoided
+        because it is no longer supported for ``binanceusdm`` futures.
 
     Returns
     -------
@@ -64,9 +67,12 @@ def create_exchange(
         }
     )
     if testnet:
-        exchange.set_sandbox_mode(True)
+        # set_sandbox_mode is deprecated for binanceusdm futures; point directly
+        # to the Binance Futures Testnet base URL instead.
+        exchange.urls["api"] = "https://testnet.binancefuture.com"
         logger.info(
-            "[TESTNET] Binance Futures Testnet client created (sandbox mode enabled)."
+            "[TESTNET] Binance Futures Testnet client created "
+            "(base URL -> https://testnet.binancefuture.com)."
         )
     else:
         logger.info("[LIVE] Binance Futures live client created.")
