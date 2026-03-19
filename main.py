@@ -2,10 +2,10 @@
 ClawdBot – entry point.
 
 Sets up a structured JSON logger and starts the asyncio event loop.
-Runs the Binance WebSocket client (for all symbols in WATCHLIST) and the
-crypto-news collector concurrently; each incoming trade is logged together
-with the latest sentiment score.  Every order-book snapshot and scored
-headline is persisted to TimescaleDB.
+Runs the Binance WebSocket client (for all symbols in WATCHLIST) and a
+Gemini-powered sentiment refresher concurrently; each incoming trade is
+logged together with the latest sentiment score.  Every order-book snapshot
+and scored headline is persisted to TimescaleDB.
 
 An ML predictor (XGBoost) is warm-started from historical market data at
 startup and emits a BUY / SELL / HOLD signal for each symbol independently.
@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import json
+import os
 import sys
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -31,15 +32,58 @@ import ccxt.async_support as ccxt_async
 from dotenv import load_dotenv
 
 from data_ingestion.funding_rate_client import FundingRateClient
-from data_ingestion.news_client import DEFAULT_FEED_URL, run_news_client
+from data_ingestion.news_scraper import fetch_crypto_headlines
 from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import MLPredictor, compute_htf_trend
-from strategy.sentiment_analyzer import SentimentAnalyzer
+from strategy.sentiment_llm import get_gemini_sentiment
 
 load_dotenv()
+
+# ── ANSI colour helpers (no extra dependency) ─────────────────────────────────
+_YELLOW = "\033[33m"
+_RED    = "\033[31m"
+_BOLD   = "\033[1m"
+_RESET  = "\033[0m"
+
+
+def _check_env() -> None:
+    """Validate required environment variables before the bot starts.
+
+    * Verifies that a ``.env`` file exists next to this module.
+    * Confirms that ``GEMINI_API_KEY`` is set and non-empty.
+
+    On failure a human-readable, colorized message is printed to *stderr* and
+    the process exits with code 1 so no messy traceback reaches the user.
+    """
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        print(
+            f"\n{_BOLD}{_RED}⚠️  ERROR:{_RESET}{_RED} .env file not found.{_RESET}\n"
+            f"  Please copy {_YELLOW}.env.example{_RESET} to {_YELLOW}.env{_RESET}"
+            " and fill in your credentials:\n"
+            f"    cp .env.example .env\n"
+            f"  Then set {_BOLD}GEMINI_API_KEY{_RESET} inside .env.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key:
+        print(
+            f"\n{_BOLD}{_RED}⚠️  ERROR:{_RESET}{_RED} GEMINI_API_KEY is missing or empty.{_RESET}\n"
+            f"  Open your {_YELLOW}.env{_RESET} file and add:\n"
+            f"    {_BOLD}GEMINI_API_KEY=your_gemini_api_key_here{_RESET}\n"
+            f"  You can obtain a free key at "
+            f"{_YELLOW}https://aistudio.google.com/app/apikey{_RESET}\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+_check_env()
 
 # ── Multi-asset watchlist ─────────────────────────────────────────────────────
 WATCHLIST: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
@@ -81,35 +125,64 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     return logging.getLogger("clawdbot")
 
 
-async def sentiment_processor(
-    news_queue: asyncio.Queue[list[str]],
+async def gemini_sentiment_refresher(
     state: dict[str, Any],
-    analyzer: SentimentAnalyzer,
-    source: str = "cointelegraph",
+    interval: int = 1800,
 ) -> None:
+    """[LLM] Background task – refreshes the sentiment score every 30 minutes.
+
+    Fetches the latest crypto headlines from CoinTelegraph and CoinDesk via RSS
+    (using :func:`~data_ingestion.news_scraper.fetch_crypto_headlines`) and
+    passes them to :func:`~strategy.sentiment_llm.get_gemini_sentiment` to
+    obtain a single aggregated score.  The result is cached in
+    ``state["sentiment"]`` and persisted to TimescaleDB so the GUI Dashboard's
+    Sentiment Gauge always reflects the most recent value.
+    """
+    log = logging.getLogger("clawdbot.gemini")
     while True:
-        headlines = await news_queue.get()
-        score = analyzer.score_headlines(headlines)
-        state["sentiment"] = score
-        logger = logging.getLogger("clawdbot.sentiment")
-        logger.info(
-            "Sentiment updated – headlines=%d  score=%.4f",
-            len(headlines),
-            score,
-        )
-        for headline in headlines:
-            headline_score = analyzer.score_headline(headline)
-            ts = datetime.now(tz=timezone.utc)
-            try:
-                await db.insert_sentiment(
-                    headline=headline,
-                    sentiment_score=headline_score,
-                    source=source,
-                    timestamp=ts,
+        try:
+            loop = asyncio.get_event_loop()
+            # Run blocking I/O in a thread executor to avoid stalling the loop.
+            headlines: list[str] = await loop.run_in_executor(
+                None, fetch_crypto_headlines
+            )
+            if headlines:
+                score: float = await loop.run_in_executor(
+                    None, get_gemini_sentiment, headlines
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("DB insert_sentiment failed: %s", exc)
-        news_queue.task_done()
+                state["sentiment"] = score
+                log.info(
+                    "[LLM] Gemini sentiment updated – headlines=%d  score=%.4f",
+                    len(headlines),
+                    score,
+                )
+                ts = datetime.now(tz=timezone.utc)
+                try:
+                    # Store one aggregated DB row per refresh cycle rather than
+                    # one row per headline.  This keeps the news_sentiment table
+                    # lean while still making the latest Gemini score visible to
+                    # the GUI Dashboard's Sentiment Gauge.
+                    await db.insert_sentiment(
+                        headline=f"[Gemini batch: {len(headlines)} headlines]",
+                        sentiment_score=score,
+                        source="gemini-1.5-flash",
+                        timestamp=ts,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("[LLM] DB insert_sentiment failed: %s", exc)
+            else:
+                log.warning("[LLM] No headlines fetched – sentiment unchanged.")
+        except asyncio.CancelledError:
+            log.info("gemini_sentiment_refresher cancelled – shutting down.")
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "[LLM] Gemini refresher error (%s): %s – retrying in %ds",
+                type(exc).__name__,
+                exc,
+                interval,
+            )
+        await asyncio.sleep(interval)
 
 
 async def market_consumer(
@@ -592,7 +665,6 @@ async def main() -> None:
     await init_db()
 
     market_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    news_queue: asyncio.Queue[list[str]] = asyncio.Queue()
     shared_state: dict[str, Any] = {
         "sentiment": 0.0,
         "prices": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
@@ -628,7 +700,6 @@ async def main() -> None:
         },
     }
 
-    analyzer = SentimentAnalyzer()
     predictor = MLPredictor()
     ws_client = BinanceWebSocketClient(queue=market_queue, watchlist=WATCHLIST)
     funding_rate_client = FundingRateClient(symbols=WATCHLIST, state=shared_state)
@@ -676,8 +747,7 @@ async def main() -> None:
     try:
         await asyncio.gather(
             ws_client.run(),
-            run_news_client(news_queue),
-            sentiment_processor(news_queue, shared_state, analyzer, source=DEFAULT_FEED_URL),
+            gemini_sentiment_refresher(shared_state),
             market_consumer(market_queue, shared_state, paper_executor),
             signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
             dashboard_logger(paper_executor, risk_manager, interval=60),

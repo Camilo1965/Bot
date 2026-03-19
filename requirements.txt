@@ -19,6 +19,10 @@ transformers
 # Sentiment analysis
 vaderSentiment
 
+# LLM sentiment (Gemini)
+google-generativeai
+feedparser
+
 # Storage / caching
 redis
 asyncpg
