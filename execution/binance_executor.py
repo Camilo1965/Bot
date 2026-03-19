@@ -18,10 +18,10 @@ paper-simulation book-keeping still runs locally.
 
 Usage example::
 
-    from execution.binance_executor import create_exchange, fetch_usdt_balance
+    from execution.binance_executor import create_exchange, fetch_total_wallet_balance
 
     exchange = create_exchange(api_key, secret, testnet=True)
-    balance  = await fetch_usdt_balance(exchange)
+    balance  = await fetch_total_wallet_balance(exchange)
     await exchange.close()
 """
 
@@ -58,7 +58,7 @@ def create_exchange(
 
         * ``fapiPublic`` / ``fapiPrivate`` → ``/fapi/v1``
         * ``fapiPrivateV2`` → ``/fapi/v2``  (required for the account-info
-          endpoint used by :func:`fetch_usdt_balance`)
+          endpoint used by :func:`fetch_total_wallet_balance`)
 
         The ``sapi`` key (Binance Spot/Wallet API) is intentionally **not**
         included; pointing it at the Futures Demo host would return error
@@ -106,12 +106,16 @@ def create_exchange(
     return exchange
 
 
-async def fetch_usdt_balance(exchange: ccxt_async.binanceusdm) -> float | None:
-    """Return the total USDT wallet balance from Binance Futures.
+async def fetch_total_wallet_balance(exchange: ccxt_async.binanceusdm) -> float | None:
+    """Return the total wallet balance from Binance Futures.
 
     Uses the Futures-specific ``/fapi/v2/account`` endpoint directly via
     :meth:`ccxt.Exchange.fapiPrivateV2GetAccount` to avoid hitting any
     Spot/SAPI endpoints that are not valid for Futures-only credentials.
+
+    The ``totalWalletBalance`` field returned by the V2 account endpoint
+    reflects the combined balance of *all* margin assets (USDT, USDC, …),
+    making it suitable as starting capital for risk-management calculations.
 
     Parameters
     ----------
@@ -121,20 +125,18 @@ async def fetch_usdt_balance(exchange: ccxt_async.binanceusdm) -> float | None:
     Returns
     -------
     float | None
-        Total wallet balance in USDT, or *None* if the request fails.
+        Total wallet balance across all assets, or *None* if the request
+        fails.
     """
     try:
         response = await exchange.fapiPrivateV2GetAccount()
-        assets = response.get("assets", [])
-        for asset in assets:
-            if asset.get("asset") == "USDT":
-                total = asset.get("walletBalance")
-                if total is not None:
-                    return float(total)
+        total = response.get("totalWalletBalance")
+        if total is not None:
+            return float(total)
         logger.warning(
-            "fetch_usdt_balance: could not extract USDT balance from response."
+            "fetch_total_wallet_balance: could not extract totalWalletBalance from response."
         )
         return None
     except (ccxt_async.NetworkError, ccxt_async.ExchangeError) as exc:
-        logger.warning("fetch_usdt_balance failed: %s", exc)
+        logger.warning("fetch_total_wallet_balance failed: %s", exc)
         return None
