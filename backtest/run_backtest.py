@@ -58,8 +58,8 @@ _MODEL_DIR = Path(__file__).parent.parent / "models"
 _MODEL_PATH = _MODEL_DIR / "xgb_live.json"
 
 # Simulated trade parameters (must mirror risk/risk_manager.py)
-_TAKE_PROFIT_PCT = 0.04    # 4 %
-_STOP_LOSS_PCT = 0.01      # 1 %
+_TAKE_PROFIT_PCT = 0.015   # 1.5 %
+_STOP_LOSS_PCT = 0.0075    # 0.75 %
 
 # Maximum number of candles to hold a simulated position before closing at market
 _MAX_HOLDING_PERIOD = 50
@@ -199,13 +199,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 def simulate_backtest(
     feat_df: pd.DataFrame,
     model: XGBClassifier,
-    buy_threshold: float = 0.65,
+    buy_threshold: float = 0.62,
 ) -> dict[str, float]:
     """Simulate a simple long-only strategy on the test set.
 
     A BUY signal is generated when the model's upward-probability
     exceeds ``buy_threshold``.  Each simulated trade is held until either
-    the Take-Profit (+4 %) or Stop-Loss (-1 %) is hit against the close
+    the Take-Profit (+1.5 %) or Stop-Loss (-0.75 %) is hit against the close
     prices that follow the entry candle.
 
     Parameters

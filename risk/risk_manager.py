@@ -4,12 +4,12 @@ risk.risk_manager
 
 Position sizing via Fractional (Half) Kelly Criterion.
 
-Every trade uses a static Stop Loss of 1.0 % and a Take Profit of 4 %,
-giving a reward-to-risk ratio of 4.  The Kelly fraction is computed as::
+Every trade uses a static Stop Loss of 0.75 % and a Take Profit of 1.5 %,
+giving a reward-to-risk ratio of 2.  The Kelly fraction is computed as::
 
     f* = (p * b - (1 - p)) / b
 
-where *b* = TP / SL = 4 and *p* is the ML-predicted win probability.
+where *b* = TP / SL = 2 and *p* is the ML-predicted win probability.
 
 A half-Kelly multiplier (0.5) is applied to reduce variance::
 
@@ -33,9 +33,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 # ── Trade parameters ──────────────────────────────────────────────────────────
-STOP_LOSS_PCT: float = 0.01     # 1.0 %
-TAKE_PROFIT_PCT: float = 0.04   # 4.0 %
-_REWARD_RISK_RATIO: float = TAKE_PROFIT_PCT / STOP_LOSS_PCT   # 4.0
+STOP_LOSS_PCT: float = 0.0075   # 0.75 %
+TAKE_PROFIT_PCT: float = 0.015  # 1.5 %
+_REWARD_RISK_RATIO: float = TAKE_PROFIT_PCT / STOP_LOSS_PCT   # 2.0
 _HALF_KELLY: float = 0.5        # Half-Kelly multiplier
 
 MAX_POSITIONS: int = 3          # Maximum simultaneous open positions
