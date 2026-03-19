@@ -60,8 +60,8 @@ from xgboost import XGBClassifier
 logger = logging.getLogger(__name__)
 
 # Signal thresholds
-_BUY_PROB_THRESHOLD = 0.68
-_BUY_SENTIMENT_THRESHOLD = 0.15
+_BUY_PROB_THRESHOLD = 0.62
+_BUY_SENTIMENT_THRESHOLD = 0.0
 _SELL_PROB_THRESHOLD = 0.3
 _SELL_SENTIMENT_THRESHOLD = -0.3
 
