@@ -7,7 +7,7 @@ next 5 price ticks (order-book snapshots).
 
 Signal generation rules
 -----------------------
-* probability > 0.75 AND sentiment_score > 0.3   → **BUY**
+* probability > 0.68 AND sentiment_score > 0.15  → **BUY**
 * probability < 0.3 AND sentiment_score < -0.3   → **SELL**
 * otherwise                                      → **HOLD**
 
@@ -60,8 +60,8 @@ from xgboost import XGBClassifier
 logger = logging.getLogger(__name__)
 
 # Signal thresholds
-_BUY_PROB_THRESHOLD = 0.75
-_BUY_SENTIMENT_THRESHOLD = 0.3
+_BUY_PROB_THRESHOLD = 0.68
+_BUY_SENTIMENT_THRESHOLD = 0.15
 _SELL_PROB_THRESHOLD = 0.3
 _SELL_SENTIMENT_THRESHOLD = -0.3
 
@@ -643,7 +643,7 @@ class MLPredictor:
         ``"BUY"``, ``"SELL"``, or ``"HOLD"`` with the following logic:
 
         Base ML signal:
-          * probability > 0.75 AND sentiment > 0.3   → BUY
+          * probability > 0.68 AND sentiment > 0.15  → BUY
           * probability < 0.3  AND sentiment < -0.3  → SELL
           * otherwise                                → HOLD
 
