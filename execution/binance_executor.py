@@ -6,11 +6,15 @@ Factory helpers for creating and configuring a ccxt async Binance Futures
 exchange client.
 
 When ``USE_BINANCE_TESTNET=True`` is set in the environment the client
-returned by :func:`create_exchange` is pointed at the Binance Futures Testnet
-(``https://testnet.binancefuture.com``) instead of the production endpoints.
+returned by :func:`create_exchange` is pointed at the Binance Futures Demo
+environment (``https://testnet.binancefuture.com``) instead of the production
+endpoints.  This is the official Binance USDT-M Futures Demo/Paper-trading
+environment; it uses the same hostname as the legacy testnet but is now
+referred to as *Demo Mode* in the Binance documentation.
+
 The same client is passed to :class:`~execution.paper_executor.PaperExecutor`
-so that real orders are routed to the testnet while the paper-simulation
-book-keeping still runs locally.
+so that real orders are routed to the Demo environment while the
+paper-simulation book-keeping still runs locally.
 
 Usage example::
 
@@ -40,15 +44,26 @@ def create_exchange(
     Parameters
     ----------
     api_key:
-        Binance API key (production or testnet).
+        Binance API key (production or Demo).
     secret:
-        Binance API secret (production or testnet).
+        Binance API secret (production or Demo).
     testnet:
-        When *True* the client is pointed at the Binance Futures Testnet
-        (``https://testnet.binancefuture.com``) by overriding the exchange
-        ``urls['api']`` directly.  The deprecated
+        When *True* the client is pointed at the Binance Futures Demo
+        environment (``https://testnet.binancefuture.com``) by overriding the
+        exchange ``urls['api']`` directly.  The deprecated
         :meth:`ccxt.Exchange.set_sandbox_mode` call is intentionally avoided
         because it is no longer supported for ``binanceusdm`` futures.
+
+        The URL map covers all sub-keys used by USDT-M Futures calls:
+
+        * ``fapiPublic`` / ``fapiPrivate`` → ``/fapi/v1``
+        * ``fapiPrivateV2`` → ``/fapi/v2``  (required for the account-info
+          endpoint used by :func:`fetch_usdt_balance`)
+
+        The ``sapi`` key (Binance Spot/Wallet API) is intentionally **not**
+        included; pointing it at the Futures Demo host would return error
+        ``-5000`` because ``/capital/config/getall`` and related paths are
+        not valid on a Futures connection.
 
     Returns
     -------
@@ -67,21 +82,24 @@ def create_exchange(
         }
     )
     if testnet:
-        # set_sandbox_mode is deprecated for binanceusdm futures; point directly
-        # to the Binance Futures Testnet base URL instead.
-        # ccxt dispatches fetch_balance (and other calls) to sub-keys such as
-        # fapiPublic, fapiPrivate, and sapi.  Override all of them so that every
-        # request stays on the testnet and none fall back to the production sapi
-        # endpoint (which rejects testnet credentials).
-        testnet_base = "https://testnet.binancefuture.com/fapi/v1"
+        # set_sandbox_mode is deprecated for binanceusdm futures; point
+        # directly to the Binance Futures Demo base URLs instead.
+        # fapiPrivateV2 must be listed explicitly so that calls routed through
+        # that sub-key (e.g. fapiPrivateV2GetAccount) reach the correct path.
+        # sapi is deliberately omitted: it maps to Spot/Wallet endpoints that
+        # do not exist on the Futures Demo host and cause error -5000.
+        demo_base = "https://testnet.binancefuture.com"
         exchange.urls["api"] = {
-            "fapiPublic": testnet_base,
-            "fapiPrivate": testnet_base,
-            "sapi": testnet_base,
+            "fapiPublic": demo_base + "/fapi/v1",
+            "fapiPrivate": demo_base + "/fapi/v1",
+            "fapiPrivateV2": demo_base + "/fapi/v2",
         }
         logger.info(
-            "[TESTNET] Binance Futures Testnet client created "
-            "(all API sub-endpoints -> https://testnet.binancefuture.com/fapi/v1)."
+            "[DEMO] Binance Futures Demo client created "
+            "(fapiPublic/fapiPrivate -> %s/fapi/v1, "
+            "fapiPrivateV2 -> %s/fapi/v2).",
+            demo_base,
+            demo_base,
         )
     else:
         logger.info("[LIVE] Binance Futures live client created.")
