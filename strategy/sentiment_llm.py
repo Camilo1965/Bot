@@ -37,7 +37,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_MODEL_NAME = "gemini-1.5-flash"
+_MODEL_NAME = "gemini-2.5-flash"
 
 _SYSTEM_INSTRUCTION = (
     "You are an expert crypto quantitative analyst. "
