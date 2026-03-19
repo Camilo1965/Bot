@@ -7,8 +7,8 @@ next 5 price ticks (order-book snapshots).
 
 Signal generation rules
 -----------------------
-* probability > 0.65 AND sentiment_score > 0.3   → **BUY**
-* probability < 0.3 AND sentiment_score < -0.3  → **SELL**
+* probability > 0.62 AND sentiment_score >= 0.0  → **BUY**
+* probability < 0.3 AND sentiment_score < -0.3   → **SELL**
 * otherwise                                      → **HOLD**
 
 Elite Quant additions
@@ -60,8 +60,8 @@ from xgboost import XGBClassifier
 logger = logging.getLogger(__name__)
 
 # Signal thresholds
-_BUY_PROB_THRESHOLD = 0.65
-_BUY_SENTIMENT_THRESHOLD = 0.3
+_BUY_PROB_THRESHOLD = 0.62
+_BUY_SENTIMENT_THRESHOLD = 0.0
 _SELL_PROB_THRESHOLD = 0.3
 _SELL_SENTIMENT_THRESHOLD = -0.3
 
@@ -630,23 +630,26 @@ class MLPredictor:
         funding_rate:    Current perpetual-futures funding rate as a decimal
                          (e.g. 0.0001 = 0.01 % per 8-hour window).
         htf_trend_4h:    4-hour trend status (``"bullish"``, ``"bearish"``, or
-                         ``"neutral"``).  A ``"bearish"`` value causes any BUY
-                         signal to be muted to HOLD ("General" filter).
-        htf_trend_1h:    1-hour trend status (same values).  A ``"bearish"``
-                         value also mutes BUY signals ("Colonel" filter).
+                         ``"neutral"``).  Only a ``"bearish"`` value mutes a BUY
+                         signal to HOLD ("General" filter); ``"neutral"`` is
+                         permitted alongside ``"bullish"``.
+        htf_trend_1h:    1-hour trend status (same values).  The 1H trend must
+                         be strictly ``"bullish"`` for a BUY to proceed; both
+                         ``"bearish"`` and ``"neutral"`` mute BUY to HOLD
+                         ("Colonel" filter).
 
         Returns
         -------
         ``"BUY"``, ``"SELL"``, or ``"HOLD"`` with the following logic:
 
         Base ML signal:
-          * probability > 0.65 AND sentiment > 0.3   → BUY
+          * probability > 0.62 AND sentiment >= 0.0  → BUY
           * probability < 0.3  AND sentiment < -0.3  → SELL
           * otherwise                                → HOLD
 
         HTF Filter ("General" + "Colonel"):
           * 4H trend bearish                         → BUY → HOLD
-          * 1H trend bearish                         → BUY → HOLD
+          * 1H trend not bullish (bearish/neutral)   → BUY → HOLD
 
         Market Regime override (ADX-based):
           * ADX > 25 (trending): BUY only when RSI > 50 AND momentum > 0;
@@ -667,7 +670,7 @@ class MLPredictor:
             return "HOLD"
 
         # ── Base ML signal ────────────────────────────────────────────────
-        if probability > _BUY_PROB_THRESHOLD and sentiment_score > _BUY_SENTIMENT_THRESHOLD:
+        if probability > _BUY_PROB_THRESHOLD and sentiment_score >= _BUY_SENTIMENT_THRESHOLD:
             base_signal: Signal = "BUY"
         elif probability < _SELL_PROB_THRESHOLD and sentiment_score < _SELL_SENTIMENT_THRESHOLD:
             base_signal = "SELL"
@@ -735,10 +738,10 @@ class MLPredictor:
             elite_factors.append(
                 f"[MTA] General filter: 4H trend is bearish – BUY muted to HOLD"
             )
-        elif signal == "BUY" and htf_trend_1h == HTF_TREND_BEARISH:
+        elif signal == "BUY" and htf_trend_1h != HTF_TREND_BULLISH:
             signal = "HOLD"
             elite_factors.append(
-                f"[MTA] Colonel filter: 1H trend is bearish – BUY muted to HOLD"
+                f"[MTA] Colonel filter: 1H trend is {htf_trend_1h} (not bullish) – BUY muted to HOLD"
             )
 
         # ── Logging ───────────────────────────────────────────────────────
