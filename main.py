@@ -35,6 +35,7 @@ from data_ingestion.funding_rate_client import FundingRateClient
 from data_ingestion.news_scraper import fetch_crypto_headlines
 from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
+from execution.binance_executor import create_exchange, fetch_usdt_balance
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import MLPredictor, compute_htf_trend
@@ -704,8 +705,79 @@ async def main() -> None:
     ws_client = BinanceWebSocketClient(queue=market_queue, watchlist=WATCHLIST)
     funding_rate_client = FundingRateClient(symbols=WATCHLIST, state=shared_state)
 
-    risk_manager = RiskManager(initial_balance=10_000.0)
-    paper_executor = PaperExecutor(db=db, risk_manager=risk_manager)
+    # ── Execution mode: Testnet / Live / Paper ───────────────────────────────
+    use_testnet: bool = os.environ.get("USE_BINANCE_TESTNET", "False").strip().lower() in (
+        "true", "1", "yes"
+    )
+    paper_trading: bool = os.environ.get("PAPER_TRADING", "True").strip().lower() in (
+        "true", "1", "yes"
+    )
+    api_key: str = os.environ.get("EXCHANGE_API_KEY", "").strip()
+    api_secret: str = os.environ.get("EXCHANGE_SECRET", "").strip()
+
+    exchange_client: ccxt_async.binanceusdm | None = None
+    initial_balance: float = 10_000.0
+
+    if use_testnet:
+        # USE_BINANCE_TESTNET takes priority over PAPER_TRADING.
+        if not api_key or not api_secret:
+            logger.warning(
+                "USE_BINANCE_TESTNET=True but EXCHANGE_API_KEY/EXCHANGE_SECRET are not "
+                "set – falling back to paper trading with %.2f USDT.",
+                initial_balance,
+            )
+        else:
+            exchange_client = create_exchange(api_key, api_secret, testnet=True)
+            fetched: float | None = await fetch_usdt_balance(exchange_client)
+            if fetched is not None:
+                initial_balance = fetched
+                logger.info(
+                    "✅ [TESTNET] Binance Futures Testnet balance fetched: %.2f USDT",
+                    initial_balance,
+                )
+            else:
+                logger.warning(
+                    "[TESTNET] Could not fetch balance from Binance Testnet – "
+                    "using default %.2f USDT.",
+                    initial_balance,
+                )
+            logger.info(
+                "🔗 [TESTNET] Orders will be sent to Binance Futures Testnet API."
+            )
+    elif not paper_trading:
+        # Live trading (non-testnet).
+        if not api_key or not api_secret:
+            logger.warning(
+                "PAPER_TRADING=False but EXCHANGE_API_KEY/EXCHANGE_SECRET are not "
+                "set – running in pure paper trading mode."
+            )
+        else:
+            exchange_client = create_exchange(api_key, api_secret, testnet=False)
+            fetched = await fetch_usdt_balance(exchange_client)
+            if fetched is not None:
+                initial_balance = fetched
+                logger.info(
+                    "✅ [LIVE] Binance Futures live balance fetched: %.2f USDT",
+                    initial_balance,
+                )
+            else:
+                logger.warning(
+                    "[LIVE] Could not fetch balance from Binance live API – "
+                    "using default %.2f USDT.",
+                    initial_balance,
+                )
+            logger.info(
+                "🔗 [LIVE] Orders will be sent to Binance Futures live API."
+            )
+    else:
+        logger.info(
+            "📝 [PAPER] Running in pure paper trading mode (internal simulation) "
+            "with %.2f USDT.",
+            initial_balance,
+        )
+
+    risk_manager = RiskManager(initial_balance=initial_balance)
+    paper_executor = PaperExecutor(db=db, risk_manager=risk_manager, exchange=exchange_client)
 
     # ------------------------------------------------------------------
     # Attempt to load a pre-trained model; fall back to warm-start
@@ -755,6 +827,8 @@ async def main() -> None:
             funding_rate_client.run(),
         )
     finally:
+        if exchange_client is not None:
+            await exchange_client.close()
         await close_db()
 
     logger.info("🛑 ClawdBot shut down cleanly")
