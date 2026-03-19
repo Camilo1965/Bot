@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 SYMBOL = "BTC/USDT"
 RECONNECT_DELAY = 5  # seconds between reconnection attempts
 OHLCV_TIMEFRAME = "15m"  # candle timeframe used for ML feature calculation
+HTF_TIMEFRAMES = ("1h", "4h")  # higher-timeframe candles for the MTF filter
 
 
 class BinanceWebSocketClient:
@@ -53,6 +54,8 @@ class BinanceWebSocketClient:
                     tasks.append(asyncio.create_task(self._watch_order_book(sym)))
                     tasks.append(asyncio.create_task(self._watch_trades(sym)))
                     tasks.append(asyncio.create_task(self._watch_ohlcv(sym)))
+                    for tf in HTF_TIMEFRAMES:
+                        tasks.append(asyncio.create_task(self._watch_ohlcv(sym, tf)))
                 await asyncio.gather(*tasks)
             except (ccxtpro.NetworkError, ccxtpro.ExchangeError) as exc:
                 logger.warning(

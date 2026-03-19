@@ -32,6 +32,13 @@ Elite Quant additions
   - lastFundingRate < -0.0003 (< -0.03 %, extreme fear): Long-Bias bonus – the
     BUY signal is retained and flagged as ``[ELITE]``.
 
+* **Multi-Timeframe "General" Filter**:
+
+  - 4H trend is BEARISH (price below EMA-20 AND last two candles are not both
+    bullish): BUY signal is muted to HOLD ("General" says no).
+  - 1H trend is BEARISH: BUY signal is muted to HOLD ("Colonel" says no).
+  - Both 4H and 1H must give the green light for a BUY to be executed.
+
 When any of the Elite factors influences the final signal, the log line is
 prefixed with ``[ELITE]``.
 
@@ -91,6 +98,9 @@ _MIN_PRICES_FOR_INFERENCE = _SMA_PERIOD
 # Default ADX value used when OHLCV data is unavailable (neutral – no regime)
 _ADX_NEUTRAL_DEFAULT = 25.0
 
+# Multi-Timeframe (HTF) EMA period for the General/Colonel trend filters
+_HTF_EMA_PERIOD = 20
+
 # Feature column order expected by the model
 _FEATURE_COLS = [
     "sentiment",
@@ -104,6 +114,71 @@ _FEATURE_COLS = [
 ]
 
 Signal = str  # literal: "BUY" | "SELL" | "HOLD"
+TrendState = str  # literal: "BULLISH" | "BEARISH" | "NEUTRAL"
+
+
+def classify_htf_trend(
+    closes: list[float],
+    opens: list[float] | None = None,
+    ema_period: int = _HTF_EMA_PERIOD,
+) -> TrendState:
+    """Classify the higher-timeframe trend as BULLISH, BEARISH, or NEUTRAL.
+
+    Primary criterion (requires ≥ *ema_period* candles):
+      - Close above EMA-*ema_period* → BULLISH
+      - Close below EMA-*ema_period* AND the last two candles are *not* both
+        bullish (close > open) → BEARISH
+      - Close below EMA-*ema_period* BUT the last two candles are both bullish
+        → BULLISH (nascent recovery)
+
+    Fallback (fewer than *ema_period* candles available):
+      - Last two candles both bullish (close > open) → BULLISH
+      - Last two candles both bearish (close < open) → BEARISH
+      - Otherwise → NEUTRAL
+
+    Parameters
+    ----------
+    closes:     Close prices in chronological order.
+    opens:      Optional open prices (same length as *closes*) used for the
+                last-two-candles bullish check.
+    ema_period: EMA period (default 20).
+
+    Returns
+    -------
+    ``"BULLISH"``, ``"BEARISH"``, or ``"NEUTRAL"``.
+    """
+    if not closes:
+        return "NEUTRAL"
+
+    last_two_bullish = False
+    if opens is not None and len(opens) >= 2 and len(closes) >= 2:
+        last_two_bullish = closes[-1] > opens[-1] and closes[-2] > opens[-2]
+    last_two_bearish = False
+    if opens is not None and len(opens) >= 2 and len(closes) >= 2:
+        last_two_bearish = closes[-1] < opens[-1] and closes[-2] < opens[-2]
+
+    if len(closes) >= ema_period:
+        ema = float(
+            pd.Series(closes, dtype=float)
+            .ewm(span=ema_period, adjust=False)
+            .mean()
+            .iloc[-1]
+        )
+        if closes[-1] > ema:
+            return "BULLISH"
+        if closes[-1] < ema:
+            # Nascent recovery: both recent candles are bullish despite EMA lag
+            if last_two_bullish:
+                return "BULLISH"
+            return "BEARISH"
+        return "NEUTRAL"
+
+    # Fallback when not enough data for EMA
+    if last_two_bullish:
+        return "BULLISH"
+    if last_two_bearish:
+        return "BEARISH"
+    return "NEUTRAL"
 
 
 class MLPredictor:
@@ -550,6 +625,10 @@ class MLPredictor:
         lows: list[float] | None = None,
         obi_ratio: float = 1.0,
         funding_rate: float = 0.0,
+        htf_4h_closes: list[float] | None = None,
+        htf_4h_opens: list[float] | None = None,
+        htf_1h_closes: list[float] | None = None,
+        htf_1h_opens: list[float] | None = None,
     ) -> Signal:
         """Generate a trading signal (BUY / SELL / HOLD).
 
@@ -562,6 +641,12 @@ class MLPredictor:
         obi_ratio:       Order Book Imbalance ratio (bid_vol / ask_vol, top-5).
         funding_rate:    Current perpetual-futures funding rate as a decimal
                          (e.g. 0.0001 = 0.01 % per 8-hour window).
+        htf_4h_closes:   4H candle close prices (chronological) for the General
+                         trend filter.  ``None`` means the filter is skipped.
+        htf_4h_opens:    4H candle open prices used in the last-two-candles
+                         bullish check inside :func:`classify_htf_trend`.
+        htf_1h_closes:   1H candle close prices for the Colonel trend filter.
+        htf_1h_opens:    1H candle open prices for the Colonel trend filter.
 
         Returns
         -------
@@ -580,6 +665,11 @@ class MLPredictor:
         Funding Rate bias:
           * rate > +0.03 % (extreme greed): BUY → HOLD (Short-Bias penalty).
           * rate < -0.03 % (extreme fear):  BUY retained + Long-Bias bonus.
+
+        Multi-Timeframe "General" filter:
+          * 4H trend BEARISH (General says no): BUY → HOLD.
+          * 1H trend BEARISH (Colonel says no): BUY → HOLD.
+          * Both must be BULLISH or NEUTRAL for a BUY to proceed.
 
         ``[ELITE]`` is logged whenever the regime or funding-rate logic alters
         the base ML signal.
@@ -652,6 +742,34 @@ class MLPredictor:
             elite_factors.append(
                 f"Funding rate={funding_rate:.6f} < -0.03% extreme fear: Long-Bias bonus"
             )
+
+        # ── Multi-Timeframe "General" Filter ─────────────────────────────
+        # Only applies when a BUY signal has survived all previous filters.
+        # The 4H ("General") and 1H ("Colonel") trend states must not be
+        # BEARISH for a BUY to proceed.
+        if signal == "BUY":
+            trend_4h: TrendState = "NEUTRAL"
+            trend_1h: TrendState = "NEUTRAL"
+
+            if htf_4h_closes:
+                trend_4h = classify_htf_trend(htf_4h_closes, htf_4h_opens)
+            if htf_1h_closes:
+                trend_1h = classify_htf_trend(htf_1h_closes, htf_1h_opens)
+
+            if trend_4h == "BEARISH":
+                signal = "HOLD"
+                elite_factors.append(
+                    f"[MTA] 4H General filter: BEARISH trend – BUY muted to HOLD"
+                )
+            elif trend_1h == "BEARISH":
+                signal = "HOLD"
+                elite_factors.append(
+                    f"[MTA] 1H Colonel filter: BEARISH trend – BUY muted to HOLD"
+                )
+            elif htf_4h_closes or htf_1h_closes:
+                elite_factors.append(
+                    f"[MTA] 4H={trend_4h} 1H={trend_1h} – BUY confirmed"
+                )
 
         # ── Logging ───────────────────────────────────────────────────────
         if elite_factors:
