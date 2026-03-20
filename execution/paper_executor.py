@@ -50,6 +50,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from ccxt.base.errors import NotSupported as CcxtNotSupported
+
 from risk.risk_manager import INITIAL_SL, ACTIVATION_PCT, TRAILING_DISTANCE, LEVERAGE, RiskManager
 
 if TYPE_CHECKING:
@@ -184,7 +186,17 @@ class PaperExecutor:
         if self._exchange is not None:
             try:
                 # Set leverage at the symbol level (required by Binance Futures).
-                await self._exchange.set_leverage(LEVERAGE, sym)
+                # On Testnet this call may fail with NotSupported because there
+                # is no sapi URL for the sandbox; in that case log a warning and
+                # proceed with the order using whatever leverage is already set.
+                try:
+                    await self._exchange.set_leverage(LEVERAGE, sym)
+                except CcxtNotSupported:
+                    logger.warning(
+                        "set_leverage not supported for %s (testnet?) – "
+                        "proceeding with existing leverage setting.",
+                        sym,
+                    )
                 # position_size is the leveraged notional value; convert to base
                 # currency quantity by dividing by the entry price.
                 amount = position_size / entry_price
