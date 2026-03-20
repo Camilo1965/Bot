@@ -123,6 +123,60 @@ class PaperExecutor:
     # Public API
     # ------------------------------------------------------------------
 
+    def restore_position(
+        self,
+        symbol: str,
+        entry_price: float,
+        position_size: float,
+    ) -> bool:
+        """Restore a single open position from exchange state at startup.
+
+        This method is used during bot initialisation to re-sync local state with
+        positions that were already open on Binance when the bot was restarted.
+        Unlike :meth:`try_open_trade`, this method:
+
+        * Does **not** deduct *position_size* from the risk manager balance
+          (the balance fetched from Binance already reflects open positions).
+        * Does **not** place a live order (the position exists on the exchange).
+        * Calls :meth:`~risk.risk_manager.RiskManager.register_open` so that the
+          concurrent-position counter is correctly incremented.
+
+        Parameters
+        ----------
+        symbol:
+            Trading pair of the existing position (e.g. ``"BTC/USDT"``).
+        entry_price:
+            Average entry price of the existing position.
+        position_size:
+            Absolute notional value in USDT of the existing position.
+
+        Returns
+        -------
+        bool
+            *True* if the position was successfully restored, *False* if a
+            position for *symbol* was already being tracked (no-op).
+        """
+        if symbol in self.open_positions:
+            logger.debug(
+                "restore_position: %s is already tracked – skipping.",
+                symbol,
+            )
+            return False
+
+        self.open_positions[symbol] = OpenPosition(
+            symbol=symbol,
+            entry_price=entry_price,
+            position_size=position_size,
+        )
+        self._risk.register_open()
+        logger.info(
+            "POSITION RESTORED  symbol=%s  entry_price=%.2f  size=%.2f",
+            symbol,
+            entry_price,
+            position_size,
+        )
+        return True
+
     async def try_open_trade(
         self,
         entry_price: float,

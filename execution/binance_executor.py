@@ -118,6 +118,62 @@ def create_exchange(
     return exchange
 
 
+async def fetch_open_positions(exchange: ccxt_async.binanceusdm) -> list[dict]:
+    """Return a list of currently open positions from Binance Futures.
+
+    Queries the Binance Futures positions endpoint and filters to entries
+    with a non-zero contract amount (i.e. positions that are genuinely open).
+
+    Parameters
+    ----------
+    exchange:
+        Authenticated ccxt async Binance Futures client.
+
+    Returns
+    -------
+    list[dict]
+        One entry per open position, each containing:
+
+        * ``symbol`` – ccxt-style trading pair (e.g. ``"BTC/USDT"``).
+        * ``entry_price`` – average entry price as a float.
+        * ``position_size`` – absolute notional value in USDT (``|contracts × entry_price|``).
+        * ``side`` – ``"long"`` or ``"short"``.
+
+        Returns an empty list if the request fails or no positions are open.
+    """
+    try:
+        positions: list[dict] = await exchange.fetch_positions()
+        open_positions: list[dict] = []
+        for pos in positions:
+            contracts = float(pos.get("contracts") or 0)
+            if contracts == 0.0:
+                continue
+            symbol: str = pos.get("symbol", "")
+            entry_price = float(pos.get("entryPrice") or 0)
+            if not symbol or entry_price <= 0:
+                continue
+            # Prefer the exchange-reported notional; fall back to contracts × entry_price.
+            notional = abs(float(pos.get("notional") or 0)) or abs(contracts * entry_price)
+            side: str = pos.get("side") or "long"
+            open_positions.append(
+                {
+                    "symbol": symbol,
+                    "entry_price": entry_price,
+                    "position_size": notional,
+                    "side": side,
+                }
+            )
+        logger.info(
+            "fetch_open_positions: %d open position(s) found: %s",
+            len(open_positions),
+            [p["symbol"] for p in open_positions],
+        )
+        return open_positions
+    except (ccxt_async.NetworkError, ccxt_async.ExchangeError) as exc:
+        logger.warning("fetch_open_positions failed: %s", exc)
+        return []
+
+
 async def fetch_total_wallet_balance(exchange: ccxt_async.binanceusdm) -> float | None:
     """Return the total wallet balance (USD equivalent) from Binance Futures.
 

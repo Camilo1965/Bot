@@ -182,6 +182,33 @@ class RiskManager:
             self._daily_start_balance,
         )
 
+    @property
+    def open_count(self) -> int:
+        """Current number of open positions."""
+        return self._open_count
+
+    def sync_open_count(self, count: int) -> None:
+        """Set the open-position counter to *count* (used at startup to re-sync state).
+
+        Call this once during bot initialisation after querying the exchange for
+        existing open positions so that :meth:`can_open_position` reflects the
+        real number of live positions rather than assuming zero.
+
+        Parameters
+        ----------
+        count:
+            Number of currently open positions as reported by the exchange.
+            Negative values are clamped to 0.
+        """
+        if count < 0:
+            logger.warning(
+                "sync_open_count called with negative value %d – clamping to 0.",
+                count,
+            )
+            count = 0
+        self._open_count = count
+        logger.info("Open-position counter synchronised to %d.", count)
+
     def register_open(self) -> None:
         """Increment the open-position counter (call when a trade is opened)."""
         self._open_count += 1

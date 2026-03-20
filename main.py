@@ -35,7 +35,7 @@ from data_ingestion.funding_rate_client import FundingRateClient
 from data_ingestion.news_scraper import fetch_crypto_headlines
 from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
-from execution.binance_executor import create_exchange, fetch_total_wallet_balance
+from execution.binance_executor import create_exchange, fetch_open_positions, fetch_total_wallet_balance
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import MLPredictor, compute_htf_trend
@@ -778,6 +778,55 @@ async def main() -> None:
 
     risk_manager = RiskManager(initial_balance=initial_balance)
     paper_executor = PaperExecutor(db=db, risk_manager=risk_manager, exchange=exchange_client)
+
+    # ------------------------------------------------------------------
+    # [SYNC] Re-sync open positions from Binance on restart
+    # ------------------------------------------------------------------
+    # When the bot restarts it must not assume all positions are closed.
+    # Fetch the actual open positions from Binance and restore them in
+    # the local PaperExecutor/RiskManager state so that:
+    #   - `can_open_position()` returns the correct headroom.
+    #   - The per-symbol duplicate guard in `try_open_trade()` works.
+    # NOTE: the balance was fetched from Binance above and already reflects
+    # the margin tied up in open positions, so no further deduction is made.
+    if exchange_client is not None:
+        try:
+            existing_positions = await fetch_open_positions(exchange_client)
+            synced = 0
+            for pos_info in existing_positions:
+                sym: str = pos_info["symbol"]
+                if sym not in WATCHLIST:
+                    logger.info(
+                        "🔄 [SYNC] Skipping position for %s (not in watchlist).",
+                        sym,
+                    )
+                    continue
+                restored = paper_executor.restore_position(
+                    symbol=sym,
+                    entry_price=pos_info["entry_price"],
+                    position_size=pos_info["position_size"],
+                )
+                if restored:
+                    synced += 1
+                    logger.info(
+                        "🔄 [SYNC] Restored open position: %s @ %.2f (notional=%.2f USDT, side=%s)",
+                        sym,
+                        pos_info["entry_price"],
+                        pos_info["position_size"],
+                        pos_info["side"],
+                    )
+            if synced > 0:
+                logger.info(
+                    "✅ [SYNC] Re-synced %d open position(s) from Binance "
+                    "(Open positions: %d/%d).",
+                    synced,
+                    risk_manager.open_count,
+                    risk_manager.max_positions,
+                )
+            else:
+                logger.info("🔄 [SYNC] No existing open positions found on Binance.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("⚠️ [SYNC] Could not sync open positions from Binance: %s", exc)
 
     # ------------------------------------------------------------------
     # Attempt to load a pre-trained model; fall back to warm-start
