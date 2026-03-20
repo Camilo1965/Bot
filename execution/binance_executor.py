@@ -87,6 +87,9 @@ def create_exchange(
             "options": {
                 "defaultType": "future",
                 "adjustForTimeDifference": True,
+                # Disable automatic currency metadata fetch which relies on
+                # sapi endpoints that are not available on the Futures Testnet.
+                "fetchCurrencies": False,
             },
         }
     )

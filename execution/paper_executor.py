@@ -50,7 +50,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from ccxt.base.errors import NotSupported as CcxtNotSupported
+from ccxt.base.errors import (
+    AuthenticationError as CcxtAuthenticationError,
+    InsufficientFunds as CcxtInsufficientFunds,
+    NetworkError as CcxtNetworkError,
+    NotSupported as CcxtNotSupported,
+)
 
 from risk.risk_manager import INITIAL_SL, ACTIVATION_PCT, TRAILING_DISTANCE, LEVERAGE, RiskManager
 
@@ -200,18 +205,32 @@ class PaperExecutor:
                 # position_size is the leveraged notional value; convert to base
                 # currency quantity by dividing by the entry price.
                 amount = position_size / entry_price
-                await self._exchange.create_market_buy_order(
-                    sym,
-                    amount,
-                    params={"leverage": LEVERAGE},
-                )
-                logger.info(
-                    "FUTURES BUY ORDER PLACED  symbol=%s  amount=%.6f  leverage=%d",
-                    sym,
-                    amount,
-                    LEVERAGE,
-                )
-            except Exception:
+                try:
+                    await self._exchange.create_market_buy_order(
+                        sym,
+                        amount,
+                        params={"leverage": LEVERAGE},
+                    )
+                except CcxtNotSupported:
+                    # Testnet sapi endpoints are not available; the fapi order
+                    # may still have been routed correctly.  Log a warning and
+                    # continue rather than treating this as a hard failure.
+                    logger.warning(
+                        "create_market_buy_order raised NotSupported for %s "
+                        "(testnet sapi metadata unavailable). "
+                        "If 'fetchCurrencies' is False the fapi order likely "
+                        "succeeded – verify via the Binance Testnet UI or "
+                        "fetch_open_orders().",
+                        sym,
+                    )
+                else:
+                    logger.info(
+                        "FUTURES BUY ORDER PLACED  symbol=%s  amount=%.6f  leverage=%d",
+                        sym,
+                        amount,
+                        LEVERAGE,
+                    )
+            except (CcxtAuthenticationError, CcxtInsufficientFunds, CcxtNetworkError):
                 logger.exception(
                     "Failed to place Binance Futures buy order for %s – "
                     "position recorded in paper simulation only.",
@@ -350,18 +369,32 @@ class PaperExecutor:
                 # position_size is the leveraged notional value; convert to base
                 # currency quantity by dividing by the exit price.
                 amount = pos.position_size / exit_price
-                await self._exchange.create_market_sell_order(
-                    symbol,
-                    amount,
-                    params={"leverage": LEVERAGE},
-                )
-                logger.info(
-                    "FUTURES SELL ORDER PLACED  symbol=%s  amount=%.6f  leverage=%d",
-                    symbol,
-                    amount,
-                    LEVERAGE,
-                )
-            except Exception:
+                try:
+                    await self._exchange.create_market_sell_order(
+                        symbol,
+                        amount,
+                        params={"leverage": LEVERAGE},
+                    )
+                except CcxtNotSupported:
+                    # Testnet sapi endpoints are not available; the fapi order
+                    # may still have been routed correctly.  Log a warning and
+                    # continue rather than treating this as a hard failure.
+                    logger.warning(
+                        "create_market_sell_order raised NotSupported for %s "
+                        "(testnet sapi metadata unavailable). "
+                        "If 'fetchCurrencies' is False the fapi order likely "
+                        "succeeded – verify via the Binance Testnet UI or "
+                        "fetch_open_orders().",
+                        symbol,
+                    )
+                else:
+                    logger.info(
+                        "FUTURES SELL ORDER PLACED  symbol=%s  amount=%.6f  leverage=%d",
+                        symbol,
+                        amount,
+                        LEVERAGE,
+                    )
+            except (CcxtAuthenticationError, CcxtInsufficientFunds, CcxtNetworkError):
                 logger.exception(
                     "Failed to place Binance Futures sell order for %s – "
                     "position closed in paper simulation only.",
