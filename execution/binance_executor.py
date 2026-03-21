@@ -42,6 +42,12 @@ _STABLECOINS: frozenset[str] = frozenset(
     {"USDT", "USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP", "USDE"}
 )
 
+# Quote currencies recognised as USDT-M Futures settlement assets.  Used when
+# converting raw Binance symbol strings (e.g. "BTCUSDT") to ccxt format
+# ("BTC/USDT").  Ordered longest-first to avoid partial matches (e.g. matching
+# "USD" inside "USDT" when USD is ever added).
+_FUTURES_QUOTE_CURRENCIES: tuple[str, ...] = ("USDT", "USDC", "BUSD")
+
 
 def create_exchange(
     api_key: str,
@@ -68,6 +74,10 @@ def create_exchange(
         * ``fapiPublic`` / ``fapiPrivate`` → ``/fapi/v1``
         * ``fapiPrivateV2`` → ``/fapi/v2``  (required for the account-info
           endpoint used by :func:`fetch_total_wallet_balance`)
+        * ``fapiPrivateV3`` → ``/fapi/v2``  (Testnet does not expose
+          ``/fapi/v3``; routing V3 sub-key calls through the V2 base path
+          ensures that ``fetch_positions()`` and similar endpoints that newer
+          ccxt versions route via ``fapiPrivateV3`` still resolve correctly)
 
         The ``sapi`` key (Binance Spot/Wallet API) is intentionally **not**
         included; pointing it at the Futures Demo host would return error
@@ -105,11 +115,16 @@ def create_exchange(
             "fapiPublic": demo_base + "/fapi/v1",
             "fapiPrivate": demo_base + "/fapi/v1",
             "fapiPrivateV2": demo_base + "/fapi/v2",
+            # Testnet does not expose /fapi/v3 endpoints; route them to /fapi/v2
+            # so that calls such as fetch_positions() (which ccxt maps to
+            # fapiPrivateV3GetPositionRisk on newer library versions) resolve
+            # correctly on the Demo environment.
+            "fapiPrivateV3": demo_base + "/fapi/v2",
         }
         logger.info(
             "[DEMO] Binance Futures Demo client created "
             "(fapiPublic/fapiPrivate -> %s/fapi/v1, "
-            "fapiPrivateV2 -> %s/fapi/v2).",
+            "fapiPrivateV2/fapiPrivateV3 -> %s/fapi/v2).",
             demo_base,
             demo_base,
         )
@@ -118,11 +133,31 @@ def create_exchange(
     return exchange
 
 
+def _ccxt_symbol(binance_symbol: str) -> str:
+    """Convert a Binance raw symbol string to ccxt format.
+
+    For example ``"BTCUSDT"`` → ``"BTC/USDT"``.  The conversion handles the
+    common quote currencies used in USDT-M Futures (USDT, USDC, BUSD) and
+    returns the input unchanged when no matching suffix is found.
+    """
+    for quote in _FUTURES_QUOTE_CURRENCIES:
+        if binance_symbol.endswith(quote):
+            return binance_symbol[: -len(quote)] + "/" + quote
+    return binance_symbol
+
+
 async def fetch_open_positions(exchange: ccxt_async.binanceusdm) -> list[dict]:
     """Return a list of currently open positions from Binance Futures.
 
     Queries the Binance Futures positions endpoint and filters to entries
     with a non-zero contract amount (i.e. positions that are genuinely open).
+
+    On the Binance Futures Testnet (Demo) environment the ccxt unified
+    ``fetch_positions()`` method may be routed to a ``fapiPrivateV3`` endpoint
+    that is not available on the Demo host.  If that primary call fails the
+    function transparently falls back to the ``fapiPrivateV2GetPositionRisk``
+    endpoint, which *is* supported on the Testnet, and maps the raw Binance
+    response to the same output format.
 
     Parameters
     ----------
@@ -141,6 +176,9 @@ async def fetch_open_positions(exchange: ccxt_async.binanceusdm) -> list[dict]:
 
         Returns an empty list if the request fails or no positions are open.
     """
+    # ------------------------------------------------------------------
+    # Primary path: unified ccxt method (works on Live / V3-capable hosts)
+    # ------------------------------------------------------------------
     try:
         positions: list[dict] = await exchange.fetch_positions()
         open_positions: list[dict] = []
@@ -170,7 +208,48 @@ async def fetch_open_positions(exchange: ccxt_async.binanceusdm) -> list[dict]:
         )
         return open_positions
     except (ccxt_async.NetworkError, ccxt_async.ExchangeError) as exc:
-        logger.warning("fetch_open_positions failed: %s", exc)
+        logger.warning(
+            "fetch_open_positions: primary fetch_positions() failed (%s). "
+            "Retrying via fapiPrivateV2GetPositionRisk (Testnet fallback)…",
+            exc,
+        )
+
+    # ------------------------------------------------------------------
+    # Fallback path: raw V2 endpoint – fully supported on Testnet/Demo.
+    # ------------------------------------------------------------------
+    try:
+        raw: list[dict] = await exchange.fapiPrivateV2GetPositionRisk()
+        open_positions = []
+        for pos in raw:
+            amt = float(pos.get("positionAmt") or 0)
+            if amt == 0.0:
+                continue
+            raw_symbol: str = pos.get("symbol", "")
+            entry_price = float(pos.get("entryPrice") or 0)
+            if not raw_symbol or entry_price <= 0:
+                continue
+            symbol_ccxt = _ccxt_symbol(raw_symbol)
+            notional = abs(amt * entry_price)
+            side = "long" if amt > 0 else "short"
+            open_positions.append(
+                {
+                    "symbol": symbol_ccxt,
+                    "entry_price": entry_price,
+                    "position_size": notional,
+                    "side": side,
+                }
+            )
+        logger.info(
+            "fetch_open_positions (V2 fallback): %d open position(s) found: %s",
+            len(open_positions),
+            [p["symbol"] for p in open_positions],
+        )
+        return open_positions
+    except (ccxt_async.NetworkError, ccxt_async.ExchangeError) as exc2:
+        logger.error(
+            "fetch_open_positions: V2 fallback also failed (%s). Returning empty list.",
+            exc2,
+        )
         return []
 
 
