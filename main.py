@@ -794,7 +794,9 @@ async def main() -> None:
             existing_positions = await fetch_open_positions(exchange_client)
             synced = 0
             for pos_info in existing_positions:
-                sym: str = pos_info["symbol"]
+                # Normalize CCXT linear-futures symbol suffix, e.g.
+                # 'ETH/USDT:USDT' → 'ETH/USDT', before matching WATCHLIST.
+                sym: str = pos_info["symbol"].split(":")[0]
                 if sym not in WATCHLIST:
                     logger.info(
                         "🔄 [SYNC] Skipping position for %s (not in watchlist).",
