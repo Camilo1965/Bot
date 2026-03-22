@@ -78,6 +78,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Hint appended to warning messages directing users to the debug log file.
+_DEBUG_LOG_HINT = "(Revisa bot_debug.log para detalles técnicos)"
+
 
 @dataclass
 class OpenPosition:
@@ -234,8 +237,9 @@ class PaperExecutor:
 
         if self._risk.is_trading_halted():
             logger.warning(
-                "Trade skipped – trading is halted due to daily loss limit (symbol=%s).",
+                "⚠️ [ALERTA] Trading detenido por límite de pérdida diaria (symbol=%s) %s",
                 sym,
+                _DEBUG_LOG_HINT,
             )
             return False
 
@@ -244,7 +248,7 @@ class PaperExecutor:
             return False
 
         if not self._risk.can_open_position():
-            logger.info(
+            logger.debug(
                 "Trade skipped – max open positions (%d) reached.",
                 self._risk.max_positions,
             )
@@ -253,9 +257,10 @@ class PaperExecutor:
         position_size = self._risk.calculate_position_size(win_probability)
         if not self._risk.has_sufficient_balance(position_size):
             logger.warning(
-                "Trade skipped – insufficient balance (%.2f) for position size %.2f.",
+                "⚠️ [ALERTA] Balance insuficiente (%.2f) para tamaño de posición %.2f %s",
                 self._risk.balance,
                 position_size,
+                _DEBUG_LOG_HINT,
             )
             return False
 
@@ -265,7 +270,7 @@ class PaperExecutor:
 
         # ── Compute dynamic risk thresholds from sentiment ─────────────────
         thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
-        logger.info(
+        logger.debug(
             "DYNAMIC THRESHOLDS  symbol=%s  sentiment=%.4f  multiplier=%.2f  "
             "sl=%.4f  activation=%.4f  trailing_dist=%.4f",
             sym,
@@ -342,7 +347,16 @@ class PaperExecutor:
             activation_pct=thresholds.activation_pct,
             trailing_distance_pct=thresholds.trailing_distance_pct,
         )
+        # Operational console line – visible on the terminal at INFO level.
         logger.info(
+            "🚀 [ENTRADA] %s | Lado: BUY | Confianza: %.1f%% | SL: %.2f%% | TP: %.2f%%",
+            sym,
+            win_probability * 100,
+            thresholds.sl_pct * 100,
+            thresholds.activation_pct * 100,
+        )
+        # Full technical details go to the debug log file only.
+        logger.debug(
             "TRADE OPENED  symbol=%s  entry_price=%.2f  size=%.2f  id=%s  balance=%.2f",
             sym,
             entry_price,
@@ -399,7 +413,7 @@ class PaperExecutor:
         # 2. Activate the trailing stop once the position crosses activation_pct.
         if not pos.trailing_stop_active and price_change_pct >= pos.activation_pct:
             pos.trailing_stop_active = True
-            logger.info(
+            logger.debug(
                 "Trailing Stop ACTIVATED  symbol=%s  entry=%.2f  current=%.2f  profit=%.2f%%",
                 sym,
                 pos.entry_price,
@@ -423,7 +437,15 @@ class PaperExecutor:
             ts = timestamp or datetime.now(tz=timezone.utc)
             reason = "TSL" if pos.trailing_stop_active else "SL"
             await self._close_position(symbol=sym, exit_price=current_price, exit_time=ts, pnl=pnl)
+            # Operational console line – visible on the terminal at INFO level.
             logger.info(
+                "💰 [CIERRE] %s | PnL: %.4f USDT | Motivo: %s",
+                sym,
+                pnl,
+                reason,
+            )
+            # Full technical details go to the debug log file only.
+            logger.debug(
                 "TRADE CLOSED [%s]  symbol=%s  entry=%.2f  peak=%.2f  exit=%.2f  pnl=%.4f",
                 reason,
                 pos.symbol,
