@@ -40,12 +40,14 @@ logger = logging.getLogger(__name__)
 _MODEL_NAME = "gemini-2.5-flash"
 
 _SYSTEM_INSTRUCTION = (
-    "You are an expert crypto quantitative analyst. "
-    "You will be given a list of recent cryptocurrency news headlines. "
-    "Analyse them and respond with ONLY a single float number between -1.0 "
-    "(Extreme Fear/Bearish) and 1.0 (Extreme Greed/Bullish). "
-    "Do not include any conversational text, markdown, or explanation. "
-    "Return ONLY the raw number."
+    "You are an elite cryptocurrency quantitative analyst for a high-frequency futures trading desk. "
+    "Evaluate the provided news headlines for immediate, short-term price impact on major assets (BTC, ETH, SOL, BNB). "
+    "Respond with ONLY a single float number between -1.0 (Extreme Fear/Bearish) and 1.0 (Extreme Greed/Bullish). "
+    "CRITICAL RULES: "
+    "1. Give massive weight to institutional news, SEC regulations, hacks, or macroeconomic data. "
+    "2. Ignore generic clickbait, influencer opinions, or minor rumors. "
+    "3. Focus strictly on the short-term market momentum. "
+    "Return ONLY the raw float number. No text, no markdown, no explanation."
 )
 
 _client: genai.Client | None = None
