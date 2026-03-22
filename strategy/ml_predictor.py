@@ -594,7 +594,7 @@ class MLPredictor:
         obi = features[5]
         adx = features[6]
         atr = features[7]
-        logger.info(
+        logger.debug(
             "[INDICATORS] RSI: %.1f | Volatility: %.4f | Momentum: %.1f%% | "
             "OBI: %.4f | ADX: %.1f | ATR: %.4f",
             rsi,
@@ -666,7 +666,7 @@ class MLPredictor:
         probability = self.predict_proba(prices, sentiment_score, highs, lows, obi_ratio)
 
         if probability is None:
-            logger.info("Signal=HOLD (model not ready or insufficient data)")
+            logger.debug("Signal=HOLD (model not ready or insufficient data)")
             return "HOLD"
 
         # ── Base ML signal ────────────────────────────────────────────────
@@ -746,7 +746,7 @@ class MLPredictor:
 
         # ── Logging ───────────────────────────────────────────────────────
         if elite_factors:
-            logger.info(
+            logger.debug(
                 "[ELITE] Signal=%s (base=%s)  probability=%.4f  sentiment=%.4f  "
                 "4H=%s  1H=%s  factors=[%s]",
                 signal,
@@ -758,7 +758,7 @@ class MLPredictor:
                 " | ".join(elite_factors),
             )
         else:
-            logger.info(
+            logger.debug(
                 "Signal=%s  probability=%.4f  sentiment=%.4f  4H=%s  1H=%s",
                 signal,
                 probability,
