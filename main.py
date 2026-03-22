@@ -464,6 +464,7 @@ async def signal_emitter(
                         entry_price=entry_price,
                         win_probability=win_prob,
                         symbol=symbol,
+                        sentiment_score=sentiment,
                     )
                     if not opened:
                         logger.info(

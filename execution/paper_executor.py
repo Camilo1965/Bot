@@ -5,17 +5,20 @@ execution.paper_executor
 Simulates order execution (paper trading) and, when a live Binance Futures
 exchange client is supplied, submits real market orders via the ccxt API.
 
-Opens and closes paper positions based on the trailing stop thresholds
-defined in :mod:`risk.risk_manager`.  Each completed trade is persisted to
-the ``trades_history`` table via the database manager.
+Opens and closes paper positions based on trailing stop thresholds that are
+computed **dynamically** at position-open time from the AI sentiment score
+(see :func:`~risk.risk_manager.get_dynamic_thresholds`).  Each completed
+trade is persisted to the ``trades_history`` table via the database manager.
 
 A BUY position is protected as follows:
 
-* **Initial Stop Loss** (SL): price falls ≥ ``INITIAL_SL`` (0.75 %) below
-  entry price.  This hard floor is active from the moment the trade opens.
-* **Trailing Stop** (TS): once the position gains ≥ ``ACTIVATION_PCT``
-  (2 %) the active stop loss updates dynamically to
-  ``peak_price * (1 - TRAILING_DISTANCE)`` (1.5 % below the running peak).
+* **Initial Stop Loss** (SL): price falls ≥ ``sl_pct`` below entry price.
+  This hard floor is active from the moment the trade opens.  The value is
+  scaled by the sentiment multiplier: tight in low-sentiment (scalping) and
+  wide in high-sentiment (swing-trading) markets.
+* **Trailing Stop** (TS): once the position gains ≥ ``activation_pct`` the
+  active stop loss updates dynamically to
+  ``peak_price * (1 - trailing_distance_pct)``.
   The stop only moves up — it never retreats — allowing the trade to capture
   exponential crypto runs while locking in profit.
 
@@ -60,7 +63,15 @@ from ccxt.base.errors import (
     NotSupported as CcxtNotSupported,
 )
 
-from risk.risk_manager import INITIAL_SL, ACTIVATION_PCT, TRAILING_DISTANCE, LEVERAGE, RiskManager
+from risk.risk_manager import (
+    BASE_ACTIVATION_PCT,
+    BASE_SL,
+    BASE_TRAILING_DISTANCE,
+    DynamicThresholds,
+    LEVERAGE,
+    RiskManager,
+    get_dynamic_thresholds,
+)
 
 if TYPE_CHECKING:
     from database.db_manager import DatabaseManager
@@ -77,6 +88,10 @@ class OpenPosition:
     position_size: float
     entry_time: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
     trade_id: int | None = None
+    # Dynamic risk thresholds computed at position open from sentiment score
+    sl_pct: float = BASE_SL
+    activation_pct: float = BASE_ACTIVATION_PCT
+    trailing_distance_pct: float = BASE_TRAILING_DISTANCE
     # [PRO] Trailing Stop state
     peak_price: float = field(init=False)
     trailing_stop_active: bool = False
@@ -186,6 +201,7 @@ class PaperExecutor:
         win_probability: float,
         symbol: str | None = None,
         timestamp: datetime | None = None,
+        sentiment_score: float = 0.0,
     ) -> bool:
         """Size and open a new trade using the leverage-based position formula.
 
@@ -210,6 +226,9 @@ class PaperExecutor:
             Trading pair to open.  Defaults to ``self.symbol``.
         timestamp:
             Trade entry time (UTC).  Defaults to *now*.
+        sentiment_score:
+            AI sentiment score in [-1.0, +1.0] used to compute dynamic
+            risk thresholds.  Defaults to ``0.0`` (neutral / base thresholds).
         """
         sym = symbol or self.symbol
 
@@ -243,6 +262,19 @@ class PaperExecutor:
         ts = timestamp or datetime.now(tz=timezone.utc)
         self._risk.deduct(position_size)
         self._risk.register_open()
+
+        # ── Compute dynamic risk thresholds from sentiment ─────────────────
+        thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
+        logger.info(
+            "DYNAMIC THRESHOLDS  symbol=%s  sentiment=%.4f  multiplier=%.2f  "
+            "sl=%.4f  activation=%.4f  trailing_dist=%.4f",
+            sym,
+            sentiment_score,
+            thresholds.multiplier,
+            thresholds.sl_pct,
+            thresholds.activation_pct,
+            thresholds.trailing_distance_pct,
+        )
 
         # ── Live Binance Futures order ─────────────────────────────────────
         if self._exchange is not None:
@@ -306,6 +338,9 @@ class PaperExecutor:
             position_size=position_size,
             entry_time=ts,
             trade_id=trade_id,
+            sl_pct=thresholds.sl_pct,
+            activation_pct=thresholds.activation_pct,
+            trailing_distance_pct=thresholds.trailing_distance_pct,
         )
         logger.info(
             "TRADE OPENED  symbol=%s  entry_price=%.2f  size=%.2f  id=%s  balance=%.2f",
@@ -325,11 +360,12 @@ class PaperExecutor:
     ) -> float | None:
         """Check whether *current_price* triggers the stop loss for *symbol*.
 
-        The active stop loss starts as the hard initial SL (``INITIAL_SL``
-        below entry price).  Once the position profit reaches
-        ``ACTIVATION_PCT`` the active SL updates dynamically to
-        ``peak_price * (1 - TRAILING_DISTANCE)``, never retreating below the
-        previously set level.
+        The active stop loss starts as the hard initial SL (``sl_pct`` below
+        entry price – set dynamically at position open from the AI sentiment
+        score).  Once the position profit reaches ``activation_pct`` the
+        active SL updates dynamically to
+        ``peak_price * (1 - trailing_distance_pct)``, never retreating below
+        the previously set level.
 
         If the current price drops at or below the active stop loss the
         position is closed and the realised PnL is returned.
@@ -360,8 +396,8 @@ class PaperExecutor:
         if current_price > pos.peak_price:
             pos.peak_price = current_price
 
-        # 2. Activate the trailing stop once the position crosses ACTIVATION_PCT.
-        if not pos.trailing_stop_active and price_change_pct >= ACTIVATION_PCT:
+        # 2. Activate the trailing stop once the position crosses activation_pct.
+        if not pos.trailing_stop_active and price_change_pct >= pos.activation_pct:
             pos.trailing_stop_active = True
             logger.info(
                 "Trailing Stop ACTIVATED  symbol=%s  entry=%.2f  current=%.2f  profit=%.2f%%",
@@ -372,11 +408,11 @@ class PaperExecutor:
             )
 
         # 3. Compute the active stop loss level.
-        initial_sl_price = pos.entry_price * (1.0 - INITIAL_SL)
+        initial_sl_price = pos.entry_price * (1.0 - pos.sl_pct)
         if pos.trailing_stop_active:
-            # Trailing SL: TRAILING_DISTANCE below the running peak.
+            # Trailing SL: trailing_distance_pct below the running peak.
             # The SL can only move up, so take the max with the initial SL.
-            trailing_sl = pos.peak_price * (1.0 - TRAILING_DISTANCE)
+            trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
             active_sl = max(trailing_sl, initial_sl_price)
         else:
             active_sl = initial_sl_price
