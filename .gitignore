@@ -19,3 +19,7 @@ build/
 # Editor / OS artefacts
 .DS_Store
 *.swp
+
+# Bot debug log (runtime artefact – not to be committed)
+bot_debug.log
+bot_debug.log.*

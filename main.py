@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
 import json
 import os
 import sys
@@ -46,6 +47,8 @@ load_dotenv()
 # ── ANSI colour helpers (no extra dependency) ─────────────────────────────────
 _YELLOW = "\033[33m"
 _RED    = "\033[31m"
+_GREEN  = "\033[32m"
+_CYAN   = "\033[36m"
 _BOLD   = "\033[1m"
 _RESET  = "\033[0m"
 
@@ -99,6 +102,9 @@ _NEWS_FILTER_HOLD_MINUTES: int = 30
 _RETRAINER_DATA_LIMIT: int = 10_000   # price rows to fetch for retraining
 _MODEL_PATH = Path(__file__).parent / "models" / "xgb_live.json"
 
+# Hint appended to warning messages that have more detail in the debug log.
+_DEBUG_LOG_HINT = "(Revisa bot_debug.log para detalles técnicos)"
+
 
 class _JsonFormatter(logging.Formatter):
     """Emit log records as single-line JSON objects."""
@@ -115,14 +121,72 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload)
 
 
+class _ConsoleFormatter(logging.Formatter):
+    """Human-readable coloured formatter for the console (stdout).
+
+    Levels are colour-coded:
+    * WARNING  → yellow
+    * ERROR / CRITICAL → bold red
+    * INFO / DEBUG → default terminal colour
+    """
+
+    _LEVEL_COLORS: dict[int, str] = {
+        logging.DEBUG:    _RESET,
+        logging.INFO:     _RESET,
+        logging.WARNING:  _YELLOW,
+        logging.ERROR:    _RED + _BOLD,
+        logging.CRITICAL: _RED + _BOLD,
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = self._LEVEL_COLORS.get(record.levelno, _RESET)
+        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
+        msg = record.getMessage()
+        if record.exc_info:
+            msg += "\n" + self.formatException(record.exc_info)
+        return f"{color}{ts} | {msg}{_RESET}"
+
+
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure the root logger with a JSON formatter and return it."""
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_JsonFormatter())
+    """Configure dual-channel logging and return the root *clawdbot* logger.
+
+    Two output channels are configured on the **root** logger:
+
+    * **File** (``bot_debug.log``):  :class:`~logging.handlers.RotatingFileHandler`
+      at ``DEBUG`` level using :class:`_JsonFormatter`.  Every price tick,
+      indicator calculation, and AI message is captured here with a full
+      ISO-8601 timestamp for post-session auditing.  The file rotates at
+      10 MB and keeps up to 5 backup files.
+
+    * **Console** (stdout):  :class:`~logging.StreamHandler` at ``INFO``
+      level using :class:`_ConsoleFormatter`.  Only operational events
+      (trade entries/closes, system heartbeat, alerts, startup messages)
+      reach the terminal.  Verbose data-pipeline noise (kline ticks,
+      buffer updates, per-symbol AI thoughts) is demoted to ``DEBUG`` in
+      the calling code so it never reaches the console handler.
+    """
     root = logging.getLogger()
     root.handlers.clear()
-    root.addHandler(handler)
-    root.setLevel(level)
+    root.setLevel(logging.DEBUG)
+
+    # ── File handler: full DEBUG log in JSON ─────────────────────────────────
+    log_file = Path(__file__).parent / "bot_debug.log"
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=10 * 1024 * 1024,  # 10 MB per file
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(_JsonFormatter())
+    root.addHandler(file_handler)
+
+    # ── Console handler: filtered INFO + WARNING/ERROR ────────────────────────
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(_ConsoleFormatter())
+    root.addHandler(console_handler)
+
     return logging.getLogger("clawdbot")
 
 
@@ -202,10 +266,10 @@ async def market_consumer(
             sentiment = state.get("sentiment", 0.0)
             ticks += 1
 
-            # Solo imprimimos el precio cada 50 ticks para no inundar la pantalla
+            # Demoted to DEBUG – price ticks flood the screen at INFO level.
             if ticks % 50 == 0:
                 prices_buf = state["prices"].get(symbol, [])
-                logger.info(
+                logger.debug(
                     "%s price=%.2f  sentiment_score=%.4f | Buffer: %d/500",
                     symbol, price, sentiment, len(prices_buf),
                 )
@@ -214,14 +278,14 @@ async def market_consumer(
                 try:
                     pnl = await paper_executor.check_and_close(float(price), symbol=symbol)
                     if pnl is not None:
-                        logger.info(
+                        logger.debug(
                             "Position closed on trade tick  symbol=%s  pnl=%.4f  total_pnl=%.4f",
                             symbol,
                             pnl,
                             paper_executor.total_pnl,
                         )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("check_and_close failed: %s", exc)
+                    logger.warning("⚠️ [ALERTA] check_and_close failed: %s %s", exc, _DEBUG_LOG_HINT)
 
         elif message.get("type") == "kline":
             # ----------------------------------------------------------------
@@ -251,7 +315,7 @@ async def market_consumer(
                             state["highs"][symbol].append(float(high_price))
                         if low_price is not None and symbol in state.get("lows", {}):
                             state["lows"][symbol].append(float(low_price))
-                        logger.info(
+                        logger.debug(
                             "📊 [KLINE] %s – new 15m candle close=%.2f | Buffer: %d/%d",
                             symbol,
                             float(close_price),
@@ -271,7 +335,7 @@ async def market_consumer(
                             htf_closes[timeframe].append(float(close_price))
                         if timeframe in htf_opens and open_price is not None:
                             htf_opens[timeframe].append(float(open_price))
-                        logger.info(
+                        logger.debug(
                             "📊 [HTF KLINE] %s – new %s candle close=%.2f",
                             symbol,
                             timeframe.upper(),
@@ -306,19 +370,19 @@ async def market_consumer(
                         timestamp=ts,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("DB insert_market_tick failed: %s", exc)
+                    logger.warning("⚠️ [ALERTA] DB insert_market_tick failed: %s %s", exc, _DEBUG_LOG_HINT)
 
                 try:
                     pnl = await paper_executor.check_and_close(mid_price, symbol=symbol, timestamp=ts)
                     if pnl is not None:
-                        logger.info(
+                        logger.debug(
                             "Position closed on order-book tick  symbol=%s  pnl=%.4f  total_pnl=%.4f",
                             symbol,
                             pnl,
                             paper_executor.total_pnl,
                         )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("check_and_close (order_book) failed: %s", exc)
+                    logger.warning("⚠️ [ALERTA] check_and_close (order_book) failed: %s %s", exc, _DEBUG_LOG_HINT)
         market_queue.task_done()
 
 
@@ -368,7 +432,7 @@ async def signal_emitter(
         hold_until = state.get("news_hold_until")
         if hold_until is not None and now < hold_until:
             remaining = int((hold_until - now).total_seconds() / 60)
-            logger.info(
+            logger.debug(
                 "[PRO] News Filter active – global HOLD in effect (%d min remaining).",
                 remaining,
             )
@@ -381,7 +445,7 @@ async def signal_emitter(
             prices: list[float] = list(state["prices"].get(symbol, []))
 
             if len(prices) < 50:
-                logger.info(
+                logger.debug(
                     "⏳ [AI WARMUP] %s – Recopilando datos... (%d/50 ticks necesarios)",
                     symbol,
                     len(prices),
@@ -425,7 +489,7 @@ async def signal_emitter(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[MTA] DB upsert_htf_trend failed for %s/%s: %s", symbol, tf, exc)
 
-            logger.info(
+            logger.debug(
                 "🔭 [MTA RADAR] %s – 4H=%s | 1H=%s | 15M=%s",
                 symbol, trend_4h, trend_1h, trend_15m,
             )
@@ -448,7 +512,7 @@ async def signal_emitter(
                 obi_ratio=obi_ratio,
             ) or 0.0
 
-            logger.info(
+            logger.debug(
                 "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d | Sentiment: %.4f",
                 symbol,
                 signal,
@@ -467,19 +531,13 @@ async def signal_emitter(
                         sentiment_score=sentiment,
                     )
                     if not opened:
-                        logger.info(
-                            "⚠️ BUY signal ignored for %s – position already open, "
+                        logger.debug(
+                            "BUY signal ignored for %s – position already open, "
                             "max positions reached, or insufficient balance.",
                             symbol,
                         )
-                    else:
-                        logger.info(
-                            "🚀 [TRADE OPENED] Comprando %s simulado a %.2f",
-                            symbol,
-                            entry_price,
-                        )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("Paper trade open failed for %s: %s", symbol, exc)
+                    logger.warning("⚠️ [ALERTA] Paper trade open failed for %s: %s %s", symbol, exc, _DEBUG_LOG_HINT)
 
 
 async def weekly_retrainer(
@@ -643,20 +701,37 @@ async def preload_historical_data(
 async def dashboard_logger(
     paper_executor: PaperExecutor,
     risk_manager: RiskManager,
+    state: dict[str, Any],
     interval: int = 60,
 ) -> None:
+    """Emit a heartbeat every *interval* seconds showing key operational metrics.
+
+    Prints a single ``[SISTEMA] 📡`` line to the console (INFO level) with the
+    current number of monitored markets, the latest Gemini sentiment score, and
+    the open-position count.  This replaces the per-tick price noise on the
+    terminal while still providing a live operational status.
+    """
     logger = logging.getLogger("clawdbot.dashboard")
     while True:
         await asyncio.sleep(interval)
-        open_symbols = list(paper_executor.open_positions.keys())
+        sentiment: float = state.get("sentiment", 0.0)
+        n_positions = len(paper_executor.open_positions)
         logger.info(
+            "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones",
+            len(WATCHLIST),
+            sentiment,
+            n_positions,
+            risk_manager.max_positions,
+        )
+        # Detailed dashboard metrics go to the file log only (DEBUG).
+        logger.debug(
             "📊 [DASHBOARD] Total PnL: %.4f USDT  |  Balance: %.2f USDT  |  "
             "Open positions: %d/%d  |  Symbols: %s",
             paper_executor.total_pnl,
             risk_manager.balance,
-            len(open_symbols),
+            n_positions,
             risk_manager.max_positions,
-            open_symbols if open_symbols else "none",
+            list(paper_executor.open_positions.keys()) or "none",
         )
 
 
@@ -874,7 +949,7 @@ async def main() -> None:
             gemini_sentiment_refresher(shared_state),
             market_consumer(market_queue, shared_state, paper_executor),
             signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
-            dashboard_logger(paper_executor, risk_manager, interval=60),
+            dashboard_logger(paper_executor, risk_manager, shared_state, interval=60),
             weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
             funding_rate_client.run(),
         )
