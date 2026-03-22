@@ -26,10 +26,13 @@ Binance Futures live execution
 ------------------------------
 Pass a ccxt ``binanceusdm`` (or equivalent Binance Futures) async client as
 the *exchange* constructor argument to enable live order placement.  Each
-trade open will call ``exchange.create_market_buy_order`` and each close will
-call ``exchange.create_market_sell_order``, both with
+trade open will call ``exchange.create_market_buy_order`` with
 ``params={'leverage': LEVERAGE}`` so the exchange applies the configured
-leverage.
+leverage.  Each close will call ``exchange.create_market_sell_order`` with
+``params={'leverage': LEVERAGE, 'reduceOnly': True}`` — the ``reduceOnly``
+flag bypasses Binance's minimum-notional check (error -4164) that applies to
+standard close orders, allowing positions with a notional value below $100 USDT
+to be fully closed.
 
 Safety break
 ------------
@@ -427,7 +430,7 @@ class PaperExecutor:
                     await self._exchange.create_market_sell_order(
                         symbol,
                         amount,
-                        params={"leverage": LEVERAGE},
+                        params={"leverage": LEVERAGE, "reduceOnly": True},
                     )
                 except CcxtNotSupported:
                     # Testnet sapi endpoints are not available; the fapi order
