@@ -21,6 +21,21 @@ Trailing stop parameters
 * ``TRAILING_DISTANCE``: Gap maintained between the running peak price and
                          the trailing stop level (2 %).
 
+Dynamic risk management
+-----------------------
+:func:`get_dynamic_thresholds` adjusts the trailing-stop parameters
+at position open time based on the absolute value of the AI sentiment
+score provided by :mod:`strategy.sentiment_llm`:
+
+* **Low sentiment** (abs < 0.30): multiplier 0.8 → *scalping* mode with
+  tighter SL and faster profit-taking.
+* **High sentiment** (abs > 0.60): multiplier 1.8 → *swing trading* mode
+  with wider thresholds to capture large directional moves.
+* Values in between are linearly interpolated.
+
+The multiplier is hard-clamped to [0.5, 2.5] and the resulting stop loss
+is additionally capped at 5 % to prevent dangerously wide stops.
+
 Daily-loss safety break
 -----------------------
 If the total realised loss for the current UTC day exceeds
@@ -40,6 +55,7 @@ Multi-asset risk controls:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -58,6 +74,99 @@ MAX_DAILY_LOSS_PCT: float = 0.03    # 3 % maximum daily loss before halting
 _HALT_DURATION: timedelta = timedelta(hours=24)
 
 MAX_POSITIONS: int = 3          # Maximum simultaneous open positions
+
+# ── Dynamic risk management – base thresholds (neutral market) ────────────────
+BASE_SL: float = 0.015                      # 1.5 % base stop loss
+BASE_ACTIVATION_PCT: float = 0.03           # 3 % profit to activate trailing stop
+BASE_TRAILING_DISTANCE: float = 0.02        # 2 % trailing distance
+
+# ── Dynamic risk management – sentiment multiplier bounds ─────────────────────
+_SENTIMENT_LOW_THRESHOLD: float = 0.30      # below this → scalping regime
+_SENTIMENT_HIGH_THRESHOLD: float = 0.60    # above this → swing-trading regime
+_MULTIPLIER_LOW: float = 0.8               # shrink thresholds in low-sentiment markets
+_MULTIPLIER_HIGH: float = 1.8              # expand thresholds in high-sentiment markets
+_MULTIPLIER_MIN: float = 0.5               # absolute floor (safety net)
+_MULTIPLIER_MAX: float = 2.5               # absolute cap (safety net)
+_SL_CAP: float = 0.05                      # maximum allowed stop-loss fraction (5 %)
+
+
+@dataclass
+class DynamicThresholds:
+    """Risk-management thresholds adjusted by an AI sentiment multiplier."""
+
+    sl_pct: float
+    activation_pct: float
+    trailing_distance_pct: float
+    multiplier: float
+
+
+def get_dynamic_thresholds(sentiment_score: float) -> DynamicThresholds:
+    """Return sentiment-adjusted risk thresholds.
+
+    The *sentiment_score* is expected in **[-1.0, +1.0]** (as returned by
+    :func:`~strategy.sentiment_llm.get_gemini_sentiment`).  Only the
+    absolute magnitude is used so that both strong bearish and strong
+    bullish readings widen the thresholds.
+
+    Regime mapping
+    ~~~~~~~~~~~~~~
+    * ``abs(sentiment) < 0.30`` → *scalping* – tighter SL / activation / trailing
+      distance so the bot takes profits quickly.
+    * ``abs(sentiment) > 0.60`` → *swing trading* – wider thresholds so the bot
+      can capture large directional moves.
+    * In between → multiplier is linearly interpolated.
+
+    Safety net
+    ~~~~~~~~~~
+    * The multiplier is clamped to [``_MULTIPLIER_MIN``, ``_MULTIPLIER_MAX``]
+      so it is never zero or negative.
+    * The resulting SL is additionally capped at ``_SL_CAP`` (5 %) to prevent
+      dangerously wide stop losses.
+
+    Parameters
+    ----------
+    sentiment_score:
+        LLM-generated sentiment score in [-1.0, +1.0].
+
+    Returns
+    -------
+    DynamicThresholds
+        Adjusted thresholds ready for use in position management.
+    """
+    abs_sentiment = abs(sentiment_score)
+
+    if abs_sentiment < _SENTIMENT_LOW_THRESHOLD:
+        multiplier = _MULTIPLIER_LOW
+    elif abs_sentiment > _SENTIMENT_HIGH_THRESHOLD:
+        multiplier = _MULTIPLIER_HIGH
+    else:
+        # Linear interpolation between _MULTIPLIER_LOW and _MULTIPLIER_HIGH
+        span = _SENTIMENT_HIGH_THRESHOLD - _SENTIMENT_LOW_THRESHOLD
+        t = (abs_sentiment - _SENTIMENT_LOW_THRESHOLD) / span
+        multiplier = _MULTIPLIER_LOW + t * (_MULTIPLIER_HIGH - _MULTIPLIER_LOW)
+
+    # Apply safety bounds
+    multiplier = max(_MULTIPLIER_MIN, min(_MULTIPLIER_MAX, multiplier))
+
+    sl_pct = min(BASE_SL * multiplier, _SL_CAP)
+    activation_pct = BASE_ACTIVATION_PCT * multiplier
+    trailing_distance_pct = BASE_TRAILING_DISTANCE * multiplier
+
+    logger.debug(
+        "dynamic_thresholds  abs_sentiment=%.4f  multiplier=%.4f  "
+        "sl=%.4f  activation=%.4f  trailing_dist=%.4f",
+        abs_sentiment,
+        multiplier,
+        sl_pct,
+        activation_pct,
+        trailing_distance_pct,
+    )
+    return DynamicThresholds(
+        sl_pct=sl_pct,
+        activation_pct=activation_pct,
+        trailing_distance_pct=trailing_distance_pct,
+        multiplier=multiplier,
+    )
 
 
 class RiskManager:
