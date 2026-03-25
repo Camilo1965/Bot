@@ -51,6 +51,7 @@ second position on the same symbol is silently rejected.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -73,6 +74,7 @@ from risk.risk_manager import (
     get_dynamic_thresholds,
     get_sector,
 )
+from utils.telegram_notifier import send_telegram_alert
 
 if TYPE_CHECKING:
     from database.db_manager import DatabaseManager
@@ -416,6 +418,13 @@ class PaperExecutor:
                 thresholds.sl_pct * 100,
                 thresholds.activation_pct * 100,
             )
+        asyncio.create_task(
+            send_telegram_alert(
+                f"🚀 *OPEN BUY* | #{sym}\n"
+                f"Precio: {entry_price:.2f}\n"
+                f"SL Dinámico (ATR): {self.open_positions[sym].stop_loss_price:.2f}"
+            )
+        )
         # Full technical details go to the debug log file only.
         logger.debug(
             "TRADE OPENED  symbol=%s  entry_price=%.2f  size=%.2f  id=%s  balance=%.2f  "
@@ -510,6 +519,13 @@ class PaperExecutor:
                 sym,
                 pnl,
                 reason,
+            )
+            asyncio.create_task(
+                send_telegram_alert(
+                    f"🛑 *CLOSED* | #{sym}\n"
+                    f"Cierre por Trailing/Stop Loss.\n"
+                    f"PnL Realizado: *{pnl:.4f} USDT*"
+                )
             )
             # Full technical details go to the debug log file only.
             logger.debug(
@@ -615,6 +631,13 @@ class PaperExecutor:
                     sym,
                     pnl,
                 )
+                asyncio.create_task(
+                    send_telegram_alert(
+                        f"🤖🧠 *SMART EXIT* | #{sym}\n"
+                        f"Cierre por reversión de IA.\n"
+                        f"PnL Estimado: *{pnl:.4f} USDT*"
+                    )
+                )
                 logger.debug(
                     "TRADE CLOSED [ML_EXHAUSTION]  symbol=%s  entry=%.2f  "
                     "exit=%.2f  sell_confidence=%.4f  gate=%.4f  pnl=%.4f",
@@ -644,6 +667,13 @@ class PaperExecutor:
                     "alcanzado. PnL: %.4f",
                     sym,
                     pnl,
+                )
+                asyncio.create_task(
+                    send_telegram_alert(
+                        f"⏳ *TTL EXIT* | #{sym}\n"
+                        f"Cierre por límite de tiempo (12h).\n"
+                        f"PnL: *{pnl:.4f} USDT*"
+                    )
                 )
                 logger.debug(
                     "TRADE CLOSED [TTL]  symbol=%s  entry=%.2f  exit=%.2f  "
