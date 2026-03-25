@@ -90,6 +90,12 @@ _DEFAULT_TTL_HOURS: float = 12.0
 # The closing threshold is: min_confidence * _ML_EXIT_CONFIDENCE_FACTOR
 _ML_EXIT_CONFIDENCE_FACTOR: float = 0.8
 
+# ── ATR-based dynamic stop-loss / trailing-stop multipliers ───────────────────
+# Stop Loss distance  = current_atr * ATR_SL_MULTIPLIER
+ATR_SL_MULTIPLIER: float = 1.5
+# Trailing Stop distance = current_atr * ATR_TRAILING_MULTIPLIER
+ATR_TRAILING_MULTIPLIER: float = 1.0
+
 
 @dataclass
 class OpenPosition:
@@ -104,6 +110,10 @@ class OpenPosition:
     sl_pct: float = BASE_SL
     activation_pct: float = BASE_ACTIVATION_PCT
     trailing_distance_pct: float = BASE_TRAILING_DISTANCE
+    # ATR-based stop loss (absolute price level; 0.0 → derive from sl_pct)
+    stop_loss_price: float = 0.0
+    # ATR-based trailing distance (absolute price distance; 0.0 → use pct-based)
+    atr_trailing_distance: float = 0.0
     # [PRO] Trailing Stop state
     peak_price: float = field(init=False)
     trailing_stop_active: bool = False
@@ -113,6 +123,9 @@ class OpenPosition:
     def __post_init__(self) -> None:
         # Initialise peak_price to entry_price so it is always defined
         self.peak_price = self.entry_price
+        # If stop_loss_price was not set explicitly, derive it from sl_pct
+        if self.stop_loss_price == 0.0:
+            self.stop_loss_price = self.entry_price * (1.0 - self.sl_pct)
 
 
 class PaperExecutor:
@@ -216,6 +229,7 @@ class PaperExecutor:
         symbol: str | None = None,
         timestamp: datetime | None = None,
         sentiment_score: float = 0.0,
+        current_atr: float | None = None,
     ) -> bool:
         """Size and open a new trade using the leverage-based position formula.
 
@@ -243,6 +257,10 @@ class PaperExecutor:
         sentiment_score:
             AI sentiment score in [-1.0, +1.0] used to compute dynamic
             risk thresholds.  Defaults to ``0.0`` (neutral / base thresholds).
+        current_atr:
+            Current ATR value for *symbol* (e.g. ATR_14 on the 15m chart).
+            When provided, the initial stop loss and trailing stop distance
+            are derived from this value instead of fixed percentages.
         """
         sym = symbol or self.symbol
 
@@ -359,6 +377,16 @@ class PaperExecutor:
             position_size=position_size,
             entry_time=ts,
         )
+
+        # ── ATR-based dynamic SL / trailing distance ───────────────────────
+        sl_distance: float | None = None
+        stop_loss_price: float = 0.0  # 0.0 → __post_init__ derives from sl_pct
+        atr_trailing_distance: float = 0.0  # 0.0 → use pct-based trailing
+        if current_atr is not None and current_atr > 0.0:
+            sl_distance = current_atr * ATR_SL_MULTIPLIER
+            stop_loss_price = entry_price - sl_distance  # LONG position
+            atr_trailing_distance = current_atr * ATR_TRAILING_MULTIPLIER
+
         self.open_positions[sym] = OpenPosition(
             symbol=sym,
             entry_price=entry_price,
@@ -368,23 +396,37 @@ class PaperExecutor:
             sl_pct=thresholds.sl_pct,
             activation_pct=thresholds.activation_pct,
             trailing_distance_pct=thresholds.trailing_distance_pct,
+            stop_loss_price=stop_loss_price,
+            atr_trailing_distance=atr_trailing_distance,
         )
         # Operational console line – visible on the terminal at INFO level.
-        logger.info(
-            "🚀 [ENTRADA] %s | Lado: BUY | Confianza: %.1f%% | SL: %.2f%% | TP: %.2f%%",
-            sym,
-            win_probability * 100,
-            thresholds.sl_pct * 100,
-            thresholds.activation_pct * 100,
-        )
+        if sl_distance is not None:
+            logger.info(
+                "✅ [OPEN LONG] %s a %.2f. SL Dinámico (ATR): %.2f (Distancia: %.2f)",
+                sym,
+                entry_price,
+                self.open_positions[sym].stop_loss_price,
+                sl_distance,
+            )
+        else:
+            logger.info(
+                "🚀 [ENTRADA] %s | Lado: BUY | Confianza: %.1f%% | SL: %.2f%% | TP: %.2f%%",
+                sym,
+                win_probability * 100,
+                thresholds.sl_pct * 100,
+                thresholds.activation_pct * 100,
+            )
         # Full technical details go to the debug log file only.
         logger.debug(
-            "TRADE OPENED  symbol=%s  entry_price=%.2f  size=%.2f  id=%s  balance=%.2f",
+            "TRADE OPENED  symbol=%s  entry_price=%.2f  size=%.2f  id=%s  balance=%.2f  "
+            "sl_price=%.2f  atr=%.4f",
             sym,
             entry_price,
             position_size,
             trade_id,
             self._risk.balance,
+            self.open_positions[sym].stop_loss_price,
+            current_atr if current_atr is not None else 0.0,
         )
         return True
 
@@ -444,11 +486,14 @@ class PaperExecutor:
             )
 
         # 3. Compute the active stop loss level.
-        initial_sl_price = pos.entry_price * (1.0 - pos.sl_pct)
+        initial_sl_price = pos.stop_loss_price  # set at open (ATR or pct-based)
         if pos.trailing_stop_active:
-            # Trailing SL: trailing_distance_pct below the running peak.
+            # Trailing SL: prefer ATR-based fixed distance; fall back to pct.
+            if pos.atr_trailing_distance > 0.0:
+                trailing_sl = pos.peak_price - pos.atr_trailing_distance
+            else:
+                trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
             # The SL can only move up, so take the max with the initial SL.
-            trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
             active_sl = max(trailing_sl, initial_sl_price)
         else:
             active_sl = initial_sl_price

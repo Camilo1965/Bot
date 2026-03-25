@@ -32,6 +32,9 @@ _SMA_SHORT = 20
 _SMA_LONG = 50
 _EMA_SHORT = 20
 
+# ATR period
+ATR_PERIOD = 14
+
 # Minimum number of price observations required for a feature vector
 MIN_PRICES = _SMA_LONG
 
@@ -54,6 +57,66 @@ class FeatureEngineer:
         rs = avg_gain / avg_loss.replace(0, np.nan)
         rsi = 100 - (100 / (1 + rs))
         return rsi.fillna(50.0)
+
+    @staticmethod
+    def compute_atr(
+        highs: list[float],
+        lows: list[float],
+        closes: list[float],
+        period: int = ATR_PERIOD,
+    ) -> float | None:
+        """Compute the Average True Range (ATR) for the latest bar.
+
+        Uses Wilder's smoothing (RMA) over *period* bars.  Requires at least
+        ``period + 1`` values in each of *highs*, *lows*, and *closes* (the
+        extra value is needed to compute the previous-close component of the
+        first True Range).
+
+        Parameters
+        ----------
+        highs:  Per-bar high prices in chronological order.
+        lows:   Per-bar low prices in chronological order.
+        closes: Per-bar close prices in chronological order.
+        period: Smoothing period (default 14, as in ATR_14).
+
+        Returns
+        -------
+        The latest ATR value as a float, or ``None`` when there is
+        insufficient data.
+        """
+        n = min(len(highs), len(lows), len(closes))
+        if n < period + 1:
+            logger.debug(
+                "compute_atr: insufficient data (%d bars, need %d).",
+                n,
+                period + 1,
+            )
+            return None
+
+        h = highs[-n:]
+        lw = lows[-n:]
+        c = closes[-n:]
+
+        # Compute True Range for each bar starting at index 1
+        trs: list[float] = []
+        for i in range(1, n):
+            tr = max(
+                h[i] - lw[i],
+                abs(h[i] - c[i - 1]),
+                abs(lw[i] - c[i - 1]),
+            )
+            trs.append(tr)
+
+        if len(trs) < period:
+            return None
+
+        # Seed the ATR with the simple mean of the first `period` TRs
+        atr = sum(trs[:period]) / period
+        # Apply Wilder's smoothing for remaining TRs
+        for tr in trs[period:]:
+            atr = (atr * (period - 1) + tr) / period
+
+        return atr
 
     # ------------------------------------------------------------------
     # Public interface
