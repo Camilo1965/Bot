@@ -39,7 +39,7 @@ from database.db_manager import close_db, db, init_db
 from execution.binance_executor import create_exchange, fetch_open_positions, fetch_total_wallet_balance
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
-from strategy.ml_predictor import MLPredictor, compute_htf_trend
+from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, compute_htf_trend
 from strategy.sentiment_llm import get_gemini_sentiment
 
 load_dotenv()
@@ -520,6 +520,40 @@ async def signal_emitter(
                 len(prices),
                 sentiment,
             )
+
+            # ------------------------------------------------------------------
+            # [SMART EXIT] Layers 1 + 4 – ML Exhaustion & TTL
+            # ------------------------------------------------------------------
+            # For every open position evaluate whether the current ML signal
+            # warrants an early exit (trend reversal) or the TTL has elapsed.
+            # This runs in the same signal-emitter cycle (every ~15 s) so it
+            # never blocks the event loop with additional network calls.
+            if symbol in paper_executor.open_positions and prices:
+                current_price = prices[-1]
+                try:
+                    smart_pnl = await paper_executor.check_ml_exit(
+                        current_price=current_price,
+                        ml_signal=signal,
+                        ml_probability=win_prob if win_prob > 0.0 else None,
+                        symbol=symbol,
+                        min_confidence=BUY_PROB_THRESHOLD,
+                    )
+                    if smart_pnl is not None:
+                        logger.debug(
+                            "Smart exit triggered  symbol=%s  pnl=%.4f  total_pnl=%.4f",
+                            symbol,
+                            smart_pnl,
+                            paper_executor.total_pnl,
+                        )
+                        # Position was closed – skip the BUY entry logic below.
+                        continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "⚠️ [ALERTA] check_ml_exit failed for %s: %s %s",
+                        symbol,
+                        exc,
+                        _DEBUG_LOG_HINT,
+                    )
 
             if signal == "BUY" and prices:
                 entry_price = prices[-1]

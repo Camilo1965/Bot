@@ -65,6 +65,10 @@ _BUY_SENTIMENT_THRESHOLD = 0.0
 _SELL_PROB_THRESHOLD = 0.3
 _SELL_SENTIMENT_THRESHOLD = -0.3
 
+# Public alias used by callers that need to synchronise their confidence
+# gate with the predictor's buy-probability threshold (e.g. smart exits).
+BUY_PROB_THRESHOLD: float = _BUY_PROB_THRESHOLD
+
 # Default prediction horizon (price-tick steps)
 _PREDICTION_HORIZON = 5
 
