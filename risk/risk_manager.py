@@ -75,6 +75,37 @@ _HALT_DURATION: timedelta = timedelta(hours=24)
 
 MAX_POSITIONS: int = 3          # Maximum simultaneous open positions
 
+# ── Sector / correlation-group mapping ────────────────────────────────────────
+# Used by :func:`get_sector` and :meth:`RiskManager.is_sector_exposed` to
+# prevent opening more than one position within the same correlated group.
+SECTOR_MAP: dict[str, str] = {
+    "BTCUSDT": "L1_MAJOR",
+    "ETHUSDT": "L1_MAJOR",
+    "SOLUSDT": "L1_MAJOR",
+    "BNBUSDT": "L1_MAJOR",
+    "LINKUSDT": "DEFI",
+    "INJUSDT": "DEFI",
+    "FETUSDT": "AI",
+    "RENDERUSDT": "AI",
+    "DOGEUSDT": "MEME",
+    "PEPEUSDT": "MEME",
+}
+
+_SECTOR_UNCLASSIFIED: str = "UNCLASSIFIED"
+
+
+def get_sector(symbol: str) -> str:
+    """Return the correlation sector for *symbol*.
+
+    Strips the ``/`` separator so that both ``"BTCUSDT"`` and ``"BTC/USDT"``
+    resolve correctly against :data:`SECTOR_MAP`.
+
+    Returns ``"UNCLASSIFIED"`` when the symbol is not listed in the map.
+    """
+    normalised = symbol.replace("/", "").upper()
+    return SECTOR_MAP.get(normalised, _SECTOR_UNCLASSIFIED)
+
+
 # ── Dynamic risk management – base thresholds (neutral market) ────────────────
 BASE_SL: float = 0.015                      # 1.5 % base stop loss
 BASE_ACTIVATION_PCT: float = 0.03           # 3 % profit to activate trailing stop
@@ -232,6 +263,25 @@ class RiskManager:
     def can_open_position(self) -> bool:
         """Return *True* if another position may be opened (below max_positions)."""
         return self._open_count < self.max_positions
+
+    def is_sector_exposed(self, symbol: str, open_symbols: list[str]) -> bool:
+        """Return *True* if any symbol in *open_symbols* shares the sector of *symbol*.
+
+        Used to enforce a maximum of one open position per correlation group
+        (e.g. at most one L1 Major at a time: BTC, ETH, SOL, BNB).
+
+        Parameters
+        ----------
+        symbol:
+            The candidate symbol being considered for a new position.
+        open_symbols:
+            Symbols that currently have an open position.
+        """
+        target_sector = get_sector(symbol)
+        # Unclassified symbols are never blocked by sector exposure.
+        if target_sector == _SECTOR_UNCLASSIFIED:
+            return False
+        return any(get_sector(s) == target_sector for s in open_symbols)
 
     # ------------------------------------------------------------------
     # Daily-loss safety break
