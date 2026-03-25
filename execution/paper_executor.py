@@ -246,6 +246,17 @@ class OpenPosition:
         if self.stop_loss_price == 0.0:
             self.stop_loss_price = self.entry_price * (1.0 - self.sl_pct)
 
+    @property
+    def max_price_seen(self) -> float:
+        """Running maximum price observed since position open (high-watermark).
+
+        Alias for :attr:`peak_price`; updated automatically in
+        :meth:`~PaperExecutor.check_and_close` whenever the current price
+        exceeds the previously recorded peak.  Used by the audit telemetry
+        layer to surface the PICO_MÁX column in ``audit.log``.
+        """
+        return self.peak_price
+
 
 class PaperExecutor:
     """Simulate (and optionally live-execute) order execution for multiple symbols.

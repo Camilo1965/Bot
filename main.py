@@ -170,6 +170,14 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
       reach the terminal.  Verbose data-pipeline noise (kline ticks,
       buffer updates, per-symbol AI thoughts) is demoted to ``DEBUG`` in
       the calling code so it never reaches the console handler.
+
+    A third, isolated channel is also configured:
+
+    * **Audit** (``audit.log``): a dedicated :class:`~logging.FileHandler`
+      attached **only** to the ``clawdbot.audit`` logger (``propagate=False``)
+      so its output never reaches the console.  It records per-position
+      risk telemetry (trailing stop, ATR, high-watermark) in a
+      human-readable pipe-delimited format for post-session analysis.
     """
     root = logging.getLogger()
     root.handlers.clear()
@@ -192,6 +200,21 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(_ConsoleFormatter())
     root.addHandler(console_handler)
+
+    # ── Audit handler: pipe-delimited risk telemetry → audit.log ─────────────
+    audit_log_file = Path(__file__).parent / "audit.log"
+    audit_file_handler = logging.FileHandler(audit_log_file, encoding="utf-8")
+    audit_file_handler.setLevel(logging.DEBUG)
+    audit_file_handler.setFormatter(logging.Formatter("%(message)s"))
+    audit_logger = logging.getLogger("clawdbot.audit")
+    audit_logger.setLevel(logging.DEBUG)
+    audit_logger.propagate = False  # never reaches console or bot_debug.log
+    audit_logger.addHandler(audit_file_handler)
+
+    # Write a column header once per session so the file is self-describing.
+    audit_logger.info(
+        "# [HORA]    | [MONEDA]   | PRECIO_ACTUAL | PICO_MÁX    | ATR_VAL  | STOP_CALCULADO | DISTANCIA_%"
+    )
 
     return logging.getLogger("clawdbot")
 
@@ -761,8 +784,13 @@ async def dashboard_logger(
     current number of monitored markets, the latest Gemini sentiment score, and
     the open-position count.  This replaces the per-tick price noise on the
     terminal while still providing a live operational status.
+
+    Per-position risk telemetry (trailing stop, ATR, high-watermark) is written
+    exclusively to ``audit.log`` via the ``clawdbot.audit`` logger so the
+    console remains clean.
     """
     logger = logging.getLogger("clawdbot.dashboard")
+    audit = logging.getLogger("clawdbot.audit")
     while True:
         await asyncio.sleep(interval)
         sentiment: float = state.get("sentiment", 0.0)
@@ -784,8 +812,8 @@ async def dashboard_logger(
             risk_manager.max_positions,
             list(paper_executor.open_positions.keys()) or "none",
         )
-        # Per-position trailing stop status – emitted at INFO so it appears on
-        # the console alongside the heartbeat line every minute.
+        # ── Audit telemetry: per-position risk data → audit.log only ─────────
+        hora = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
         for sym, pos in paper_executor.open_positions.items():
             prices_buf = state["prices"].get(sym, [])
             if not prices_buf:
@@ -793,8 +821,6 @@ async def dashboard_logger(
             mark_price: float = prices_buf[-1]
             if pos.entry_price == 0.0:
                 continue
-            price_change_pct = (mark_price - pos.entry_price) / pos.entry_price
-            unrealized_pnl = price_change_pct * pos.position_size
             # Mirror the trailing-stop computation from check_and_close.
             initial_sl_price = pos.stop_loss_price
             if pos.trailing_stop_active:
@@ -802,15 +828,26 @@ async def dashboard_logger(
                     trailing_sl = pos.peak_price - pos.atr_trailing_distance
                 else:
                     trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
-                trailing_stop_price = max(trailing_sl, initial_sl_price)
+                stop_calculated = max(trailing_sl, initial_sl_price)
             else:
-                trailing_stop_price = initial_sl_price
-            logger.info(
-                "[POSICIÓN] %s | Precio Actual: %.4f | Trailing Stop: %.4f | PNL: %.4f",
+                stop_calculated = initial_sl_price
+            atr_val: float | None = state.get("atrs", {}).get(sym)
+            # DISTANCIA_% = ((PRECIO_ACTUAL - STOP_CALCULADO) / PRECIO_ACTUAL) * 100
+            distancia_pct = (
+                (mark_price - stop_calculated) / mark_price * 100
+                if mark_price > 0
+                else 0.0
+            )
+            atr_str = f"{atr_val:.4f}" if atr_val is not None else "N/A"
+            audit.info(
+                "%s | %-10s | %13.4f | %11.4f | %8s | %14.4f | %11.2f%%",
+                hora,
                 sym,
                 mark_price,
-                trailing_stop_price,
-                unrealized_pnl,
+                pos.peak_price,
+                atr_str,
+                stop_calculated,
+                distancia_pct,
             )
 
 
