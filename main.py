@@ -213,7 +213,7 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 
     # Write a column header once per session so the file is self-describing.
     audit_logger.info(
-        "# [HORA]    | [MONEDA]   | PRECIO_ACTUAL | PICO_MÁX    | ATR_VAL  | STOP_CALCULADO | DISTANCIA_%"
+        "# [HORA]    | [MONEDA]   | PRECIO_ACTUAL | PICO_MÁX    | ATR_VAL  | STOP_CALCULADO | XGB_CONF | DISTANCIA_%"
     )
 
     return logging.getLogger("clawdbot")
@@ -551,6 +551,9 @@ async def signal_emitter(
                 obi_ratio=obi_ratio,
             ) or 0.0
 
+            # Store the latest ML confidence so dashboard_logger can display it.
+            state["ml_probs"][symbol] = win_prob
+
             logger.debug(
                 "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d | Sentiment: %.4f",
                 symbol,
@@ -795,13 +798,34 @@ async def dashboard_logger(
         await asyncio.sleep(interval)
         sentiment: float = state.get("sentiment", 0.0)
         n_positions = len(paper_executor.open_positions)
-        logger.info(
-            "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones",
-            len(WATCHLIST),
-            sentiment,
-            n_positions,
-            risk_manager.max_positions,
+        # Compute average ML confidence across all symbols that have a prediction.
+        ml_probs: dict[str, float] = state.get("ml_probs", {})
+        active_probs = [v for v in ml_probs.values() if v > 0.0]
+        avg_conf_pct = int(round(sum(active_probs) / len(active_probs) * 100)) if active_probs else 0
+        # Build per-open-position confidence tag (e.g. "SOL/USDT (ML: 72%)")
+        pos_tags = ", ".join(
+            f"{sym} (ML: {int(round(ml_probs.get(sym, 0.0) * 100))}%)"
+            for sym in paper_executor.open_positions
         )
+        if pos_tags:
+            logger.info(
+                "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones [%s] | Confianza Promedio ML: %d%%",
+                len(WATCHLIST),
+                sentiment,
+                n_positions,
+                risk_manager.max_positions,
+                pos_tags,
+                avg_conf_pct,
+            )
+        else:
+            logger.info(
+                "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones | Confianza Promedio ML: %d%%",
+                len(WATCHLIST),
+                sentiment,
+                n_positions,
+                risk_manager.max_positions,
+                avg_conf_pct,
+            )
         # Detailed dashboard metrics go to the file log only (DEBUG).
         logger.debug(
             "📊 [DASHBOARD] Total PnL: %.4f USDT  |  Balance: %.2f USDT  |  "
@@ -839,14 +863,16 @@ async def dashboard_logger(
                 else 0.0
             )
             atr_str = f"{atr_val:.4f}" if atr_val is not None else "N/A"
+            xgb_conf: float = ml_probs.get(sym, 0.0)
             audit.info(
-                "%s | %-10s | %13.4f | %11.4f | %8s | %14.4f | %11.2f%%",
+                "%s | %-10s | %13.4f | %11.4f | %8s | %14.4f | %8.4f | %11.2f%%",
                 hora,
                 sym,
                 mark_price,
                 pos.peak_price,
                 atr_str,
                 stop_calculated,
+                xgb_conf,
                 distancia_pct,
             )
 
@@ -893,6 +919,8 @@ async def main() -> None:
             symbol: {"1h": "neutral", "4h": "neutral", "15m": "neutral"}
             for symbol in WATCHLIST
         },
+        # [ML] Latest XGBoost win-probability per symbol (0.0 = not yet computed)
+        "ml_probs": {symbol: 0.0 for symbol in WATCHLIST},
     }
 
     predictor = MLPredictor()
