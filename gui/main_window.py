@@ -48,7 +48,12 @@ from gui.db_reader import DBReaderThread
 # Constants
 # ---------------------------------------------------------------------------
 
-WATCHLIST: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+WATCHLIST: list[str] = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",  # L1_MAJOR
+    "LINK/USDT", "INJ/USDT",                           # DEFI
+    "FET/USDT", "RENDER/USDT",                         # AI
+    "DOGE/USDT", "PEPE/USDT",                          # MEME
+]
 APP_TITLE = "ClawdBot - Institutional Dashboard"
 DEFAULT_SYMBOL = WATCHLIST[0]
 

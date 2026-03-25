@@ -33,7 +33,12 @@ logger = logging.getLogger(__name__)
 # Constants (must mirror strategy/ml_predictor.py)
 # ---------------------------------------------------------------------------
 
-_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",  # L1_MAJOR
+    "LINK/USDT", "INJ/USDT",                           # DEFI
+    "FET/USDT", "RENDER/USDT",                         # AI
+    "DOGE/USDT", "PEPE/USDT",                          # MEME
+]
 _TIMEFRAME = "15m"
 _FETCH_LIMIT = 1000         # ccxt max per request
 _PREDICTION_HORIZON = 5     # ticks ahead used as the label
