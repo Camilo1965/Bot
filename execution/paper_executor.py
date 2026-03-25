@@ -82,6 +82,14 @@ logger = logging.getLogger(__name__)
 _DEBUG_LOG_HINT = "(Revisa bot_debug.log para detalles técnicos)"
 
 
+# Default TTL for open positions (hours).  Set to None to disable.
+_DEFAULT_TTL_HOURS: float = 12.0
+
+# Smart-exit ML confidence multiplier for Layer 1 (Exhaustion Exit).
+# The closing threshold is: min_confidence * _ML_EXIT_CONFIDENCE_FACTOR
+_ML_EXIT_CONFIDENCE_FACTOR: float = 0.8
+
+
 @dataclass
 class OpenPosition:
     """Lightweight container for a single open paper trade."""
@@ -98,6 +106,8 @@ class OpenPosition:
     # [PRO] Trailing Stop state
     peak_price: float = field(init=False)
     trailing_stop_active: bool = False
+    # [SMART EXIT] Maximum holding time in hours; None disables TTL (Layer 4).
+    max_ttl_hours: float | None = _DEFAULT_TTL_HOURS
 
     def __post_init__(self) -> None:
         # Initialise peak_price to entry_price so it is always defined
@@ -455,6 +465,140 @@ class PaperExecutor:
                 pnl,
             )
             return pnl
+
+        return None
+
+    async def check_ml_exit(
+        self,
+        current_price: float,
+        ml_signal: str,
+        ml_probability: float | None = None,
+        symbol: str | None = None,
+        timestamp: datetime | None = None,
+        min_confidence: float = 0.55,
+    ) -> float | None:
+        """Apply smart-exit logic driven by ML signals and TTL (Layers 1 and 4).
+
+        This method is called from the signal-emitter loop (typically every 15 s)
+        after the ML predictor has already generated a fresh signal.  It
+        complements the mechanical stop-loss in :meth:`check_and_close` (Layer 3)
+        with two higher-level exit conditions:
+
+        Layer 1 – ML Exhaustion / Reversal Exit
+            For a LONG position: if *ml_signal* is ``"SELL"`` **and** the
+            predicted probability of a downward move
+            (``1 - ml_probability``) is at least ``min_confidence *
+            _ML_EXIT_CONFIDENCE_FACTOR`` (default 80 % of *min_confidence*),
+            the position is closed immediately at *current_price*, ahead of any
+            SL level.  This handles the scenario where the model detects trend
+            exhaustion before the price reaches the trailing stop.
+
+        Layer 4 – Time-To-Live (TTL) Exit
+            If the position has been open for longer than its
+            :attr:`~OpenPosition.max_ttl_hours` limit (default 12 h), and neither
+            Layer 1 nor Layer 3 has yet closed it, the position is force-closed
+            to free up margin in a sideways market.
+
+        Parameters
+        ----------
+        current_price:
+            Latest market price.
+        ml_signal:
+            Output of :meth:`~strategy.ml_predictor.MLPredictor.generate_signal`
+            for *symbol* – ``"BUY"``, ``"SELL"``, or ``"HOLD"``.
+        ml_probability:
+            Output of :meth:`~strategy.ml_predictor.MLPredictor.predict_proba`
+            for *symbol* – probability in ``[0, 1]`` that price will move up.
+            When ``None`` Layer 1 is skipped entirely so that an untrained or
+            unavailable model never triggers an early exit.
+        symbol:
+            Trading pair to evaluate.  Defaults to ``self.symbol``.
+        timestamp:
+            Evaluation time (UTC).  Defaults to *now*.
+        min_confidence:
+            Base ML confidence threshold used to compute the Layer-1 gate
+            (``min_confidence * _ML_EXIT_CONFIDENCE_FACTOR``).  Pass the same
+            value as ``_BUY_PROB_THRESHOLD`` used in the predictor (default
+            0.55) to keep both thresholds in sync.
+
+        Returns
+        -------
+        Realised PnL if the position was closed, ``None`` otherwise.
+        """
+        sym = symbol or self.symbol
+        if sym not in self.open_positions:
+            return None
+
+        pos = self.open_positions[sym]
+        price_change_pct = (current_price - pos.entry_price) / pos.entry_price
+        pnl = price_change_pct * pos.position_size
+        ts = timestamp or datetime.now(tz=timezone.utc)
+
+        # ------------------------------------------------------------------
+        # Layer 1: ML Exhaustion / Reversal Exit
+        # ------------------------------------------------------------------
+        # For a LONG position: close if ML signals a high-confidence SELL.
+        # The downward-move confidence = 1 - ml_probability.
+        # Threshold = min_confidence * _ML_EXIT_CONFIDENCE_FACTOR (default 0.44).
+        # Skip Layer 1 entirely when ml_probability is unavailable (model not
+        # yet trained) to avoid acting on a signal without probability support.
+        if ml_signal == "SELL" and ml_probability is not None:
+            sell_confidence = 1.0 - ml_probability
+            confidence_gate = min_confidence * _ML_EXIT_CONFIDENCE_FACTOR
+            if sell_confidence >= confidence_gate:
+                await self._close_position(
+                    symbol=sym,
+                    exit_price=current_price,
+                    exit_time=ts,
+                    pnl=pnl,
+                )
+                logger.info(
+                    "🤖💰 [SMART EXIT] %s cerrado por Reversión de Tendencia "
+                    "(ML Exhaustion). PnL estimado: %.4f",
+                    sym,
+                    pnl,
+                )
+                logger.debug(
+                    "TRADE CLOSED [ML_EXHAUSTION]  symbol=%s  entry=%.2f  "
+                    "exit=%.2f  sell_confidence=%.4f  gate=%.4f  pnl=%.4f",
+                    sym,
+                    pos.entry_price,
+                    current_price,
+                    sell_confidence,
+                    confidence_gate,
+                    pnl,
+                )
+                return pnl
+
+        # ------------------------------------------------------------------
+        # Layer 4: Time-To-Live (TTL) Exit
+        # ------------------------------------------------------------------
+        if pos.max_ttl_hours is not None:
+            age_hours = (ts - pos.entry_time).total_seconds() / 3600.0
+            if age_hours >= pos.max_ttl_hours:
+                await self._close_position(
+                    symbol=sym,
+                    exit_price=current_price,
+                    exit_time=ts,
+                    pnl=pnl,
+                )
+                logger.info(
+                    "⏳ [TTL EXIT] %s cerrado por tiempo máximo de exposición "
+                    "alcanzado. PnL: %.4f",
+                    sym,
+                    pnl,
+                )
+                logger.debug(
+                    "TRADE CLOSED [TTL]  symbol=%s  entry=%.2f  exit=%.2f  "
+                    "age_hours=%.2f  max_ttl=%.2f  pnl=%.4f",
+                    sym,
+                    pos.entry_price,
+                    current_price,
+                    age_hours,
+                    pos.max_ttl_hours,
+                    pnl,
+                )
+                return pnl
 
         return None
 
