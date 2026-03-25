@@ -71,6 +71,7 @@ from risk.risk_manager import (
     LEVERAGE,
     RiskManager,
     get_dynamic_thresholds,
+    get_sector,
 )
 
 if TYPE_CHECKING:
@@ -261,6 +262,17 @@ class PaperExecutor:
             logger.debug(
                 "Trade skipped – max open positions (%d) reached.",
                 self._risk.max_positions,
+            )
+            return False
+
+        # ── Sector / correlation-group exposure check ──────────────────────
+        if self._risk.is_sector_exposed(sym, list(self.open_positions.keys())):
+            sector = get_sector(sym)
+            logger.warning(
+                "🛡️ [RISK CONTROL] Señal de BUY para %s ignorada. "
+                "Exposición máxima alcanzada para el sector: %s.",
+                sym,
+                sector,
             )
             return False
 
