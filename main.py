@@ -213,7 +213,7 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 
     # Write a column header once per session so the file is self-describing.
     audit_logger.info(
-        "# [HORA]    | [MONEDA]   | PRECIO_ACTUAL | PICO_MÁX    | ATR_VAL  | STOP_CALCULADO | DISTANCIA_%"
+        "# [HORA]    | [MONEDA]   | PRECIO_ACTUAL | PICO_MÁX    | ATR_VAL  | STOP_CALCULADO | XGB_CONF | DISTANCIA_%"
     )
 
     return logging.getLogger("clawdbot")
@@ -305,7 +305,11 @@ async def market_consumer(
 
             if price is not None:
                 try:
-                    pnl = await paper_executor.check_and_close(float(price), symbol=symbol)
+                    pnl = await paper_executor.check_and_close(
+                        float(price),
+                        symbol=symbol,
+                        current_atr=state.get("atrs", {}).get(symbol),
+                    )
                     if pnl is not None:
                         logger.debug(
                             "Position closed on trade tick  symbol=%s  pnl=%.4f  total_pnl=%.4f",
@@ -402,7 +406,12 @@ async def market_consumer(
                     logger.warning("⚠️ [ALERTA] DB insert_market_tick failed: %s %s", exc, _DEBUG_LOG_HINT)
 
                 try:
-                    pnl = await paper_executor.check_and_close(mid_price, symbol=symbol, timestamp=ts)
+                    pnl = await paper_executor.check_and_close(
+                        mid_price,
+                        symbol=symbol,
+                        timestamp=ts,
+                        current_atr=state.get("atrs", {}).get(symbol),
+                    )
                     if pnl is not None:
                         logger.debug(
                             "Position closed on order-book tick  symbol=%s  pnl=%.4f  total_pnl=%.4f",
@@ -550,6 +559,9 @@ async def signal_emitter(
                 lows=lows or None,
                 obi_ratio=obi_ratio,
             ) or 0.0
+
+            # Store the latest ML confidence so dashboard_logger can display it.
+            state["ml_probs"][symbol] = win_prob
 
             logger.debug(
                 "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d | Sentiment: %.4f",
@@ -795,13 +807,34 @@ async def dashboard_logger(
         await asyncio.sleep(interval)
         sentiment: float = state.get("sentiment", 0.0)
         n_positions = len(paper_executor.open_positions)
-        logger.info(
-            "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones",
-            len(WATCHLIST),
-            sentiment,
-            n_positions,
-            risk_manager.max_positions,
+        # Compute average ML confidence across all symbols that have a prediction.
+        ml_probs: dict[str, float] = state.get("ml_probs", {})
+        active_probs = [v for v in ml_probs.values() if v > 0.0]
+        avg_conf_pct = int(round((sum(active_probs) / len(active_probs)) * 100)) if active_probs else 0
+        # Build per-open-position confidence tag (e.g. "SOL/USDT (ML: 72%)")
+        pos_tags = ", ".join(
+            f"{sym} (ML: {int(round(ml_probs.get(sym, 0.0) * 100))}%)"
+            for sym in paper_executor.open_positions
         )
+        if pos_tags:
+            logger.info(
+                "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones [%s] | Confianza Promedio ML: %d%%",
+                len(WATCHLIST),
+                sentiment,
+                n_positions,
+                risk_manager.max_positions,
+                pos_tags,
+                avg_conf_pct,
+            )
+        else:
+            logger.info(
+                "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones | Confianza Promedio ML: %d%%",
+                len(WATCHLIST),
+                sentiment,
+                n_positions,
+                risk_manager.max_positions,
+                avg_conf_pct,
+            )
         # Detailed dashboard metrics go to the file log only (DEBUG).
         logger.debug(
             "📊 [DASHBOARD] Total PnL: %.4f USDT  |  Balance: %.2f USDT  |  "
@@ -821,16 +854,11 @@ async def dashboard_logger(
             mark_price: float = prices_buf[-1]
             if pos.entry_price == 0.0:
                 continue
-            # Mirror the trailing-stop computation from check_and_close.
-            initial_sl_price = pos.stop_loss_price
-            if pos.trailing_stop_active:
-                if pos.atr_trailing_distance > 0.0:
-                    trailing_sl = pos.peak_price - pos.atr_trailing_distance
-                else:
-                    trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
-                stop_calculated = max(trailing_sl, initial_sl_price)
-            else:
-                stop_calculated = initial_sl_price
+            # Use the live ratcheted stop stored on the position object – this
+            # is updated by check_and_close() on every price tick, so it always
+            # reflects the current in-memory value rather than a recomputed
+            # snapshot that could diverge from what the exit logic actually uses.
+            stop_calculated: float = pos.current_stop_loss
             atr_val: float | None = state.get("atrs", {}).get(sym)
             # DISTANCIA_% = ((PRECIO_ACTUAL - STOP_CALCULADO) / PRECIO_ACTUAL) * 100
             distancia_pct = (
@@ -839,15 +867,56 @@ async def dashboard_logger(
                 else 0.0
             )
             atr_str = f"{atr_val:.4f}" if atr_val is not None else "N/A"
+            xgb_conf: float = ml_probs.get(sym, 0.0)
             audit.info(
-                "%s | %-10s | %13.4f | %11.4f | %8s | %14.4f | %11.2f%%",
+                "%s | %-10s | %13.4f | %11.4f | %8s | %14.4f | %8.4f | %11.2f%%",
                 hora,
                 sym,
                 mark_price,
                 pos.peak_price,
                 atr_str,
                 stop_calculated,
+                xgb_conf,
                 distancia_pct,
+            )
+
+
+async def position_sync_loop(
+    paper_executor: PaperExecutor,
+    interval: int = 60,
+) -> None:
+    """Periodically reconcile local position state with live Binance Futures.
+
+    On each tick the coroutine:
+
+    1. Logs ``[SISTEMA] 🔄 Sincronizando posiciones con Binance…``
+    2. Calls :meth:`~execution.paper_executor.PaperExecutor.sync_positions_with_exchange`
+       which removes any *ghost* positions (in memory but gone on Binance) and
+       cancels their orphan orders.
+    3. Logs ``[SISTEMA] ✅ Sincronización completa. Posiciones reales: {count}``.
+
+    When the executor is running in pure paper-trading mode (no live exchange
+    client) the coroutine exits immediately so it never occupies a task slot
+    needlessly.
+    """
+    if paper_executor._exchange is None:
+        return  # Nothing to sync in pure paper-trading mode.
+
+    logger = logging.getLogger("clawdbot.sync")
+    while True:
+        await asyncio.sleep(interval)
+        logger.info("[SISTEMA] 🔄 Sincronizando posiciones con Binance...")
+        try:
+            real_count = await paper_executor.sync_positions_with_exchange()
+            logger.info(
+                "[SISTEMA] ✅ Sincronización completa. Posiciones reales: %d.",
+                real_count,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "⚠️ [ALERTA] Position sync failed: %s %s",
+                exc,
+                _DEBUG_LOG_HINT,
             )
 
 
@@ -893,6 +962,8 @@ async def main() -> None:
             symbol: {"1h": "neutral", "4h": "neutral", "15m": "neutral"}
             for symbol in WATCHLIST
         },
+        # [ML] Latest XGBoost win-probability per symbol (0.0 = not yet computed)
+        "ml_probs": {symbol: 0.0 for symbol in WATCHLIST},
     }
 
     predictor = MLPredictor()
@@ -1070,6 +1141,7 @@ async def main() -> None:
             dashboard_logger(paper_executor, risk_manager, shared_state, interval=60),
             weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
             funding_rate_client.run(),
+            position_sync_loop(paper_executor, interval=60),
         )
     finally:
         if exchange_client is not None:

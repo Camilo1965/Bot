@@ -57,8 +57,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+import ccxt.async_support as ccxt_async
 from ccxt.base.errors import (
     AuthenticationError as CcxtAuthenticationError,
+    ExchangeError as CcxtExchangeError,
     InsufficientFunds as CcxtInsufficientFunds,
     NetworkError as CcxtNetworkError,
     NotSupported as CcxtNotSupported,
@@ -236,6 +238,8 @@ class OpenPosition:
     # [PRO] Trailing Stop state
     peak_price: float = field(init=False)
     trailing_stop_active: bool = False
+    # Ratcheted active stop level – updated every check cycle; never retreats.
+    current_stop_loss: float = field(init=False)
     # [SMART EXIT] Maximum holding time in hours; None disables TTL (Layer 4).
     max_ttl_hours: float | None = _DEFAULT_TTL_HOURS
 
@@ -245,6 +249,8 @@ class OpenPosition:
         # If stop_loss_price was not set explicitly, derive it from sl_pct
         if self.stop_loss_price == 0.0:
             self.stop_loss_price = self.entry_price * (1.0 - self.sl_pct)
+        # Seed the ratcheted stop at the initial SL level.
+        self.current_stop_loss = self.stop_loss_price
 
     @property
     def max_price_seen(self) -> float:
@@ -572,6 +578,7 @@ class PaperExecutor:
         current_price: float,
         symbol: str | None = None,
         timestamp: datetime | None = None,
+        current_atr: float | None = None,
     ) -> float | None:
         """Check whether *current_price* triggers the stop loss for *symbol*.
 
@@ -596,6 +603,10 @@ class PaperExecutor:
             Trading pair to check.  Defaults to ``self.symbol``.
         timestamp:
             Evaluation time (UTC).  Defaults to *now*.
+        current_atr:
+            Latest ATR_14 value for *symbol*.  When provided and the trailing
+            stop is active, the stored ``atr_trailing_distance`` is refreshed
+            so the stop adapts to changing volatility.
         """
         sym = symbol or self.symbol
         if sym not in self.open_positions:
@@ -625,18 +636,31 @@ class PaperExecutor:
         # 3. Compute the active stop loss level.
         initial_sl_price = pos.stop_loss_price  # set at open (ATR or pct-based)
         if pos.trailing_stop_active:
+            # Refresh the ATR-based trailing distance if a live ATR is available.
+            if current_atr is not None and current_atr > 0.0:
+                pos.atr_trailing_distance = current_atr * ATR_TRAILING_MULTIPLIER
             # Trailing SL: prefer ATR-based fixed distance; fall back to pct.
             if pos.atr_trailing_distance > 0.0:
                 trailing_sl = pos.peak_price - pos.atr_trailing_distance
             else:
                 trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
-            # The SL can only move up, so take the max with the initial SL.
             active_sl = max(trailing_sl, initial_sl_price)
         else:
             active_sl = initial_sl_price
 
-        # 4. Close the position if the current price hits the active SL.
-        if current_price <= active_sl:
+        # Ratchet: the stored stop only ever moves up, guarding against both
+        # ATR spikes that would otherwise widen the distance and stale values.
+        pos.current_stop_loss = max(active_sl, pos.current_stop_loss)
+
+        logger.debug(
+            "[DEBUG] Precio: %.4f | Stop Activo: %.4f | Distancia al Stop: %.4f",
+            current_price,
+            pos.current_stop_loss,
+            current_price - pos.current_stop_loss,
+        )
+
+        # 4. Close the position if the current price hits the ratcheted SL.
+        if current_price <= pos.current_stop_loss:
             pnl = price_change_pct * pos.position_size
             ts = timestamp or datetime.now(tz=timezone.utc)
             reason = "TSL" if pos.trailing_stop_active else "SL"
@@ -910,4 +934,93 @@ class PaperExecutor:
             self._risk.record_daily_loss(-pnl)
         self.total_pnl += pnl
         del self.open_positions[symbol]
+
+    async def sync_positions_with_exchange(self) -> int:
+        """Re-sync local open-position state against live Binance Futures positions.
+
+        Detects *ghost* positions — entries that exist in local memory but have
+        already been closed on the exchange (e.g. via manual close on the Binance
+        UI or an external stop-loss trigger) — and removes them from
+        :attr:`open_positions`.  For each ghost position any lingering open orders
+        on Binance are also cancelled to avoid orphan TP/SL orders.
+
+        In pure paper-trading mode (``self._exchange is None``) the method is a
+        no-op and returns the current local position count unchanged.
+
+        Returns
+        -------
+        int
+            Number of positions currently open on Binance (0 in paper mode).
+        """
+        if self._exchange is None:
+            return len(self.open_positions)
+
+        # Local import to avoid a circular dependency at module level
+        # (both modules live in the execution package).
+        from execution.binance_executor import fetch_open_positions
+
+        live_positions = await fetch_open_positions(self._exchange)
+        # Normalise symbols: strip settle suffix (e.g. "BTC/USDT:USDT" → "BTC/USDT")
+        live_symbols: set[str] = {p["symbol"].split(":")[0] for p in live_positions}
+
+        ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
+        for sym in ghost_symbols:
+            logger.info(
+                "[SYNC] 👻 Ghost position detected: %s exists in bot memory but is "
+                "no longer open on Binance. Removing from local state.",
+                sym,
+            )
+            await self._cancel_open_orders(sym)
+            pos = self.open_positions.pop(sym, None)
+            if pos is not None:
+                self._risk.register_close()
+                logger.info(
+                    "[SYNC] ✅ Ghost position %s removed. Local positions now: %d.",
+                    sym,
+                    len(self.open_positions),
+                )
+
+        return len(live_symbols)
+
+    async def _cancel_open_orders(self, symbol: str) -> None:
+        """Cancel all open orders for *symbol* on Binance Futures.
+
+        Called when a ghost position is detected so that any orphan Stop-Loss or
+        Take-Profit orders left on the exchange are cleaned up automatically.
+        Errors are logged as warnings rather than raised so they never interrupt
+        the main sync loop.
+        """
+        if self._exchange is None:
+            return
+        try:
+            open_orders: list[dict] = await self._exchange.fetch_open_orders(symbol)
+        except (CcxtNetworkError, CcxtAuthenticationError, CcxtNotSupported, CcxtExchangeError) as exc:
+            logger.warning(
+                "[SYNC] Could not fetch open orders for %s: %s – orphan orders may remain.",
+                symbol,
+                exc,
+            )
+            return
+
+        if not open_orders:
+            return
+
+        for order in open_orders:
+            order_id = order.get("id")
+            if order_id is None:
+                continue
+            try:
+                await self._exchange.cancel_order(order_id, symbol)
+                logger.info(
+                    "[SYNC] 🗑️ Cancelled orphan order %s for %s.",
+                    order_id,
+                    symbol,
+                )
+            except (CcxtNetworkError, CcxtAuthenticationError, CcxtNotSupported, CcxtExchangeError) as exc:
+                logger.warning(
+                    "[SYNC] Could not cancel order %s for %s: %s",
+                    order_id,
+                    symbol,
+                    exc,
+                )
 
