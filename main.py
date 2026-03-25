@@ -244,12 +244,19 @@ async def gemini_sentiment_refresher(
                 score: float = await loop.run_in_executor(
                     None, get_gemini_sentiment, headlines
                 )
+                is_first_reading = state.get("sentiment") is None
                 state["sentiment"] = score
-                log.info(
-                    "[LLM] Gemini sentiment updated – headlines=%d  score=%.4f",
-                    len(headlines),
-                    score,
-                )
+                if is_first_reading:
+                    log.info(
+                        "[LLM] Primera lectura de sentimiento: %.2f (Ignorando cálculo de swing por inicio de sistema).",
+                        score,
+                    )
+                else:
+                    log.info(
+                        "[LLM] Gemini sentiment updated – headlines=%d  score=%.4f",
+                        len(headlines),
+                        score,
+                    )
                 ts = datetime.now(tz=timezone.utc)
                 try:
                     # Store one aggregated DB row per refresh cycle rather than
@@ -434,7 +441,7 @@ async def signal_emitter(
     logger = logging.getLogger("clawdbot.signal")
     while True:
         await asyncio.sleep(interval)
-        sentiment: float = state.get("sentiment", 0.0)
+        sentiment: float | None = state.get("sentiment")
 
         # ------------------------------------------------------------------
         # [PRO] Advanced News Filter
@@ -442,29 +449,33 @@ async def signal_emitter(
         # Record the current sentiment reading with its timestamp.
         now = datetime.now(tz=timezone.utc)
         sentiment_history: deque[tuple[datetime, float]] = state["sentiment_history"]
-        sentiment_history.append((now, sentiment))
+        # Only append to history once a real Gemini score is available.
+        # When sentiment is None (first boot, before first Gemini call) we skip
+        # the append so the deque stays empty and no artificial swing is triggered.
+        if sentiment is not None:
+            sentiment_history.append((now, sentiment))
 
-        # Prune entries older than the 10-minute observation window.
-        cutoff = now - timedelta(minutes=10)
-        while sentiment_history and sentiment_history[0][0] < cutoff:
-            sentiment_history.popleft()
+            # Prune entries older than the 10-minute observation window.
+            cutoff = now - timedelta(minutes=10)
+            while sentiment_history and sentiment_history[0][0] < cutoff:
+                sentiment_history.popleft()
 
-        # Check for high-volatility sentiment fluctuation.
-        hold_until: datetime | None = state.get("news_hold_until")
-        if len(sentiment_history) >= 2:
-            scores = [s for _, s in sentiment_history]
-            if max(scores) - min(scores) > _NEWS_FILTER_VOLATILITY_THRESHOLD:
-                new_hold_until = now + timedelta(minutes=_NEWS_FILTER_HOLD_MINUTES)
-                # Extend the HOLD window on every new trigger.
-                if hold_until is None or new_hold_until > hold_until:
-                    state["news_hold_until"] = new_hold_until
-                    logger.info(
-                        "[PRO] News Filter triggered – sentiment swing %.4f > %.2f "
-                        "in the last 10 min. Global HOLD until %s.",
-                        max(scores) - min(scores),
-                        _NEWS_FILTER_VOLATILITY_THRESHOLD,
-                        new_hold_until.isoformat(),
-                    )
+            # Check for high-volatility sentiment fluctuation.
+            hold_until: datetime | None = state.get("news_hold_until")
+            if len(sentiment_history) >= 2:
+                scores = [s for _, s in sentiment_history]
+                if max(scores) - min(scores) > _NEWS_FILTER_VOLATILITY_THRESHOLD:
+                    new_hold_until = now + timedelta(minutes=_NEWS_FILTER_HOLD_MINUTES)
+                    # Extend the HOLD window on every new trigger.
+                    if hold_until is None or new_hold_until > hold_until:
+                        state["news_hold_until"] = new_hold_until
+                        logger.info(
+                            "[PRO] News Filter triggered – sentiment swing %.4f > %.2f "
+                            "in the last 10 min. Global HOLD until %s.",
+                            max(scores) - min(scores),
+                            _NEWS_FILTER_VOLATILITY_THRESHOLD,
+                            new_hold_until.isoformat(),
+                        )
 
         # Honour the active HOLD period: skip all signal evaluation.
         hold_until = state.get("news_hold_until")
@@ -481,6 +492,10 @@ async def signal_emitter(
 
         for symbol in watchlist:
             prices: list[float] = list(state["prices"].get(symbol, []))
+
+            # Resolve the effective sentiment score for signal generation.
+            # Use neutral 0.0 until the first real Gemini reading is available.
+            effective_sentiment: float = sentiment if sentiment is not None else 0.0
 
             if len(prices) < 50:
                 logger.debug(
@@ -544,7 +559,7 @@ async def signal_emitter(
 
             signal = predictor.generate_signal(
                 prices,
-                sentiment,
+                effective_sentiment,
                 highs=highs or None,
                 lows=lows or None,
                 obi_ratio=obi_ratio,
@@ -554,7 +569,7 @@ async def signal_emitter(
             )
             win_prob: float = predictor.predict_proba(
                 prices,
-                sentiment,
+                effective_sentiment,
                 highs=highs or None,
                 lows=lows or None,
                 obi_ratio=obi_ratio,
@@ -569,7 +584,7 @@ async def signal_emitter(
                 signal,
                 win_prob * 100,
                 len(prices),
-                sentiment,
+                effective_sentiment,
             )
 
             # ------------------------------------------------------------------
@@ -928,7 +943,7 @@ async def main() -> None:
 
     market_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     shared_state: dict[str, Any] = {
-        "sentiment": 0.0,
+        "sentiment": None,  # None until first Gemini reading (prevents false swing on startup)
         "prices": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         # [ELITE] OHLCV buffers for ADX / ATR computation
         "highs": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
