@@ -40,6 +40,7 @@ from execution.binance_executor import create_exchange, fetch_open_positions, fe
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, compute_htf_trend
+from strategy.feature_engineer import FeatureEngineer
 from strategy.sentiment_llm import get_gemini_sentiment
 
 load_dotenv()
@@ -458,6 +459,16 @@ async def signal_emitter(
             obi_ratio: float = state.get("obi_ratios", {}).get(symbol, 1.0)
             funding_rate: float = state.get("funding_rates", {}).get(symbol, 0.0)
 
+            # [ATR] Compute ATR_14 from the 15m OHLCV buffers and cache in state
+            current_atr: float | None = FeatureEngineer.compute_atr(highs, lows, prices)
+            if current_atr is not None:
+                state.setdefault("atrs", {})[symbol] = current_atr
+                logger.debug(
+                    "📐 [ATR] %s – ATR_14=%.4f", symbol, current_atr
+                )
+            else:
+                current_atr = state.get("atrs", {}).get(symbol)
+
             # [MTA] Compute higher-timeframe trend statuses
             closes_4h: list[float] = list(
                 state.get("htf_closes", {}).get(symbol, {}).get("4h", [])
@@ -563,6 +574,7 @@ async def signal_emitter(
                         win_probability=win_prob,
                         symbol=symbol,
                         sentiment_score=sentiment,
+                        current_atr=current_atr,
                     )
                     if not opened:
                         logger.debug(
@@ -782,6 +794,8 @@ async def main() -> None:
         # [ELITE] OHLCV buffers for ADX / ATR computation
         "highs": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         "lows": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
+        # [ATR] Latest ATR_14 value per symbol (updated each signal cycle; None = not yet computed)
+        "atrs": {symbol: None for symbol in WATCHLIST},
         # [ELITE] Latest Order Book Imbalance ratio per symbol
         "obi_ratios": {symbol: 1.0 for symbol in WATCHLIST},
         # [ELITE] Latest perpetual-futures funding rate per symbol
