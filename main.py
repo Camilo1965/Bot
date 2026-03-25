@@ -91,7 +91,12 @@ def _check_env() -> None:
 _check_env()
 
 # ── Multi-asset watchlist ─────────────────────────────────────────────────────
-WATCHLIST: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+WATCHLIST: list[str] = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",  # L1_MAJOR
+    "LINK/USDT", "INJ/USDT",                           # DEFI
+    "FET/USDT", "RENDER/USDT",                         # AI
+    "DOGE/USDT", "PEPE/USDT",                          # MEME
+]
 
 # ── [PRO] News Filter parameters ─────────────────────────────────────────────
 # Maximum allowed sentiment swing within the 10-minute observation window.

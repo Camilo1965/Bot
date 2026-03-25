@@ -53,7 +53,12 @@ _RESET  = "\033[0m"
 logger = logging.getLogger(__name__)
 
 # ── Back-test parameters ──────────────────────────────────────────────────────
-_SYMBOLS          = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+_SYMBOLS          = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",  # L1_MAJOR
+    "LINK/USDT", "INJ/USDT",                           # DEFI
+    "FET/USDT", "RENDER/USDT",                         # AI
+    "DOGE/USDT", "PEPE/USDT",                          # MEME
+]
 _FETCH_LIMIT      = 1_000              # max candles per ccxt request
 _SIX_MONTHS_MS    = 183 * 24 * 60 * 60 * 1_000
 
