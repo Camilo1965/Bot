@@ -98,6 +98,123 @@ ATR_SL_MULTIPLIER: float = 1.5
 # Trailing Stop distance = current_atr * ATR_TRAILING_MULTIPLIER
 ATR_TRAILING_MULTIPLIER: float = 1.0
 
+# ── Post-trade reporting ───────────────────────────────────────────────────────
+# Simulated taker fee per side (Binance Futures standard: 0.04 % of notional).
+# Applied twice (entry + exit) to compute the round-trip fee cost.
+_TAKER_FEE_RATE: float = 0.0004
+
+# Human-readable exit-reason labels used in the Telegram trade report.
+_EXIT_REASON_LABELS: dict[str, str] = {
+    "SL_BASE":               "SL_BASE: El precio tocó el stop loss inicial.",
+    "TRAILING_STOP":         "TRAILING_STOP: El stop subió con el precio y se ejecutó al retroceder (Ganancia protegida).",
+    "SMART_EXIT_ML":         "SMART_EXIT_ML: El modelo XGBoost detectó agotamiento de tendencia.",
+    "SMART_EXIT_SENTIMENT":  "SMART_EXIT_SENTIMENT: Gemini detectó un cambio brusco a sentimiento negativo.",
+    "TTL_TIMEOUT":           "TTL_TIMEOUT: Tiempo máximo de exposición alcanzado.",
+}
+
+
+def _format_duration(total_seconds: float) -> str:
+    """Return a human-readable duration string (e.g. ``'2h 15m 30s'``).
+
+    Parameters
+    ----------
+    total_seconds:
+        Elapsed time in seconds (non-negative).
+    """
+    secs = int(abs(total_seconds))  # abs() guards against clock skew / rounding
+    hours, remainder = divmod(secs, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or hours:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def _build_trade_report(
+    sym: str,
+    pos: "OpenPosition",
+    exit_price: float,
+    exit_time: "datetime",
+    gross_pnl: float,
+    exit_reason_code: str,
+    current_balance: float,
+) -> str:
+    """Build the institutional post-trade Telegram report.
+
+    Computes net PnL after simulated round-trip taker fees
+    (``_TAKER_FEE_RATE`` applied twice: once on entry, once on exit).
+    The percentage return is expressed on the *initial margin* deployed
+    (``position_size / LEVERAGE``) so it reflects the actual capital at risk.
+
+    Parameters
+    ----------
+    sym:
+        Normalised trading pair symbol (e.g. ``"BTC/USDT"``).
+    pos:
+        The :class:`OpenPosition` that was just closed.
+    exit_price:
+        Price at which the position was closed.
+    exit_time:
+        UTC timestamp of the close event.
+    gross_pnl:
+        Unrealised PnL *before* fee deduction (in USDT).
+    exit_reason_code:
+        One of the keys in :data:`_EXIT_REASON_LABELS`.
+    current_balance:
+        Risk-manager balance *after* crediting back the closed position.
+
+    Returns
+    -------
+    str
+        Markdown-formatted Telegram message.
+    """
+    # Net PnL: deduct round-trip taker fees (assumes both legs are market/taker orders;
+    # entry fee = fee_rate × notional, exit fee = fee_rate × notional).
+    total_fees = pos.position_size * _TAKER_FEE_RATE * 2
+    net_pnl = gross_pnl - total_fees
+
+    # Percentage return on deployed margin (initial margin = notional / leverage)
+    margin_used = pos.position_size / LEVERAGE
+    if margin_used <= 0:
+        logger.warning(
+            "_build_trade_report: non-positive margin_used=%.4f for %s – pnl_pct set to 0",
+            margin_used,
+            sym,
+        )
+        pnl_pct = 0.0
+    else:
+        pnl_pct = net_pnl / margin_used * 100
+
+    # Dynamic status based on profitability
+    if net_pnl > 0:
+        status_emoji = "🟢"
+    else:
+        status_emoji = "🔴"
+
+    # Duration
+    duration_str = _format_duration((exit_time - pos.entry_time).total_seconds())
+
+    # Exit reason label
+    exit_label = _EXIT_REASON_LABELS.get(exit_reason_code, exit_reason_code)
+
+    # Sign prefixes for display
+    pnl_sign = "+" if net_pnl >= 0 else ""
+    pct_sign = "+" if pnl_pct >= 0 else ""
+
+    return (
+        f"🏁 *TRADE COMPLETED* | #{sym} {status_emoji}\n"
+        f"────────────────────────\n"
+        f"📈 *PnL:* {pnl_sign}{net_pnl:.4f} USDT ({pct_sign}{pnl_pct:.2f}%)\n"
+        f"🚪 *Causa:* {exit_label}\n"
+        f"⏱️ *Duración:* {duration_str}\n"
+        f"📊 *Entrada:* {pos.entry_price:.2f} | *Salida:* {exit_price:.2f}\n"
+        f"💰 *Wallet Final:* {current_balance:.2f} USDT\n"
+        f"────────────────────────"
+    )
+
 
 @dataclass
 class OpenPosition:
@@ -512,6 +629,7 @@ class PaperExecutor:
             pnl = price_change_pct * pos.position_size
             ts = timestamp or datetime.now(tz=timezone.utc)
             reason = "TSL" if pos.trailing_stop_active else "SL"
+            reason_code = "TRAILING_STOP" if pos.trailing_stop_active else "SL_BASE"
             await self._close_position(symbol=sym, exit_price=current_price, exit_time=ts, pnl=pnl)
             # Operational console line – visible on the terminal at INFO level.
             logger.info(
@@ -522,9 +640,15 @@ class PaperExecutor:
             )
             asyncio.create_task(
                 send_telegram_alert(
-                    f"🛑 *CLOSED* | #{sym}\n"
-                    f"Cierre por Trailing/Stop Loss.\n"
-                    f"PnL Realizado: *{pnl:.4f} USDT*"
+                    _build_trade_report(
+                        sym=sym,
+                        pos=pos,
+                        exit_price=current_price,
+                        exit_time=ts,
+                        gross_pnl=pnl,
+                        exit_reason_code=reason_code,
+                        current_balance=self._risk.balance,
+                    )
                 )
             )
             # Full technical details go to the debug log file only.
@@ -633,9 +757,15 @@ class PaperExecutor:
                 )
                 asyncio.create_task(
                     send_telegram_alert(
-                        f"🤖🧠 *SMART EXIT* | #{sym}\n"
-                        f"Cierre por reversión de IA.\n"
-                        f"PnL Estimado: *{pnl:.4f} USDT*"
+                        _build_trade_report(
+                            sym=sym,
+                            pos=pos,
+                            exit_price=current_price,
+                            exit_time=ts,
+                            gross_pnl=pnl,
+                            exit_reason_code="SMART_EXIT_ML",
+                            current_balance=self._risk.balance,
+                        )
                     )
                 )
                 logger.debug(
@@ -670,9 +800,15 @@ class PaperExecutor:
                 )
                 asyncio.create_task(
                     send_telegram_alert(
-                        f"⏳ *TTL EXIT* | #{sym}\n"
-                        f"Cierre por límite de tiempo (12h).\n"
-                        f"PnL: *{pnl:.4f} USDT*"
+                        _build_trade_report(
+                            sym=sym,
+                            pos=pos,
+                            exit_price=current_price,
+                            exit_time=ts,
+                            gross_pnl=pnl,
+                            exit_reason_code="TTL_TIMEOUT",
+                            current_balance=self._risk.balance,
+                        )
                     )
                 )
                 logger.debug(
