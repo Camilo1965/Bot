@@ -784,6 +784,34 @@ async def dashboard_logger(
             risk_manager.max_positions,
             list(paper_executor.open_positions.keys()) or "none",
         )
+        # Per-position trailing stop status – emitted at INFO so it appears on
+        # the console alongside the heartbeat line every minute.
+        for sym, pos in paper_executor.open_positions.items():
+            prices_buf = state["prices"].get(sym, [])
+            if not prices_buf:
+                continue
+            mark_price: float = prices_buf[-1]
+            if pos.entry_price == 0.0:
+                continue
+            price_change_pct = (mark_price - pos.entry_price) / pos.entry_price
+            unrealized_pnl = price_change_pct * pos.position_size
+            # Mirror the trailing-stop computation from check_and_close.
+            initial_sl_price = pos.stop_loss_price
+            if pos.trailing_stop_active:
+                if pos.atr_trailing_distance > 0.0:
+                    trailing_sl = pos.peak_price - pos.atr_trailing_distance
+                else:
+                    trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
+                trailing_stop_price = max(trailing_sl, initial_sl_price)
+            else:
+                trailing_stop_price = initial_sl_price
+            logger.info(
+                "[POSICIÓN] %s | Precio Actual: %.4f | Trailing Stop: %.4f | PNL: %.4f",
+                sym,
+                mark_price,
+                trailing_stop_price,
+                unrealized_pnl,
+            )
 
 
 async def main() -> None:
