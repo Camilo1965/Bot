@@ -97,6 +97,10 @@ def create_exchange(
             "options": {
                 "defaultType": "future",
                 "adjustForTimeDifference": True,
+                # Extend the server-side validity window to 10 s so that
+                # minor clock skew between the local machine and Binance does
+                # not trigger error -1021 ("Timestamp … ahead of server time").
+                "recvWindow": 10000,
                 # Disable automatic currency metadata fetch which relies on
                 # sapi endpoints that are not available on the Futures Testnet.
                 "fetchCurrencies": False,
