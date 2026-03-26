@@ -293,24 +293,26 @@ async def market_consumer(
 ) -> None:
     logger = logging.getLogger("clawdbot.market")
     ticks = 0
+    _last_price_log: dict[str, float] = {}  # symbol → last log timestamp (monotonic)
     while True:
         message = await market_queue.get()
         symbol: str = message.get("symbol", "BTC/USDT")
 
         if message.get("type") == "trade":
             price = message.get("price")
-            sentiment = state.get("sentiment", 0.0)
+            sentiment: float = state.get("sentiment") or 0.0
             ticks += 1
 
-            # Demoted to DEBUG – price ticks flood the screen at INFO level.
-            if ticks % 50 == 0:
-                prices_buf = state["prices"].get(symbol, [])
-                logger.debug(
-                    "%s price=%.2f  sentiment_score=%.4f | Buffer: %d/500",
-                    symbol, price, sentiment, len(prices_buf),
-                )
-
+            # Throttled INFO log – at most once every 60 seconds per symbol.
             if price is not None:
+                now_mono = asyncio.get_event_loop().time()
+                if now_mono - _last_price_log.get(symbol, 0.0) >= 60.0:
+                    _last_price_log[symbol] = now_mono
+                    prices_buf = state["prices"].get(symbol, [])
+                    logger.info(
+                        "%s price=%.2f  sentiment_score=%.4f | Buffer: %d/500",
+                        symbol, price, sentiment, len(prices_buf),
+                    )
                 try:
                     pnl = await paper_executor.check_and_close(
                         float(price),
@@ -575,8 +577,9 @@ async def signal_emitter(
                 obi_ratio=obi_ratio,
             ) or 0.0
 
-            # Store the latest ML confidence so dashboard_logger can display it.
+            # Store the latest ML confidence and signal so dashboard_logger can display it.
             state["ml_probs"][symbol] = win_prob
+            state["signals"][symbol] = signal
 
             logger.debug(
                 "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d | Sentiment: %.4f",
@@ -820,10 +823,11 @@ async def dashboard_logger(
     audit = logging.getLogger("clawdbot.audit")
     while True:
         await asyncio.sleep(interval)
-        sentiment: float = state.get("sentiment", 0.0)
+        sentiment: float = state.get("sentiment") or 0.0
         n_positions = len(paper_executor.open_positions)
         # Compute average ML confidence across all symbols that have a prediction.
         ml_probs: dict[str, float] = state.get("ml_probs", {})
+        signals: dict[str, str] = state.get("signals", {})
         active_probs = [v for v in ml_probs.values() if v > 0.0]
         avg_conf_pct = int(round((sum(active_probs) / len(active_probs)) * 100)) if active_probs else 0
         # Build per-open-position confidence tag (e.g. "SOL/USDT (ML: 72%)")
@@ -831,6 +835,16 @@ async def dashboard_logger(
             f"{sym} (ML: {int(round(ml_probs.get(sym, 0.0) * 100))}%)"
             for sym in paper_executor.open_positions
         )
+
+        # ── News Filter global HOLD status ────────────────────────────────────
+        news_hold_until = state.get("news_hold_until")
+        now = datetime.now(tz=timezone.utc)
+        if news_hold_until is not None and now < news_hold_until:
+            logger.info(
+                "[ESTADO] ⛔ GLOBAL HOLD ACTIVO (Sentimiento: %.2f) - No se permiten compras.",
+                sentiment,
+            )
+
         if pos_tags:
             logger.info(
                 "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones [%s] | Confianza Promedio ML: %d%%",
@@ -850,6 +864,29 @@ async def dashboard_logger(
                 risk_manager.max_positions,
                 avg_conf_pct,
             )
+
+        # ── Analysis board: top 3–5 symbols by ML confidence ─────────────────
+        # Pick the symbols with the highest ML probability to display.
+        prices_state: dict = state.get("prices", {})
+        ranked = sorted(
+            ((sym, prob) for sym, prob in ml_probs.items() if prob > 0.0),
+            key=lambda t: t[1],
+            reverse=True,
+        )[:5]
+        if ranked:
+            parts: list[str] = []
+            for sym, prob in ranked:
+                base_sym = sym.split("/")[0]
+                price_buf = prices_state.get(sym, [])
+                last_price: float | None = price_buf[-1] if price_buf else None
+                sig = signals.get(sym, "HOLD")
+                conf_pct = int(round(prob * 100))
+                if last_price is not None:
+                    parts.append(f"{base_sym}: ${last_price:,.2f} (ML: {conf_pct}% - {sig})")
+                else:
+                    parts.append(f"{base_sym}: N/A (ML: {conf_pct}% - {sig})")
+            logger.info("[ANÁLISIS] %s", " | ".join(parts))
+
         # Detailed dashboard metrics go to the file log only (DEBUG).
         logger.debug(
             "📊 [DASHBOARD] Total PnL: %.4f USDT  |  Balance: %.2f USDT  |  "
@@ -979,6 +1016,8 @@ async def main() -> None:
         },
         # [ML] Latest XGBoost win-probability per symbol (0.0 = not yet computed)
         "ml_probs": {symbol: 0.0 for symbol in WATCHLIST},
+        # [ML] Latest generated signal per symbol ("HOLD" until first prediction)
+        "signals": {symbol: "HOLD" for symbol in WATCHLIST},
     }
 
     predictor = MLPredictor()
