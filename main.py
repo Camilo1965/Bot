@@ -32,6 +32,11 @@ from typing import Any
 
 import ccxt.async_support as ccxt_async
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich import box as rich_box
+from rich.logging import RichHandler
 
 from data_ingestion.funding_rate_client import FundingRateClient
 from data_ingestion.news_scraper import fetch_crypto_headlines
@@ -802,62 +807,137 @@ async def preload_historical_data(
         await exchange.close()
 
 
+def generate_dashboard(
+    state: dict[str, Any],
+    paper_executor: PaperExecutor,
+    risk_manager: RiskManager,
+    watchlist: list[str],
+) -> Table:
+    """Build and return a Rich Table with a snapshot of the current bot state.
+
+    Reads prices, ML probabilities, sentiment, HTF trend, and open positions
+    from *state* and *paper_executor* to produce a one-screen summary that is
+    rendered by :class:`~rich.live.Live` every second.
+    """
+    now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    sentiment: float | None = state.get("sentiment")
+    ml_probs: dict[str, float] = state.get("ml_probs", {})
+    news_hold_until: datetime | None = state.get("news_hold_until")
+    now_utc = datetime.now(tz=timezone.utc)
+    global_hold = (
+        (sentiment is not None and sentiment < 0.35)
+        or (news_hold_until is not None and now_utc < news_hold_until)
+    )
+
+    table = Table(
+        title=f"🤖  ClawdBot  –  Live Dashboard  |  {now_str}",
+        box=rich_box.ROUNDED,
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+        show_footer=True,
+    )
+
+    table.add_column("Símbolo", style="bold white", no_wrap=True)
+    table.add_column("Precio", justify="right")
+    table.add_column("ML Conf.", justify="right")
+    table.add_column("Tendencia 15m / 1h / 4h", justify="center")
+    table.add_column("Posición", justify="center")
+    table.add_column("PnL Pos.", justify="right")
+
+    _trend_color = {"bullish": "green", "bearish": "red", "neutral": "yellow"}
+
+    for sym in watchlist:
+        prices = state["prices"].get(sym, [])
+        price: float | None = prices[-1] if prices else None
+        price_str = f"{price:,.2f}" if price is not None else "[dim]N/A[/dim]"
+
+        prob = ml_probs.get(sym, 0.0)
+        prob_color = "green" if prob >= 0.55 else "yellow" if prob >= 0.40 else "red"
+        prob_str = f"[{prob_color}]{prob * 100:.1f}%[/{prob_color}]"
+
+        htf_trend = state.get("htf_trend", {}).get(sym, {})
+        t15 = htf_trend.get("15m", "neutral")
+        t1h = htf_trend.get("1h", "neutral")
+        t4h = htf_trend.get("4h", "neutral")
+        trend_str = (
+            f"[{_trend_color.get(t15, 'white')}]{t15[:4]}[/] / "
+            f"[{_trend_color.get(t1h, 'white')}]{t1h[:4]}[/] / "
+            f"[{_trend_color.get(t4h, 'white')}]{t4h[:4]}[/]"
+        )
+
+        pos = paper_executor.open_positions.get(sym)
+        if pos and price is not None:
+            qty = pos.position_size / pos.entry_price
+            unrealized_pnl = (price - pos.entry_price) * qty
+            pnl_color = "green" if unrealized_pnl >= 0 else "red"
+            pos_str = f"[cyan]LONG @{pos.entry_price:,.2f}[/cyan]"
+            pnl_str = f"[{pnl_color}]{unrealized_pnl:+.2f}[/{pnl_color}]"
+        elif pos:
+            pos_str = f"[cyan]LONG @{pos.entry_price:,.2f}[/cyan]"
+            pnl_str = "[dim]N/A[/dim]"
+        else:
+            pos_str = "[dim]—[/dim]"
+            pnl_str = "[dim]—[/dim]"
+
+        table.add_row(sym.split("/")[0], price_str, prob_str, trend_str, pos_str, pnl_str)
+
+    # ── Summary footer ────────────────────────────────────────────────────────
+    sentiment_str = f"{sentiment:.4f}" if sentiment is not None else "N/A"
+    news_str = "[red]⛔ HOLD[/red]" if global_hold else "[green]✅ OK[/green]"
+    n_pos = len(paper_executor.open_positions)
+    balance_str = f"[bold]{risk_manager.balance:,.2f} USDT[/bold]"
+    total_pnl_color = "green" if paper_executor.total_pnl >= 0 else "red"
+    total_pnl_str = f"[{total_pnl_color}]{paper_executor.total_pnl:+.4f} USDT[/{total_pnl_color}]"
+
+    table.add_section()
+    table.add_row(
+        "[bold]RESUMEN[/bold]",
+        balance_str,
+        f"[bold]IA: {sentiment_str}[/bold]",
+        f"Noticias: {news_str}",
+        f"[bold]{n_pos}/{risk_manager.max_positions} pos.[/bold]",
+        f"PnL total: {total_pnl_str}",
+    )
+
+    return table
+
+
 async def dashboard_logger(
     paper_executor: PaperExecutor,
     risk_manager: RiskManager,
     state: dict[str, Any],
-    interval: int = 60,
+    live: Live,
+    interval: int = 1,
 ) -> None:
-    """Emit a heartbeat every *interval* seconds showing key operational metrics.
+    """Refresh the Rich Live dashboard every *interval* seconds.
 
-    Prints a single ``[SISTEMA] 📡`` line to the console (INFO level) with the
-    current number of monitored markets, the latest Gemini sentiment score, and
-    the open-position count.  This replaces the per-tick price noise on the
-    terminal while still providing a live operational status.
+    On each tick the function:
 
-    Per-position risk telemetry (trailing stop, ATR, high-watermark) is written
-    exclusively to ``audit.log`` via the ``clawdbot.audit`` logger so the
-    console remains clean.
+    * Calls :func:`generate_dashboard` to build a fresh :class:`~rich.table.Table`
+      and pushes it to the running :class:`~rich.live.Live` context so the
+      terminal display is updated in-place without any scrolling.
+    * Writes per-position risk telemetry (trailing stop, ATR, high-watermark)
+      exclusively to ``audit.log`` via the ``clawdbot.audit`` logger – this
+      output never reaches the console.
+    * Emits a DEBUG heartbeat to ``bot_debug.log`` for post-session analysis.
+
+    Important log events (errors, trade opens/closes) continue to reach the
+    console via the :class:`~rich.logging.RichHandler` that is attached to the
+    root logger in :func:`main`, which renders them above the live table.
     """
-    logger = logging.getLogger("clawdbot.dashboard")
+    logger_dash = logging.getLogger("clawdbot.dashboard")
     audit = logging.getLogger("clawdbot.audit")
     while True:
         await asyncio.sleep(interval)
-        # Sentinel: None until first Gemini reading.
-        raw_sentiment: float | None = state.get("sentiment")
-        sentiment: float = raw_sentiment if raw_sentiment is not None else 0.0
+
+        # ── Refresh the live TUI table ────────────────────────────────────────
+        live.update(generate_dashboard(state, paper_executor, risk_manager, WATCHLIST))
+
+        # ── Detailed heartbeat → bot_debug.log only (DEBUG) ──────────────────
         n_positions = len(paper_executor.open_positions)
-        # Compute average ML confidence across all symbols that have a prediction.
         ml_probs: dict[str, float] = state.get("ml_probs", {})
-
-        # -- Top 3 symbols by XGBoost probability ----------------------------
-        top3 = sorted(ml_probs.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        top3_str = ", ".join(
-            f"{sym.split('/')[0]} ({int(round(prob * 100))}%)"
-            for sym, prob in top3
-            if prob > 0.0
-        ) or "N/A"
-
-        # -- News Filter status ----------------------------------------------
-        news_hold_until: datetime | None = state.get("news_hold_until")
-        now_utc = datetime.now(tz=timezone.utc)
-        global_hold_active = (
-            sentiment < 0.35
-            or (news_hold_until is not None and now_utc < news_hold_until)
-        )
-        news_status = "⛔ GLOBAL HOLD ACTIVO" if global_hold_active else "✅ Filtro OK"
-
-        logger.info(
-            "[SISTEMA] 📡 %d Mercados | IA: %.2f | %s | Top: %s | %d/%d Pos.",
-            len(WATCHLIST),
-            sentiment,
-            news_status,
-            top3_str,
-            n_positions,
-            risk_manager.max_positions,
-        )
-        # Detailed dashboard metrics go to the file log only (DEBUG).
-        logger.debug(
+        logger_dash.debug(
             "📊 [DASHBOARD] Total PnL: %.4f USDT  |  Balance: %.2f USDT  |  "
             "Open positions: %d/%d  |  Symbols: %s",
             paper_executor.total_pnl,
@@ -866,6 +946,7 @@ async def dashboard_logger(
             risk_manager.max_positions,
             list(paper_executor.open_positions.keys()) or "none",
         )
+
         # ── Audit telemetry: per-position risk data → audit.log only ─────────
         hora = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
         for sym, pos in paper_executor.open_positions.items():
@@ -944,6 +1025,27 @@ async def position_sync_loop(
 
 async def main() -> None:
     logger = setup_logging()
+
+    # ── Rich console & Live dashboard setup ───────────────────────────────────
+    # Replace the plain StreamHandler with a RichHandler so that any log
+    # messages emitted while the Live table is active are rendered above the
+    # live area rather than being mixed into the raw terminal stream.
+    # Only WARNING+ events (trade alerts, errors) are forwarded to the console;
+    # everything else continues to be captured by the rotating file handler
+    # (bot_debug.log) and the dedicated audit logger (audit.log).
+    _rich_console = Console()
+    root_logger = logging.getLogger()
+    for _h in list(root_logger.handlers):
+        if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+            root_logger.removeHandler(_h)
+    _rich_handler = RichHandler(
+        console=_rich_console,
+        show_path=False,
+        rich_tracebacks=False,
+        level=logging.WARNING,
+    )
+    root_logger.addHandler(_rich_handler)
+
     logger.info("🚀 ClawdBot starting up...")
 
     await init_db()
@@ -1154,18 +1256,32 @@ async def main() -> None:
     # ------------------------------------------------------------------
     await preload_historical_data(shared_state, WATCHLIST)
 
+    # ── Start Rich Live dashboard ─────────────────────────────────────────────
+    # The Live context renders a fixed TUI table that refreshes every second.
+    # Important log events (WARNING+) are forwarded via RichHandler and appear
+    # above the live area so they are never lost.  Full DEBUG logs continue to
+    # be written to bot_debug.log and audit.log as before.
+    _live = Live(
+        generate_dashboard(shared_state, paper_executor, risk_manager, WATCHLIST),
+        console=_rich_console,
+        refresh_per_second=1,
+        auto_refresh=True,
+    )
+    _live.start(refresh=True)
+
     try:
         await asyncio.gather(
             ws_client.run(),
             gemini_sentiment_refresher(shared_state),
             market_consumer(market_queue, shared_state, paper_executor),
             signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
-            dashboard_logger(paper_executor, risk_manager, shared_state, interval=60),
+            dashboard_logger(paper_executor, risk_manager, shared_state, _live, interval=1),
             weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
             funding_rate_client.run(),
             position_sync_loop(paper_executor, interval=60),
         )
     finally:
+        _live.stop()
         if exchange_client is not None:
             await exchange_client.close()
         await close_db()

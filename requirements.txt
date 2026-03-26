@@ -33,6 +33,9 @@ vectorbt
 # Configuration
 python-dotenv
 
+# Terminal UI (Live dashboard)
+rich>=13.0.0
+
 # Desktop GUI
 PyQt6
 pyqtgraph
