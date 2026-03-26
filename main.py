@@ -904,11 +904,12 @@ async def position_sync_loop(
 
     On each tick the coroutine:
 
-    1. Logs ``[SISTEMA] 🔄 Sincronizando posiciones con Binance…``
+    1. Logs ``[SISTEMA] 🔄 Sincronizando posiciones con Binance…`` at DEBUG level.
     2. Calls :meth:`~execution.paper_executor.PaperExecutor.sync_positions_with_exchange`
        which removes any *ghost* positions (in memory but gone on Binance) and
        cancels their orphan orders.
-    3. Logs ``[SISTEMA] ✅ Sincronización completa. Posiciones reales: {count}``.
+    3. Logs the completion at DEBUG when there are no open positions (silent when
+       everything is in order) or at INFO when real positions exist.
 
     When the executor is running in pure paper-trading mode (no live exchange
     client) the coroutine exits immediately so it never occupies a task slot
@@ -920,13 +921,18 @@ async def position_sync_loop(
     logger = logging.getLogger("clawdbot.sync")
     while True:
         await asyncio.sleep(interval)
-        logger.info("[SISTEMA] 🔄 Sincronizando posiciones con Binance...")
+        logger.debug("[SISTEMA] 🔄 Sincronizando posiciones con Binance...")
         try:
             real_count = await paper_executor.sync_positions_with_exchange()
-            logger.info(
-                "[SISTEMA] ✅ Sincronización completa. Posiciones reales: %d.",
-                real_count,
-            )
+            if real_count > 0:
+                logger.info(
+                    "[SISTEMA] ✅ Sincronización completa. Posiciones reales: %d.",
+                    real_count,
+                )
+            else:
+                logger.debug(
+                    "[SISTEMA] ✅ Sincronización completa. Posiciones reales: 0."
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "⚠️ [ALERTA] Position sync failed: %s %s",

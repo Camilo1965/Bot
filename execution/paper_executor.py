@@ -965,7 +965,7 @@ class PaperExecutor:
 
         ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
         for sym in ghost_symbols:
-            logger.info(
+            logger.warning(
                 "[SYNC] 👻 Ghost position detected: %s exists in bot memory but is "
                 "no longer open on Binance. Removing from local state.",
                 sym,
