@@ -299,7 +299,7 @@ async def market_consumer(
 
         if message.get("type") == "trade":
             price = message.get("price")
-            sentiment = state.get("sentiment", 0.0)
+            sentiment = state.get("sentiment") or 0.0
             ticks += 1
 
             # Demoted to DEBUG – price ticks flood the screen at INFO level.
