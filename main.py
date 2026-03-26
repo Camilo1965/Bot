@@ -922,7 +922,7 @@ def generate_dashboard(
     header_text.append("   │   🔮 Sentimiento IA: ", style="dim")
     header_text.append(sentiment_val_str, style=f"bold {s_color}")
     header_text.append("   │   Noticias: ", style="dim")
-    header_text.append(news_str)
+    header_text.append_text(Text.from_markup(news_str))
 
     header_panel = Panel(
         header_text,
@@ -1077,9 +1077,9 @@ def generate_dashboard(
     events = list(_DASHBOARD_EVENTS)
     if events:
         for evt in events[-3:]:
-            events_text.append(evt + "\n")
+            events_text.append_text(Text.from_markup(evt + "\n"))
     else:
-        events_text.append("[dim]Sin eventos recientes…[/dim]")
+        events_text.append_text(Text.from_markup("[dim]Sin eventos recientes…[/dim]"))
 
     events_panel = Panel(
         events_text,
@@ -1099,6 +1099,7 @@ async def dashboard_logger(
     state: dict[str, Any],
     live: Live,
     interval: int = 1,
+    exchange: ccxt_async.binanceusdm | None = None,
 ) -> None:
     """Refresh the Rich Live dashboard every *interval* seconds.
 
@@ -1118,8 +1119,21 @@ async def dashboard_logger(
     """
     logger_dash = logging.getLogger("clawdbot.dashboard")
     audit = logging.getLogger("clawdbot.audit")
+    _latency_tick: int = 0
+    _LATENCY_INTERVAL: int = 10  # measure API latency every 10 iterations
     while True:
         await asyncio.sleep(interval)
+
+        # ── API latency measurement (every ~10 seconds) ───────────────────────
+        _latency_tick += 1
+        if exchange is not None and _latency_tick >= _LATENCY_INTERVAL:
+            _latency_tick = 0
+            try:
+                t_before = time.monotonic()
+                await exchange.fetch_time()
+                state["api_latency_ms"] = (time.monotonic() - t_before) * 1000.0
+            except Exception:  # noqa: BLE001
+                pass  # keep stale latency value; do not spam events panel
 
         # ── Refresh the live TUI table ────────────────────────────────────────
         live.update(generate_dashboard(state, paper_executor, risk_manager, WATCHLIST))
@@ -1479,7 +1493,7 @@ async def main() -> None:
             gemini_sentiment_refresher(shared_state),
             market_consumer(market_queue, shared_state, paper_executor),
             signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
-            dashboard_logger(paper_executor, risk_manager, shared_state, _live, interval=1),
+            dashboard_logger(paper_executor, risk_manager, shared_state, _live, interval=1, exchange=exchange_client),
             weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
             funding_rate_client.run(),
             position_sync_loop(paper_executor, interval=60),

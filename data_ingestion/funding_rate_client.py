@@ -90,9 +90,10 @@ class FundingRateClient:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
-                    logger.warning(
-                        "FundingRateClient: HTTP %d for %s", resp.status, symbol
-                    )
+                    if resp.status != 400:
+                        logger.warning(
+                            "FundingRateClient: HTTP %d for %s", resp.status, symbol
+                        )
                     return 0.0
                 data = await resp.json()
                 rate = float(data.get("lastFundingRate", 0.0))
