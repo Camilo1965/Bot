@@ -32,9 +32,12 @@ from typing import Any
 
 import ccxt.async_support as ccxt_async
 from dotenv import load_dotenv
-from rich.console import Console
+from rich.columns import Columns
+from rich.console import Console, Group
 from rich.live import Live
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 from rich import box as rich_box
 from rich.logging import RichHandler
 
@@ -44,7 +47,7 @@ from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
 from execution.binance_executor import create_exchange, fetch_open_positions, fetch_total_wallet_balance
 from execution.paper_executor import PaperExecutor
-from risk.risk_manager import RiskManager
+from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE, RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, compute_htf_trend
 from strategy.feature_engineer import FeatureEngineer
 from strategy.sentiment_llm import get_gemini_sentiment
@@ -58,6 +61,11 @@ _GREEN  = "\033[32m"
 _CYAN   = "\033[36m"
 _BOLD   = "\033[1m"
 _RESET  = "\033[0m"
+
+
+# ── Mega-Dashboard state ─────────────────────────────────────────────────────
+_BOT_START_TIME: datetime | None = None
+_DASHBOARD_EVENTS: deque[str] = deque(maxlen=5)
 
 
 def _check_env() -> None:
@@ -159,6 +167,30 @@ class _ConsoleFormatter(logging.Formatter):
         return f"{color}{ts} | {msg}{_RESET}"
 
 
+class _DashboardEventHandler(logging.Handler):
+    """Captures INFO+ log messages for the dashboard events panel.
+
+    Appends a short timestamped line to the module-level
+    :data:`_DASHBOARD_EVENTS` deque so the mega-dashboard can display
+    the last few operational events without interfering with other handlers.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
+            msg = record.getMessage()
+            if len(msg) > 78:
+                msg = msg[:75] + "..."
+            level_markup = {
+                logging.WARNING:  "[yellow]⚠[/yellow]",
+                logging.ERROR:    "[red]✖[/red]",
+                logging.CRITICAL: "[bold red]‼[/bold red]",
+            }.get(record.levelno, "[dim]•[/dim]")
+            _DASHBOARD_EVENTS.append(f"[dim]{ts}[/dim] {level_markup} {msg}")
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
     """Configure dual-channel logging and return the root *clawdbot* logger.
 
@@ -206,6 +238,11 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(_ConsoleFormatter())
     root.addHandler(console_handler)
+
+    # ── Dashboard event handler: capture INFO+ events for TUI panel ───────────
+    dashboard_event_handler = _DashboardEventHandler()
+    dashboard_event_handler.setLevel(logging.INFO)
+    root.addHandler(dashboard_event_handler)
 
     # ── Audit handler: pipe-delimited risk telemetry → audit.log ─────────────
     audit_log_file = Path(__file__).parent / "audit.log"
@@ -807,55 +844,147 @@ async def preload_historical_data(
         await exchange.close()
 
 
+def _compute_rsi(prices: list[float], period: int = 14) -> float | None:
+    """Compute RSI for the last *period* bars using simple averages.
+
+    Returns a float in [0, 100] or ``None`` when there are insufficient bars.
+    Used only by the dashboard for display; the authoritative RSI used in
+    signal generation comes from :class:`~strategy.feature_engineer.FeatureEngineer`.
+    """
+    if len(prices) < period + 1:
+        return None
+    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    recent = deltas[-period:]
+    avg_gain = sum(d for d in recent if d > 0) / period
+    avg_loss = sum(-d for d in recent if d < 0) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
 def generate_dashboard(
     state: dict[str, Any],
     paper_executor: PaperExecutor,
     risk_manager: RiskManager,
     watchlist: list[str],
-) -> Table:
-    """Build and return a Rich Table with a snapshot of the current bot state.
+) -> Group:
+    """Build and return a Rich mega-dashboard layout with system health,
+    market data, and risk/events panels.
 
-    Reads prices, ML probabilities, sentiment, HTF trend, and open positions
-    from *state* and *paper_executor* to produce a one-screen summary that is
-    rendered by :class:`~rich.live.Live` every second.
+    The returned :class:`~rich.console.Group` stacks three sections:
+
+    1. **Header panel** – uptime, API latency, model names, sentiment.
+    2. **Market table** – per-symbol price, 24 h %, ATR volatility, RSI,
+       HTF trend, open position, unrealised PnL, and AI action.
+       Rows for open positions are highlighted with a neon-green background.
+    3. **Footer columns** – risk & wallet panel (balance, available margin,
+       session PnL, max drawdown) beside a live-events log.
     """
-    now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_utc = datetime.now(tz=timezone.utc)
+    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
     sentiment: float | None = state.get("sentiment")
     ml_probs: dict[str, float] = state.get("ml_probs", {})
     news_hold_until: datetime | None = state.get("news_hold_until")
-    now_utc = datetime.now(tz=timezone.utc)
     global_hold = (
         (sentiment is not None and sentiment < 0.35)
         or (news_hold_until is not None and now_utc < news_hold_until)
     )
 
+    # ── Header Panel: System Health ──────────────────────────────────────────
+    if _BOT_START_TIME is not None:
+        elapsed = now_utc - _BOT_START_TIME
+        total_secs = int(elapsed.total_seconds())
+        h, rem = divmod(total_secs, 3600)
+        m, s = divmod(rem, 60)
+        uptime_str = f"{h:02d}h {m:02d}m {s:02d}s"
+    else:
+        uptime_str = "—"
+
+    latency_ms: float = state.get("api_latency_ms", 0.0)
+    lat_color = "bright_green" if latency_ms < 100 else "yellow" if latency_ms < 500 else "bright_red"
+    lat_str = f"{latency_ms:.0f} ms" if latency_ms > 0 else "—"
+
+    sentiment_val_str = f"{sentiment:.4f}" if sentiment is not None else "—"
+    s_color = "bright_green" if (sentiment or 0) >= 0.55 else "yellow" if (sentiment or 0) >= 0.35 else "bright_red"
+    news_str = "[bright_red]⛔ HOLD[/bright_red]" if global_hold else "[bright_green]✅ OK[/bright_green]"
+
+    header_text = Text(justify="left")
+    header_text.append("🤖  ClawdBot  –  Mega Dashboard  |  ", style="bold cyan")
+    header_text.append(now_str, style="white")
+    header_text.append("\n")
+    header_text.append("⏱ Uptime: ", style="dim")
+    header_text.append(uptime_str, style="bold white")
+    header_text.append("   │   🌐 Latencia API: ", style="dim")
+    header_text.append(lat_str, style=f"bold {lat_color}")
+    header_text.append("   │   🧠 Modelo: ", style="dim")
+    header_text.append("XGBoost_v3 + Gemini-2.5-Flash", style="bold magenta")
+    header_text.append("   │   🔮 Sentimiento IA: ", style="dim")
+    header_text.append(sentiment_val_str, style=f"bold {s_color}")
+    header_text.append("   │   Noticias: ", style="dim")
+    header_text.append(news_str)
+
+    header_panel = Panel(
+        header_text,
+        title="[bold cyan]⚡ SYSTEM HEALTH[/bold cyan]",
+        border_style="cyan",
+        box=rich_box.ROUNDED,
+    )
+
+    # ── Market Data Table ────────────────────────────────────────────────────
     table = Table(
-        title=f"🤖  ClawdBot  –  Live Dashboard  |  {now_str}",
         box=rich_box.ROUNDED,
         show_header=True,
         header_style="bold cyan",
         expand=True,
-        show_footer=True,
+        show_footer=False,
+        border_style="bright_blue",
+        title="[bold cyan]📊 MARKET DATA[/bold cyan]",
+        title_style="bold cyan",
     )
-
     table.add_column("Símbolo", style="bold white", no_wrap=True)
     table.add_column("Precio", justify="right")
-    table.add_column("ML Conf.", justify="right")
-    table.add_column("Tendencia 15m / 1h / 4h", justify="center")
+    table.add_column("24h %", justify="right")
+    table.add_column("Vol (ATR)", justify="right")
+    table.add_column("RSI", justify="right")
+    table.add_column("Tendencia 15m/1h/4h", justify="center")
     table.add_column("Posición", justify="center")
     table.add_column("PnL Pos.", justify="right")
+    table.add_column("Acción IA", justify="center")
 
-    _trend_color = {"bullish": "green", "bearish": "red", "neutral": "yellow"}
+    _trend_color = {"bullish": "bright_green", "bearish": "bright_red", "neutral": "yellow"}
 
     for sym in watchlist:
-        prices = state["prices"].get(sym, [])
+        prices = list(state["prices"].get(sym, []))
         price: float | None = prices[-1] if prices else None
         price_str = f"{price:,.2f}" if price is not None else "[dim]N/A[/dim]"
 
-        prob = ml_probs.get(sym, 0.0)
-        prob_color = "green" if prob >= 0.55 else "yellow" if prob >= 0.40 else "red"
-        prob_str = f"[{prob_color}]{prob * 100:.1f}%[/{prob_color}]"
+        # 24 h % change – 96 bars × 15 m = 24 h
+        change_24h_str = "[dim]—[/dim]"
+        if price is not None and len(prices) >= 96:
+            price_24h = prices[-96]
+            if price_24h > 0:
+                pct = (price - price_24h) / price_24h * 100
+                ch_color = "bright_green" if pct >= 0 else "bright_red"
+                sign = "+" if pct >= 0 else ""
+                change_24h_str = f"[{ch_color}]{sign}{pct:.2f}%[/{ch_color}]"
 
+        # Vol (ATR)
+        atr_val: float | None = state.get("atrs", {}).get(sym)
+        atr_str = f"{atr_val:.2f}" if atr_val is not None else "[dim]—[/dim]"
+
+        # RSI
+        rsi_val = _compute_rsi(prices) if len(prices) >= 15 else None
+        if rsi_val is not None:
+            rsi_color = "bright_red" if rsi_val >= 70 else "bright_green" if rsi_val <= 30 else "white"
+            rsi_str = f"[{rsi_color}]{rsi_val:.1f}[/{rsi_color}]"
+        else:
+            rsi_str = "[dim]—[/dim]"
+
+        # ML probability (kept for Acción IA)
+        prob = ml_probs.get(sym, 0.0)
+
+        # HTF trend
         htf_trend = state.get("htf_trend", {}).get(sym, {})
         t15 = htf_trend.get("15m", "neutral")
         t1h = htf_trend.get("1h", "neutral")
@@ -866,41 +995,102 @@ def generate_dashboard(
             f"[{_trend_color.get(t4h, 'white')}]{t4h[:4]}[/]"
         )
 
+        # Position & unrealised PnL
         pos = paper_executor.open_positions.get(sym)
+        row_style = ""
         if pos and price is not None:
             qty = pos.position_size / pos.entry_price
             unrealized_pnl = (price - pos.entry_price) * qty
-            pnl_color = "green" if unrealized_pnl >= 0 else "red"
-            pos_str = f"[cyan]LONG @{pos.entry_price:,.2f}[/cyan]"
+            pnl_color = "bright_green" if unrealized_pnl >= 0 else "bright_red"
+            pos_str = f"[bright_cyan]LONG @{pos.entry_price:,.2f}[/bright_cyan]"
             pnl_str = f"[{pnl_color}]{unrealized_pnl:+.2f}[/{pnl_color}]"
+            row_style = "on dark_green"
         elif pos:
-            pos_str = f"[cyan]LONG @{pos.entry_price:,.2f}[/cyan]"
+            pos_str = f"[bright_cyan]LONG @{pos.entry_price:,.2f}[/bright_cyan]"
             pnl_str = "[dim]N/A[/dim]"
+            row_style = "on dark_green"
         else:
             pos_str = "[dim]—[/dim]"
             pnl_str = "[dim]—[/dim]"
 
-        table.add_row(sym.split("/")[0], price_str, prob_str, trend_str, pos_str, pnl_str)
+        # Acción IA
+        if pos:
+            accion_str = "[bright_blue]TRADING 🔵[/bright_blue]"
+        elif prob >= BUY_PROB_THRESHOLD:
+            accion_str = "[bright_green]BUY! 🟢[/bright_green]"
+        else:
+            accion_str = "[bright_yellow]HOLD 🟡[/bright_yellow]"
 
-    # ── Summary footer ────────────────────────────────────────────────────────
-    sentiment_str = f"{sentiment:.4f}" if sentiment is not None else "N/A"
-    news_str = "[red]⛔ HOLD[/red]" if global_hold else "[green]✅ OK[/green]"
+        table.add_row(
+            sym.split("/")[0],
+            price_str,
+            change_24h_str,
+            atr_str,
+            rsi_str,
+            trend_str,
+            pos_str,
+            pnl_str,
+            accion_str,
+            style=row_style,
+        )
+
+    # ── Footer: Risk & Wallet + Events Log ──────────────────────────────────
     n_pos = len(paper_executor.open_positions)
-    balance_str = f"[bold]{risk_manager.balance:,.2f} USDT[/bold]"
-    total_pnl_color = "green" if paper_executor.total_pnl >= 0 else "red"
-    total_pnl_str = f"[{total_pnl_color}]{paper_executor.total_pnl:+.4f} USDT[/{total_pnl_color}]"
+    balance = risk_manager.balance
+    total_pnl = paper_executor.total_pnl
+    max_drawdown: float = state.get("max_drawdown", 0.0)
 
-    table.add_section()
-    table.add_row(
-        "[bold]RESUMEN[/bold]",
-        balance_str,
-        f"[bold]IA: {sentiment_str}[/bold]",
-        f"Noticias: {news_str}",
-        f"[bold]{n_pos}/{risk_manager.max_positions} pos.[/bold]",
-        f"PnL total: {total_pnl_str}",
+    # Approximate used margin (position_size already in USDT notional / LEVERAGE)
+    used_margin = sum(
+        pos.position_size / _RISK_LEVERAGE for pos in paper_executor.open_positions.values()
+    )
+    available_margin = balance - used_margin
+    margin_color = (
+        "bright_green" if available_margin > balance * 0.2
+        else "yellow" if available_margin > 0
+        else "bright_red"
+    )
+    pnl_color_r = "bright_green" if total_pnl >= 0 else "bright_red"
+    dd_color = "bright_red" if max_drawdown < -(balance * 0.05) else "yellow" if max_drawdown < 0 else "bright_green"
+
+    risk_text = Text()
+    risk_text.append("💰 Balance:           ", style="dim")
+    risk_text.append(f"{balance:>12,.2f} USDT\n", style="bold white")
+    risk_text.append("📊 Margen Disponible: ", style="dim")
+    risk_text.append(f"{available_margin:>12,.2f} USDT\n", style=f"bold {margin_color}")
+    risk_text.append("📈 PnL Sesión:        ", style="dim")
+    risk_text.append(f"{total_pnl:>+12.4f} USDT\n", style=f"bold {pnl_color_r}")
+    risk_text.append("📉 Max Drawdown:      ", style="dim")
+    risk_text.append(f"{max_drawdown:>+12.4f} USDT\n", style=f"bold {dd_color}")
+    risk_text.append("🔄 Posiciones:        ", style="dim")
+    risk_text.append(f"{n_pos}/{risk_manager.max_positions}", style="bold white")
+
+    risk_panel = Panel(
+        risk_text,
+        title="[bold yellow]💼 RIESGO & WALLET[/bold yellow]",
+        border_style="yellow",
+        box=rich_box.ROUNDED,
     )
 
-    return table
+    # Events log panel
+    events_text = Text()
+    events = list(_DASHBOARD_EVENTS)
+    if events:
+        for evt in events[-3:]:
+            events_text.append(evt + "\n")
+    else:
+        events_text.append("[dim]Sin eventos recientes…[/dim]")
+
+    events_panel = Panel(
+        events_text,
+        title="[bold green]📋 ÚLTIMOS EVENTOS[/bold green]",
+        border_style="green",
+        box=rich_box.ROUNDED,
+    )
+
+    footer = Columns([risk_panel, events_panel], equal=True)
+
+    return Group(header_panel, table, footer)
 
 
 async def dashboard_logger(
@@ -982,6 +1172,13 @@ async def dashboard_logger(
                 distancia_pct,
             )
 
+            # ── Track max drawdown across all open positions ──────────────────
+            qty = pos.position_size / pos.entry_price
+            unrealized = (mark_price - pos.entry_price) * qty
+            current_dd = state.get("max_drawdown", 0.0)
+            if unrealized < current_dd:
+                state["max_drawdown"] = unrealized
+
 
 async def position_sync_loop(
     paper_executor: PaperExecutor,
@@ -1048,6 +1245,10 @@ async def main() -> None:
 
     logger.info("🚀 ClawdBot starting up...")
 
+    # ── Record bot start time for uptime display ──────────────────────────────
+    global _BOT_START_TIME
+    _BOT_START_TIME = datetime.now(tz=timezone.utc)
+
     await init_db()
 
     market_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -1088,6 +1289,9 @@ async def main() -> None:
         },
         # [ML] Latest XGBoost win-probability per symbol (0.0 = not yet computed)
         "ml_probs": {symbol: 0.0 for symbol in WATCHLIST},
+        # [DASHBOARD] Mega-dashboard telemetry
+        "api_latency_ms": 0.0,   # REST/WS round-trip latency in milliseconds
+        "max_drawdown": 0.0,     # most negative unrealised PnL seen this session
     }
 
     predictor = MLPredictor()
