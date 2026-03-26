@@ -300,10 +300,17 @@ async def market_consumer(
 
         if message.get("type") == "trade":
             price = message.get("price")
-            sentiment: float = state.get("sentiment") or 0.0
+            sentiment = state.get("sentiment") or 0.0
             ticks += 1
 
-            # Throttled INFO log – at most once every 60 seconds per symbol.
+            # Demoted to DEBUG – price ticks flood the screen at INFO level.
+            if ticks % 50 == 0:
+                prices_buf = state["prices"].get(symbol, [])
+                logger.debug(
+                    "%s price=%.2f  sentiment_score=%s | Buffer: %d/500",
+                    symbol, price, sentiment, len(prices_buf),
+                )
+
             if price is not None:
                 now_mono = asyncio.get_event_loop().time()
                 if now_mono - _last_price_log.get(symbol, 0.0) >= 60.0:
@@ -825,68 +832,22 @@ async def dashboard_logger(
         await asyncio.sleep(interval)
         sentiment: float = state.get("sentiment") or 0.0
         n_positions = len(paper_executor.open_positions)
-        # Compute average ML confidence across all symbols that have a prediction.
+        # Build Top-3 symbols by ML confidence for the heartbeat line.
         ml_probs: dict[str, float] = state.get("ml_probs", {})
-        signals: dict[str, str] = state.get("signals", {})
-        active_probs = [v for v in ml_probs.values() if v > 0.0]
-        avg_conf_pct = int(round((sum(active_probs) / len(active_probs)) * 100)) if active_probs else 0
-        # Build per-open-position confidence tag (e.g. "SOL/USDT (ML: 72%)")
-        pos_tags = ", ".join(
-            f"{sym} (ML: {int(round(ml_probs.get(sym, 0.0) * 100))}%)"
-            for sym in paper_executor.open_positions
+        top3 = sorted(ml_probs.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        top3_str = ", ".join(
+            f"{sym.split('/')[0]} ({int(round(prob * 100))}%)"
+            for sym, prob in top3
+            if prob > 0.0
         )
-
-        # ── News Filter global HOLD status ────────────────────────────────────
-        news_hold_until = state.get("news_hold_until")
-        now = datetime.now(tz=timezone.utc)
-        if news_hold_until is not None and now < news_hold_until:
-            logger.info(
-                "[ESTADO] ⛔ GLOBAL HOLD ACTIVO (Sentimiento: %.2f) - No se permiten compras.",
-                sentiment,
-            )
-
-        if pos_tags:
-            logger.info(
-                "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones [%s] | Confianza Promedio ML: %d%%",
-                len(WATCHLIST),
-                sentiment,
-                n_positions,
-                risk_manager.max_positions,
-                pos_tags,
-                avg_conf_pct,
-            )
-        else:
-            logger.info(
-                "[SISTEMA] 📡 Monitorizando %d mercados | Sentimiento actual: %.2f | %d/%d Posiciones | Confianza Promedio ML: %d%%",
-                len(WATCHLIST),
-                sentiment,
-                n_positions,
-                risk_manager.max_positions,
-                avg_conf_pct,
-            )
-
-        # ── Analysis board: top 3–5 symbols by ML confidence ─────────────────
-        # Pick the symbols with the highest ML probability to display.
-        prices_state: dict = state.get("prices", {})
-        ranked = sorted(
-            ((sym, prob) for sym, prob in ml_probs.items() if prob > 0.0),
-            key=lambda t: t[1],
-            reverse=True,
-        )[:5]
-        if ranked:
-            parts: list[str] = []
-            for sym, prob in ranked:
-                base_sym = sym.split("/")[0]
-                price_buf = prices_state.get(sym, [])
-                last_price: float | None = price_buf[-1] if price_buf else None
-                sig = signals.get(sym, "HOLD")
-                conf_pct = int(round(prob * 100))
-                if last_price is not None:
-                    parts.append(f"{base_sym}: ${last_price:,.2f} (ML: {conf_pct}% - {sig})")
-                else:
-                    parts.append(f"{base_sym}: N/A (ML: {conf_pct}% - {sig})")
-            logger.info("[ANÁLISIS] %s", " | ".join(parts))
-
+        logger.info(
+            "[SISTEMA] 📡 Monitorizando %d mercados | IA: %.2f | %d/%d Pos%s",
+            len(WATCHLIST),
+            sentiment,
+            n_positions,
+            risk_manager.max_positions,
+            f" | Top Confianza: {top3_str}" if top3_str else "",
+        )
         # Detailed dashboard metrics go to the file log only (DEBUG).
         logger.debug(
             "📊 [DASHBOARD] Total PnL: %.4f USDT  |  Balance: %.2f USDT  |  "
@@ -939,13 +900,20 @@ async def position_sync_loop(
 ) -> None:
     """Periodically reconcile local position state with live Binance Futures.
 
+    On each tick the coroutine calls
+    :meth:`~execution.paper_executor.PaperExecutor.sync_positions_with_exchange`
+    which removes any *ghost* positions (in memory but gone on Binance) and
+    cancels their orphan orders.  A log line is only emitted when the real
+    position count differs from the local count, keeping the console clean
+    during normal operation.
     On each tick the coroutine:
 
-    1. Logs ``[SISTEMA] 🔄 Sincronizando posiciones con Binance…``
+    1. Logs ``[SISTEMA] 🔄 Sincronizando posiciones con Binance…`` at DEBUG level.
     2. Calls :meth:`~execution.paper_executor.PaperExecutor.sync_positions_with_exchange`
        which removes any *ghost* positions (in memory but gone on Binance) and
        cancels their orphan orders.
-    3. Logs ``[SISTEMA] ✅ Sincronización completa. Posiciones reales: {count}``.
+    3. Logs the completion at DEBUG when there are no open positions (silent when
+       everything is in order) or at INFO when real positions exist.
 
     When the executor is running in pure paper-trading mode (no live exchange
     client) the coroutine exits immediately so it never occupies a task slot
@@ -957,13 +925,16 @@ async def position_sync_loop(
     logger = logging.getLogger("clawdbot.sync")
     while True:
         await asyncio.sleep(interval)
-        logger.info("[SISTEMA] 🔄 Sincronizando posiciones con Binance...")
+        local_count = len(paper_executor.open_positions)
         try:
             real_count = await paper_executor.sync_positions_with_exchange()
-            logger.info(
-                "[SISTEMA] ✅ Sincronización completa. Posiciones reales: %d.",
-                real_count,
-            )
+            if real_count != local_count:
+                logger.info(
+                    "[SISTEMA] 🔄 Sincronizando posiciones con Binance... "
+                    "Posiciones reales: %d (local: %d).",
+                    real_count,
+                    local_count,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "⚠️ [ALERTA] Position sync failed: %s %s",

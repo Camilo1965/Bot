@@ -201,7 +201,7 @@ async def fetch_open_positions(exchange: ccxt_async.binanceusdm) -> list[dict]:
                     "side": side,
                 }
             )
-        logger.info(
+        logger.debug(
             "fetch_open_positions: %d open position(s) found: %s",
             len(open_positions),
             [p["symbol"] for p in open_positions],
@@ -239,7 +239,7 @@ async def fetch_open_positions(exchange: ccxt_async.binanceusdm) -> list[dict]:
                     "side": side,
                 }
             )
-        logger.info(
+        logger.debug(
             "fetch_open_positions (V2 fallback): %d open position(s) found: %s",
             len(open_positions),
             [p["symbol"] for p in open_positions],
