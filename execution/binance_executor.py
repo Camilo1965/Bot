@@ -180,6 +180,16 @@ async def fetch_open_positions(exchange: ccxt_async.binanceusdm) -> list[dict]:
 
         Returns an empty list if the request fails or no positions are open.
     """
+    # Synchronise local clock with Binance server time before signed requests
+    # to avoid error -1021 ("Timestamp ahead of server's time").
+    try:
+        await exchange.load_time_difference()
+    except Exception as _lte:  # noqa: BLE001
+        logger.warning(
+            "fetch_open_positions: load_time_difference() failed (%s) – proceeding anyway.",
+            _lte,
+        )
+
     # ------------------------------------------------------------------
     # Primary path: unified ccxt method (works on Live / V3-capable hosts)
     # ------------------------------------------------------------------
@@ -294,6 +304,10 @@ async def fetch_total_wallet_balance(exchange: ccxt_async.binanceusdm) -> float 
         *None* if the request fails entirely.
     """
     try:
+        # Synchronise local clock with Binance server time before the signed
+        # request so that minor clock skew does not cause error -1021
+        # ("Timestamp ahead of server's time").
+        await exchange.load_time_difference()
         response = await exchange.fapiPrivateV2GetAccount()
 
         # ------------------------------------------------------------------
