@@ -947,7 +947,8 @@ def generate_dashboard(
     table.add_column("24h %", justify="right")
     table.add_column("Vol (ATR)", justify="right")
     table.add_column("RSI", justify="right")
-    table.add_column("Tendencia 15m/1h/4h", justify="center")
+    table.add_column("ML Conf.", justify="right")
+    table.add_column("Tendencia", justify="center")
     table.add_column("Posición", justify="center")
     table.add_column("PnL Pos.", justify="right")
     table.add_column("Acción IA", justify="center")
@@ -981,8 +982,17 @@ def generate_dashboard(
         else:
             rsi_str = "[dim]—[/dim]"
 
-        # ML probability (kept for Acción IA)
+        # ML probability (kept for Acción IA and ML Conf. column)
         prob = ml_probs.get(sym, 0.0)
+
+        # ML Conf. display
+        prob_pct = prob * 100
+        if prob_pct > 55:
+            ml_conf_str = f"[bold green]{prob_pct:.1f}%[/bold green]"
+        elif prob_pct > 50:
+            ml_conf_str = f"[bold yellow]{prob_pct:.1f}%[/bold yellow]"
+        else:
+            ml_conf_str = f"[dim]{prob_pct:.1f}%[/dim]"
 
         # HTF trend
         htf_trend = state.get("htf_trend", {}).get(sym, {})
@@ -1027,6 +1037,7 @@ def generate_dashboard(
             change_24h_str,
             atr_str,
             rsi_str,
+            ml_conf_str,
             trend_str,
             pos_str,
             pnl_str,
