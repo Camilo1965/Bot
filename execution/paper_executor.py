@@ -963,6 +963,7 @@ class PaperExecutor:
         # Normalise symbols: strip settle suffix (e.g. "BTC/USDT:USDT" → "BTC/USDT")
         live_symbols: set[str] = {p["symbol"].split(":")[0] for p in live_positions}
 
+        # ── Ghost detection: in memory but gone on exchange ────────────────
         ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
         for sym in ghost_symbols:
             logger.info(
@@ -979,6 +980,19 @@ class PaperExecutor:
                     sym,
                     len(self.open_positions),
                 )
+
+        # ── Discrepancy detection: on exchange but not tracked locally ─────
+        untracked_symbols = [sym for sym in live_symbols if sym not in self.open_positions]
+        for sym in untracked_symbols:
+            logger.warning(
+                "[SYNC] ⚠️ Discrepancy detected: position for %s is open on Binance "
+                "but is NOT tracked in local bot state. "
+                "Consider restarting the bot or manually reconciling. "
+                "Local positions: %d, Binance positions: %d.",
+                sym,
+                len(self.open_positions),
+                len(live_symbols),
+            )
 
         return len(live_symbols)
 
