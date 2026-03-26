@@ -896,6 +896,14 @@ async def position_sync_loop(
     cancels their orphan orders.  A log line is only emitted when the real
     position count differs from the local count, keeping the console clean
     during normal operation.
+    On each tick the coroutine:
+
+    1. Logs ``[SISTEMA] 🔄 Sincronizando posiciones con Binance…`` at DEBUG level.
+    2. Calls :meth:`~execution.paper_executor.PaperExecutor.sync_positions_with_exchange`
+       which removes any *ghost* positions (in memory but gone on Binance) and
+       cancels their orphan orders.
+    3. Logs the completion at DEBUG when there are no open positions (silent when
+       everything is in order) or at INFO when real positions exist.
 
     When the executor is running in pure paper-trading mode (no live exchange
     client) the coroutine exits immediately so it never occupies a task slot
