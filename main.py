@@ -48,7 +48,7 @@ from database.db_manager import close_db, db, init_db
 from execution.binance_executor import create_exchange, fetch_open_positions, fetch_total_wallet_balance
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE, RiskManager
-from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, compute_htf_trend
+from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor, compute_htf_trend
 from strategy.feature_engineer import FeatureEngineer
 from strategy.sentiment_llm import get_gemini_sentiment
 
@@ -887,7 +887,7 @@ def generate_dashboard(
     ml_probs: dict[str, float] = state.get("ml_probs", {})
     news_hold_until: datetime | None = state.get("news_hold_until")
     global_hold = (
-        (sentiment is not None and sentiment < 0.35)
+        (sentiment is not None and sentiment < BUY_SENTIMENT_THRESHOLD)
         or (news_hold_until is not None and now_utc < news_hold_until)
     )
 
@@ -1484,6 +1484,26 @@ async def main() -> None:
     # [ELITE] Fast REST Warmup – pre-fill buffers before WebSocket starts
     # ------------------------------------------------------------------
     await preload_historical_data(shared_state, WATCHLIST)
+
+    # ------------------------------------------------------------------
+    # [AUDIT] Decision pipeline diagnostics – log active thresholds and
+    # confirm that session state was cleanly initialised on this startup.
+    # ------------------------------------------------------------------
+    logger.info(
+        "🔍 [AUDIT] Decision pipeline thresholds: "
+        "ML_BUY_PROB≥%.2f | SENTIMENT_BUY≥%.2f | "
+        "NEWS_FILTER_SWING>%.2f → HOLD_%dmin",
+        BUY_PROB_THRESHOLD,
+        BUY_SENTIMENT_THRESHOLD,
+        _NEWS_FILTER_VOLATILITY_THRESHOLD,
+        _NEWS_FILTER_HOLD_MINUTES,
+    )
+    logger.info(
+        "🔍 [AUDIT] Session state reset: "
+        "sentiment=None  news_hold_until=None  max_drawdown=0.0  "
+        "trading_halted=%s",
+        risk_manager.is_trading_halted(),
+    )
 
     # ── Start Rich Live dashboard ─────────────────────────────────────────────
     # The Live context renders a fixed TUI table that refreshes every second.
