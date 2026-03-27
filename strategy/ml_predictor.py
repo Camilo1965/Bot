@@ -61,13 +61,14 @@ logger = logging.getLogger(__name__)
 
 # Signal thresholds
 _BUY_PROB_THRESHOLD = 0.55
-_BUY_SENTIMENT_THRESHOLD = 0.0
+_BUY_SENTIMENT_THRESHOLD = -0.1   # allow sentiment down to -0.1 (values above -0.1 pass)
 _SELL_PROB_THRESHOLD = 0.3
 _SELL_SENTIMENT_THRESHOLD = -0.3
 
-# Public alias used by callers that need to synchronise their confidence
-# gate with the predictor's buy-probability threshold (e.g. smart exits).
+# Public aliases used by callers that need to synchronise their thresholds
+# with the predictor (e.g. smart exits, dashboard display).
 BUY_PROB_THRESHOLD: float = _BUY_PROB_THRESHOLD
+BUY_SENTIMENT_THRESHOLD: float = _BUY_SENTIMENT_THRESHOLD
 
 # Default prediction horizon (price-tick steps)
 _PREDICTION_HORIZON = 5
@@ -647,13 +648,14 @@ class MLPredictor:
         ``"BUY"``, ``"SELL"``, or ``"HOLD"`` with the following logic:
 
         Base ML signal:
-          * probability > 0.68 AND sentiment > 0.15  → BUY
-          * probability < 0.3  AND sentiment < -0.3  → SELL
-          * otherwise                                → HOLD
+          * probability >= 0.55 AND sentiment >= -0.1  → BUY
+          * probability < 0.3  AND sentiment < -0.3   → SELL
+          * otherwise                                  → HOLD
 
         HTF Filter ("General" + "Colonel"):
-          * 4H trend bearish                         → BUY → HOLD
-          * 1H trend not bullish (bearish/neutral)   → BUY → HOLD
+          * 4H trend bearish                           → BUY → HOLD
+          * 1H trend bearish                           → BUY → HOLD
+            (neutral 1H is permitted; only active bearish mutes the signal)
 
         Market Regime override (ADX-based):
           * ADX > 25 (trending): BUY only when RSI > 50 AND momentum > 0;
@@ -742,10 +744,10 @@ class MLPredictor:
             elite_factors.append(
                 f"[MTA] General filter: 4H trend is bearish – BUY muted to HOLD"
             )
-        elif signal == "BUY" and htf_trend_1h != HTF_TREND_BULLISH:
+        elif signal == "BUY" and htf_trend_1h == HTF_TREND_BEARISH:
             signal = "HOLD"
             elite_factors.append(
-                f"[MTA] Colonel filter: 1H trend is {htf_trend_1h} (not bullish) – BUY muted to HOLD"
+                f"[MTA] Colonel filter: 1H trend is bearish – BUY muted to HOLD"
             )
 
         # ── Logging ───────────────────────────────────────────────────────

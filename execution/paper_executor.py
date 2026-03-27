@@ -500,7 +500,7 @@ class PaperExecutor:
                         amount,
                         LEVERAGE,
                     )
-            except (CcxtAuthenticationError, CcxtInsufficientFunds, CcxtNetworkError):
+            except (CcxtAuthenticationError, CcxtExchangeError, CcxtInsufficientFunds, CcxtNetworkError):
                 logger.exception(
                     "Failed to place Binance Futures buy order for %s – "
                     "position recorded in paper simulation only.",
@@ -911,7 +911,7 @@ class PaperExecutor:
                         amount,
                         LEVERAGE,
                     )
-            except (CcxtAuthenticationError, CcxtInsufficientFunds, CcxtNetworkError):
+            except (CcxtAuthenticationError, CcxtExchangeError, CcxtInsufficientFunds, CcxtNetworkError):
                 logger.exception(
                     "Failed to place Binance Futures sell order for %s – "
                     "position closed in paper simulation only.",
