@@ -16,10 +16,10 @@ Trailing stop parameters
 ------------------------
 * ``INITIAL_SL``:        Hard stop loss during the entry phase (1.5 %).
 * ``ACTIVATION_PCT``:    Minimum profit required to activate the trailing
-                         stop (3 %).  Once this threshold is reached the
+                         stop (2.5 %).  Once this threshold is reached the
                          active stop loss updates dynamically.
 * ``TRAILING_DISTANCE``: Gap maintained between the running peak price and
-                         the trailing stop level (2 %).
+                         the trailing stop level (1.5 %).
 
 Dynamic risk management
 -----------------------
@@ -65,8 +65,8 @@ logger = logging.getLogger(__name__)
 
 # ── Trade parameters ──────────────────────────────────────────────────────────
 INITIAL_SL: float = 0.015           # 1.5 % hard stop loss for initial protection
-ACTIVATION_PCT: float = 0.03       # 3 % profit required to activate trailing stop
-TRAILING_DISTANCE: float = 0.02    # 2 % trailing distance from the highest peak
+ACTIVATION_PCT: float = 0.025      # 2.5 % profit required to activate trailing stop
+TRAILING_DISTANCE: float = 0.015   # 1.5 % trailing distance from the highest peak
 
 # ── Futures / leverage parameters ─────────────────────────────────────────────
 LEVERAGE: int = 5                   # 5× futures leverage (Elite Sniper)
@@ -111,8 +111,8 @@ def get_sector(symbol: str) -> str:
 
 # ── Dynamic risk management – base thresholds (neutral market) ────────────────
 BASE_SL: float = 0.015                      # 1.5 % base stop loss
-BASE_ACTIVATION_PCT: float = 0.03           # 3 % profit to activate trailing stop
-BASE_TRAILING_DISTANCE: float = 0.02        # 2 % trailing distance
+BASE_ACTIVATION_PCT: float = 0.025          # 2.5 % profit to activate trailing stop
+BASE_TRAILING_DISTANCE: float = 0.015       # 1.5 % trailing distance
 
 # ── Dynamic risk management – sentiment multiplier bounds ─────────────────────
 _SENTIMENT_LOW_THRESHOLD: float = 0.30      # below this → scalping regime

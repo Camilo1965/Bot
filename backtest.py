@@ -13,8 +13,8 @@ Risk parameters
 * Starting capital    : 10,000 USDT  (shared across the portfolio)
 * Risk per trade      : 15 % of current balance  (fixed fractional, from risk_manager)
 * Initial Stop Loss   : −1.5 %  (hard floor from entry)
-* Trailing activation : +3 % profit activates the trailing stop
-* Trailing distance   : 2 % below the running price peak
+* Trailing activation : +2.5 % profit activates the trailing stop
+* Trailing distance   : 1.5 % below the running price peak
 
 Sentiment mock
 --------------
