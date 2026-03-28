@@ -35,6 +35,9 @@ score provided by :mod:`strategy.sentiment_llm`:
 
 The multiplier is hard-clamped to [0.5, 2.5] and the resulting stop loss
 is additionally capped at 5 % to prevent dangerously wide stops.
+The activation threshold is additionally floored at 2 % (``_ACTIVATION_PCT_MIN``)
+so that the minimum dynamic profit always outpaces the 0.2 % round-trip
+exchange fees on a 5× leveraged position.
 
 Daily-loss safety break
 -----------------------
@@ -119,6 +122,7 @@ _MULTIPLIER_HIGH: float = 1.8              # expand thresholds in high-sentiment
 _MULTIPLIER_MIN: float = 0.5               # absolute floor (safety net)
 _MULTIPLIER_MAX: float = 2.5               # absolute cap (safety net)
 _SL_CAP: float = 0.05                      # maximum allowed stop-loss fraction (5 %)
+_ACTIVATION_PCT_MIN: float = 0.02          # activation must always be >= 2 % to outpace fees
 
 
 @dataclass
@@ -153,6 +157,9 @@ def get_dynamic_thresholds(sentiment_score: float) -> DynamicThresholds:
       so it is never zero or negative.
     * The resulting SL is additionally capped at ``_SL_CAP`` (5 %) to prevent
       dangerously wide stop losses.
+    * The resulting activation threshold is floored at ``_ACTIVATION_PCT_MIN``
+      (2 %) to ensure the minimum dynamic profit always outpaces the 0.2 %
+      round-trip exchange fees on a 5× leveraged position.
 
     Parameters
     ----------
@@ -180,7 +187,7 @@ def get_dynamic_thresholds(sentiment_score: float) -> DynamicThresholds:
     multiplier = max(_MULTIPLIER_MIN, min(_MULTIPLIER_MAX, multiplier))
 
     sl_pct = min(BASE_SL * multiplier, _SL_CAP)
-    activation_pct = BASE_ACTIVATION_PCT * multiplier
+    activation_pct = max(BASE_ACTIVATION_PCT * multiplier, _ACTIVATION_PCT_MIN)
     trailing_distance_pct = BASE_TRAILING_DISTANCE * multiplier
 
     logger.debug(
