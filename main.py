@@ -46,6 +46,7 @@ from data_ingestion.news_scraper import fetch_crypto_headlines
 from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
 from execution.binance_executor import create_exchange, fetch_open_positions, fetch_total_wallet_balance
+from execution.mt5_executor import MT5Executor, initialize_mt5, shutdown_mt5
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE, RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor, compute_htf_trend
@@ -1210,27 +1211,28 @@ async def position_sync_loop(
     paper_executor: PaperExecutor,
     interval: int = 60,
 ) -> None:
-    """Periodically reconcile local position state with live Binance Futures.
+    """Periodically reconcile local position state with the live exchange.
 
     On each tick the coroutine:
 
-    1. Logs ``[SISTEMA] 🔄 Sincronizando posiciones con Binance…``
+    1. Logs ``[SISTEMA] 🔄 Sincronizando posiciones…``
     2. Calls :meth:`~execution.paper_executor.PaperExecutor.sync_positions_with_exchange`
-       which removes any *ghost* positions (in memory but gone on Binance) and
+       which removes any *ghost* positions (in memory but gone on the exchange) and
        cancels their orphan orders.
     3. Logs ``[SISTEMA] ✅ Sincronización completa. Posiciones reales: {count}``.
 
     When the executor is running in pure paper-trading mode (no live exchange
-    client) the coroutine exits immediately so it never occupies a task slot
-    needlessly.
+    client and not a live MT5Executor) the coroutine exits immediately so it
+    never occupies a task slot needlessly.
     """
-    if paper_executor._exchange is None:
+    is_live_mt5 = isinstance(paper_executor, MT5Executor) and paper_executor._live
+    if paper_executor._exchange is None and not is_live_mt5:
         return  # Nothing to sync in pure paper-trading mode.
 
     logger = logging.getLogger("clawdbot.sync")
     while True:
         await asyncio.sleep(interval)
-        logger.debug("[SISTEMA] 🔄 Sincronizando posiciones con Binance...")
+        logger.debug("[SISTEMA] 🔄 Sincronizando posiciones con el exchange...")
         try:
             real_count = await paper_executor.sync_positions_with_exchange()
             log_fn = logger.debug if real_count == 0 else logger.info
@@ -1331,7 +1333,8 @@ async def main() -> None:
     ws_client = BinanceWebSocketClient(queue=market_queue, watchlist=WATCHLIST)
     funding_rate_client = FundingRateClient(symbols=WATCHLIST, state=shared_state)
 
-    # ── Execution mode: Testnet / Live / Paper ───────────────────────────────
+    # ── Execution mode: MT5 / Testnet / Live / Paper ────────────────────────
+    execution_mode: str = os.environ.get("EXECUTION_MODE", "paper").strip().lower()
     use_testnet: bool = os.environ.get("USE_BINANCE_TESTNET", "False").strip().lower() in (
         "true", "1", "yes"
     )
@@ -1343,8 +1346,57 @@ async def main() -> None:
 
     exchange_client: ccxt_async.binanceusdm | None = None
     initial_balance: float = 10_000.0
+    _mt5_initialized: bool = False
 
-    if use_testnet:
+    if execution_mode == "mt5":
+        # ── MetaTrader 5 execution path ──────────────────────────────────
+        mt5_login_raw: str = os.environ.get("MT5_LOGIN", "").strip()
+        mt5_password: str = os.environ.get("MT5_PASSWORD", "").strip()
+        mt5_server: str = os.environ.get("MT5_SERVER", "").strip()
+
+        missing = [k for k, v in [
+            ("MT5_LOGIN", mt5_login_raw),
+            ("MT5_PASSWORD", mt5_password),
+            ("MT5_SERVER", mt5_server),
+        ] if not v]
+        if missing:
+            logger.warning(
+                "⚠️ [MT5] Missing environment variable(s): %s – "
+                "falling back to paper trading with %.2f USDT.",
+                ", ".join(missing),
+                initial_balance,
+            )
+            execution_mode = "paper"
+        else:
+            try:
+                mt5_login: int = int(mt5_login_raw)
+            except ValueError:
+                logger.warning(
+                    "⚠️ [MT5] MT5_LOGIN='%s' is not a valid integer – "
+                    "falling back to paper trading.",
+                    mt5_login_raw,
+                )
+                execution_mode = "paper"
+            else:
+                logger.info(
+                    "🔌 [MT5] Connecting to MetaTrader 5 | server=%s | login=%d",
+                    mt5_server,
+                    mt5_login,
+                )
+                _mt5_initialized = initialize_mt5(
+                    account=mt5_login,
+                    password=mt5_password,
+                    server=mt5_server,
+                )
+                if not _mt5_initialized:
+                    logger.warning(
+                        "⚠️ [MT5] initialize_mt5() failed – "
+                        "falling back to paper trading with %.2f USDT.",
+                        initial_balance,
+                    )
+                    execution_mode = "paper"
+
+    if execution_mode != "mt5" and use_testnet:
         # USE_BINANCE_TESTNET takes priority over PAPER_TRADING.
         if not api_key or not api_secret:
             logger.warning(
@@ -1370,7 +1422,7 @@ async def main() -> None:
             logger.info(
                 "🔗 [TESTNET] Orders will be sent to Binance Futures Testnet API."
             )
-    elif not paper_trading:
+    elif execution_mode != "mt5" and not paper_trading:
         # Live trading (non-testnet).
         if not api_key or not api_secret:
             logger.warning(
@@ -1395,7 +1447,7 @@ async def main() -> None:
             logger.info(
                 "🔗 [LIVE] Orders will be sent to Binance Futures live API."
             )
-    else:
+    elif execution_mode != "mt5":
         logger.info(
             "📝 [PAPER] Running in pure paper trading mode (internal simulation) "
             "with %.2f USDT.",
@@ -1403,7 +1455,19 @@ async def main() -> None:
         )
 
     risk_manager = RiskManager(initial_balance=initial_balance)
-    paper_executor = PaperExecutor(db=db, risk_manager=risk_manager, exchange=exchange_client)
+
+    if execution_mode == "mt5" and _mt5_initialized:
+        paper_executor: PaperExecutor = MT5Executor(
+            db=db,
+            risk_manager=risk_manager,
+            live=True,
+        )
+        logger.info(
+            "✅ [MT5] MT5Executor initialised in LIVE mode – "
+            "orders will be sent to MetaTrader 5."
+        )
+    else:
+        paper_executor = PaperExecutor(db=db, risk_manager=risk_manager, exchange=exchange_client)
 
     # ------------------------------------------------------------------
     # [SYNC] Re-sync open positions from Binance on restart
@@ -1564,6 +1628,8 @@ async def main() -> None:
         raise
     finally:
         _live.stop()
+        if _mt5_initialized:
+            shutdown_mt5()
         if exchange_client is not None:
             await exchange_client.close()
         await close_db()

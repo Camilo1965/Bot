@@ -54,10 +54,20 @@ Usage example::
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+
+try:
+    import pandas as pd  # type: ignore[import-untyped]
+
+    _PANDAS_AVAILABLE = True
+except ImportError:
+    pd = None  # type: ignore[assignment]
+    _PANDAS_AVAILABLE = False
 
 from execution.paper_executor import (
     ATR_SL_MULTIPLIER,
@@ -87,8 +97,6 @@ except ImportError:  # pragma: no cover – only available on Windows with MT5 i
     mt5 = None  # type: ignore[assignment]
     _MT5_AVAILABLE = False
 
-import asyncio
-
 logger = logging.getLogger(__name__)
 
 # ── Default risk per trade used by calculate_lot_size ─────────────────────────
@@ -104,6 +112,120 @@ _SPREAD_BUFFER_FALLBACK: float = 0.001  # 0.10 % fallback when spread is unknown
 # Minimum recognised lot size when the broker reports 0.0 (safety guard).
 _FALLBACK_VOLUME_MIN: float = 0.01
 _FALLBACK_VOLUME_STEP: float = 0.01
+
+# ── MT5 timeframe constants ────────────────────────────────────────────────────
+# Mirrors the values exported by the MetaTrader5 library so callers can import
+# them without the library being installed (e.g. in tests or non-Windows envs).
+TIMEFRAME_M1:  int = 1
+TIMEFRAME_M5:  int = 5
+TIMEFRAME_M15: int = 15
+TIMEFRAME_M30: int = 30
+TIMEFRAME_H1:  int = 16385
+TIMEFRAME_H4:  int = 16388
+TIMEFRAME_D1:  int = 16408
+
+# ── Symbol map ────────────────────────────────────────────────────────────────
+# Maps internal/Binance symbol names to the exact broker symbol name required
+# by the Admirals MT5 server.  Add entries here whenever you trade a new asset.
+SYMBOL_MAP: dict[str, str] = {
+    # Binance/CCXT format (entries from WATCHLIST in main.py)
+    "BTC/USDT":    "BTCUSD-T",
+    "ETH/USDT":    "ETHUSD-T",
+    "SOL/USDT":    "SOLUSD-T",
+    "BNB/USDT":    "BNBUSD-T",
+    "LINK/USDT":   "LINKUSD-T",
+    "INJ/USDT":    "INJUSD-T",
+    "FET/USDT":    "FETUSD-T",
+    "RENDER/USDT": "RENDERUSD-T",
+    "DOGE/USDT":   "DOGEUSD-T",
+    "PEPE/USDT":   "PEPEUSD-T",
+    # Raw MT5 base names (pass-through for code that already normalises)
+    "BTCUSD":      "BTCUSD-T",
+    "ETHUSD":      "ETHUSD-T",
+    "SOLUSD":      "SOLUSD-T",
+    "BNBUSD":      "BNBUSD-T",
+    "LINKUSD":     "LINKUSD-T",
+    "INJUSD":      "INJUSD-T",
+    "FETUSD":      "FETUSD-T",
+    "RENDERUSD":   "RENDERUSD-T",
+    "DOGEUSD":     "DOGEUSD-T",
+    "PEPEUSD":     "PEPEUSD-T",
+}
+
+# ── MT5 return-code catalogue ─────────────────────────────────────────────────
+# Human-readable descriptions for every known MT5 trade retcode.  Used by
+# _log_mt5_retcode() to produce actionable log messages.
+MT5_RETCODE_DESCRIPTIONS: dict[int, str] = {
+    10004: "REQUOTE – price changed between request and execution; retry",
+    10006: "REQUEST_REJECTED – request rejected by the broker",
+    10007: "REQUEST_CANCEL – request was cancelled by the client",
+    10008: "REQUEST_PLACED – order placed but not yet executed",
+    10009: "TRADE_RETCODE_DONE – request completed successfully",
+    10010: "DONE_PARTIAL – request partially executed; retry remainder",
+    10011: "REQUEST_ERROR – processing error; retry",
+    10012: "REQUEST_TIMEOUT – request timed out; retry",
+    10013: "INVALID_REQUEST – malformed order request",
+    10014: "INVALID_VOLUME – lot size is outside broker limits",
+    10015: "INVALID_PRICE – price is out of range or stale",
+    10016: "INVALID_STOPS – SL/TP price is invalid (check digits/distance)",
+    10017: "TRADE_DISABLED – trading is disabled for this symbol",
+    10018: "MARKET_CLOSED – market is closed for this symbol",
+    10019: "NO_MONEY – insufficient margin to open the position",
+    10020: "PRICE_CHANGED – price changed; retry with updated price",
+    10021: "PRICE_OFF – no quotes available; retry shortly",
+    10022: "INVALID_EXPIRATION – order expiration time is invalid",
+    10023: "ORDER_CHANGED – order state changed during processing",
+    10024: "TOO_MANY_REQUESTS – request flood limit hit; retry after pause",
+    10025: "NO_CHANGES – modification request contains no actual changes",
+    10026: "SERVER_DISABLES_AT – algo-trading disabled on the server side",
+    10027: "CLIENT_DISABLES_AT – 'Algo Trading' button is OFF in MT5 terminal",
+    10028: "LOCKED – order or position is locked by the server",
+    10029: "FROZEN – order or position is frozen (e.g. during market auction)",
+    10030: "INVALID_FILL – order filling type is not supported",
+    10031: "CONNECTION – no connection to the trade server; retry",
+    10032: "ONLY_REAL – operation only allowed on real accounts",
+    10033: "LIMIT_ORDERS – maximum number of pending orders reached",
+    10034: "LIMIT_VOLUME – volume limit per symbol/direction reached",
+    10035: "INVALID_ORDER – unknown or invalid order type",
+    10036: "POSITION_CLOSED – position is already closed",
+    10038: "INVALID_CLOSE_VOLUME – close volume exceeds open volume",
+    10039: "CLOSE_ORDER_EXIST – a close order for this position already exists",
+    10040: "LIMIT_POSITIONS – maximum number of open positions reached",
+    10041: "REJECT_CANCEL – pending order activation failed; order was cancelled",
+    10042: "LONG_ONLY – only long (BUY) positions are allowed",
+    10043: "SHORT_ONLY – only short (SELL) positions are allowed",
+    10044: "CLOSE_ONLY – only close operations are allowed at this time",
+    10045: "FIFO_CLOSE – positions must be closed in FIFO order",
+}
+
+# Return codes that represent transient conditions worth retrying.
+_RETRYABLE_RETCODES: frozenset[int] = frozenset({
+    10004,  # REQUOTE
+    10010,  # DONE_PARTIAL
+    10011,  # REQUEST_ERROR
+    10012,  # REQUEST_TIMEOUT
+    10020,  # PRICE_CHANGED
+    10021,  # PRICE_OFF
+    10024,  # TOO_MANY_REQUESTS
+    10031,  # CONNECTION
+})
+
+
+def _log_mt5_retcode(retcode: int, context: str = "") -> None:
+    """Log a human-readable description for an MT5 trade return code.
+
+    Successful retcodes (10009) are logged at INFO; retryable ones at WARNING;
+    all others at ERROR so they stand out in the bot's log output.
+    """
+    description = MT5_RETCODE_DESCRIPTIONS.get(retcode, f"Unknown retcode {retcode}")
+    prefix = f"[MT5 RETCODE {retcode}]"
+    ctx = f" ({context})" if context else ""
+    if retcode == 10009:
+        logger.info("%s %s%s", prefix, description, ctx)
+    elif retcode in _RETRYABLE_RETCODES:
+        logger.warning("%s %s%s", prefix, description, ctx)
+    else:
+        logger.error("%s %s%s", prefix, description, ctx)
 
 
 # ── Connection helpers ─────────────────────────────────────────────────────────
@@ -348,8 +470,11 @@ class MT5Executor(PaperExecutor):
         """
         if not _MT5_AVAILABLE or not self._live:
             return _SPREAD_BUFFER_FALLBACK
+        mt5_sym = self._resolve_symbol(symbol)
+        if mt5_sym is None:
+            return _SPREAD_BUFFER_FALLBACK
         try:
-            tick = mt5.symbol_info_tick(symbol)
+            tick = mt5.symbol_info_tick(mt5_sym)
             if tick is None or tick.ask <= 0 or tick.bid <= 0:
                 return _SPREAD_BUFFER_FALLBACK
             spread_price = tick.ask - tick.bid
@@ -409,6 +534,80 @@ class MT5Executor(PaperExecutor):
         return effective
 
     # ------------------------------------------------------------------
+    # Symbol resolution and price normalisation helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_symbol(self, sym: str) -> str | None:
+        """Translate an internal symbol name to the broker's MT5 symbol name.
+
+        Looks up *sym* in :data:`SYMBOL_MAP`.  If the mapped symbol exists but
+        is not currently visible in the Market Watch, this method calls
+        ``mt5.symbol_select`` to add it automatically.
+
+        Parameters
+        ----------
+        sym:
+            Internal symbol (e.g. ``"BTC/USDT"`` or ``"BTCUSD"``).
+
+        Returns
+        -------
+        str | None
+            The broker symbol string (e.g. ``"BTCUSD-T"``), or ``None`` when
+            the symbol is not in :data:`SYMBOL_MAP` or cannot be validated.
+        """
+        broker_sym = SYMBOL_MAP.get(sym)
+        if broker_sym is None:
+            logger.error(
+                "[MT5] Símbolo no mapeado para MT5: '%s'.  "
+                "Agréguelo a SYMBOL_MAP en mt5_executor.py.",
+                sym,
+            )
+            return None
+
+        if not _MT5_AVAILABLE:
+            return broker_sym  # Paper mode – no terminal to query.
+
+        info = mt5.symbol_info(broker_sym)
+        if info is None:
+            logger.error(
+                "[MT5] mt5.symbol_info('%s') returned None – "
+                "el símbolo no existe en el servidor del broker.",
+                broker_sym,
+            )
+            return None
+
+        if not info.visible:
+            if not mt5.symbol_select(broker_sym, True):
+                logger.error(
+                    "[MT5] No se pudo agregar '%s' al Market Watch. "
+                    "Añádalo manualmente en MetaTrader 5.",
+                    broker_sym,
+                )
+                return None
+            logger.info("[MT5] Símbolo '%s' agregado al Market Watch.", broker_sym)
+
+        return broker_sym
+
+    @staticmethod
+    def _normalize_price(price: float, digits: int) -> float:
+        """Round *price* to the number of decimal places required by the broker.
+
+        Parameters
+        ----------
+        price:
+            Raw price value (e.g. stop-loss level).
+        digits:
+            Number of significant decimal places from ``symbol_info.digits``
+            (e.g. ``2`` for BTCUSD-T on Admirals).
+
+        Returns
+        -------
+        float
+            Price rounded to *digits* decimal places.
+        """
+        return round(price, digits)
+
+    # ------------------------------------------------------------------
     # MT5 order helpers
     # ------------------------------------------------------------------
 
@@ -459,7 +658,12 @@ class MT5Executor(PaperExecutor):
         }
 
     def _send_order(self, request: dict) -> Any | None:
-        """Send an order via ``mt5.order_send`` and log the result."""
+        """Send an order via ``mt5.order_send`` and log the result.
+
+        Uses :func:`_log_mt5_retcode` to emit a human-readable description for
+        every non-success return code.  Prefer :meth:`_send_order_with_retry`
+        for live trading paths where transient failures should be retried.
+        """
         result = mt5.order_send(request)
         if result is None:
             logger.error(
@@ -469,26 +673,116 @@ class MT5Executor(PaperExecutor):
             )
             return None
 
+        _log_mt5_retcode(result.retcode, context=str(request.get("symbol", "")))
+
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error(
-                "MT5 order rejected for %s: retcode=%d  comment=%s",
-                request.get("symbol"),
-                result.retcode,
-                result.comment,
-            )
             return None
 
-        logger.info(
-            "MT5 ORDER PLACED  symbol=%s  type=%s  volume=%.4f  price=%.5f  "
-            "order=%d  deal=%d",
-            request.get("symbol"),
-            "BUY" if request.get("type") == mt5.ORDER_TYPE_BUY else "SELL",
-            request.get("volume", 0.0),
-            result.price,
-            result.order,
-            result.deal,
-        )
+        action = request.get("action")
+        if action == mt5.TRADE_ACTION_SLTP:
+            logger.info(
+                "MT5 SL/TP MODIFIED  position=%d  sl=%.5f  tp=%.5f",
+                request.get("position", 0),
+                request.get("sl", 0.0),
+                request.get("tp", 0.0),
+            )
+        else:
+            logger.info(
+                "MT5 ORDER PLACED  symbol=%s  type=%s  volume=%.4f  price=%.5f  "
+                "order=%d  deal=%d",
+                request.get("symbol"),
+                "BUY" if request.get("type") == mt5.ORDER_TYPE_BUY else "SELL",
+                request.get("volume", 0.0),
+                result.price,
+                result.order,
+                result.deal,
+            )
         return result
+
+    async def _send_order_with_retry(
+        self,
+        request: dict,
+        max_retries: int = 3,
+    ) -> Any | None:
+        """Send an MT5 order with automatic retry on transient failures.
+
+        Retries up to *max_retries* times when the return code is in
+        :data:`_RETRYABLE_RETCODES` (e.g. requote, price changed, connection
+        error).  Each attempt waits an increasing back-off before retrying.
+
+        Parameters
+        ----------
+        request:
+            Order request dictionary to pass to ``mt5.order_send``.
+        max_retries:
+            Maximum number of attempts (default: 3).
+
+        Returns
+        -------
+        Any | None
+            The ``order_send`` result on success, or ``None`` on final failure.
+        """
+        if not _MT5_AVAILABLE:
+            return None
+
+        for attempt in range(1, max_retries + 1):
+            result = mt5.order_send(request)
+
+            if result is None:
+                logger.error(
+                    "mt5.order_send returned None (attempt %d/%d) for %s. "
+                    "Last error: %s",
+                    attempt,
+                    max_retries,
+                    request.get("symbol"),
+                    mt5.last_error(),
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(0.5 * attempt)
+                continue
+
+            _log_mt5_retcode(
+                result.retcode,
+                context=f"attempt {attempt}/{max_retries}  symbol={request.get('symbol')}",
+            )
+
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                action = request.get("action")
+                if action == mt5.TRADE_ACTION_SLTP:
+                    logger.info(
+                        "MT5 SL/TP MODIFIED  position=%d  sl=%.5f  tp=%.5f",
+                        request.get("position", 0),
+                        request.get("sl", 0.0),
+                        request.get("tp", 0.0),
+                    )
+                else:
+                    logger.info(
+                        "MT5 ORDER PLACED  symbol=%s  type=%s  volume=%.4f  price=%.5f  "
+                        "order=%d  deal=%d",
+                        request.get("symbol"),
+                        "BUY" if request.get("type") == mt5.ORDER_TYPE_BUY else "SELL",
+                        request.get("volume", 0.0),
+                        result.price,
+                        result.order,
+                        result.deal,
+                    )
+                return result
+
+            if result.retcode in _RETRYABLE_RETCODES and attempt < max_retries:
+                back_off = 0.5 * attempt
+                logger.warning(
+                    "[MT5] Transient error for %s (attempt %d/%d) – "
+                    "retrying in %.1f s...",
+                    request.get("symbol"),
+                    attempt,
+                    max_retries,
+                    back_off,
+                )
+                await asyncio.sleep(back_off)
+            else:
+                return None  # Non-retryable failure or final attempt exhausted.
+
+        return None
 
     # ------------------------------------------------------------------
     # try_open_trade override
@@ -569,6 +863,13 @@ class MT5Executor(PaperExecutor):
             )
             return False
 
+        # ── MT5 symbol resolution (fail-fast before any state mutation) ────
+        mt5_sym: str | None = None
+        if self._live:
+            mt5_sym = self._resolve_symbol(sym)
+            if mt5_sym is None:
+                return False
+
         ts = timestamp or datetime.now(tz=timezone.utc)
         self._risk.deduct(position_size)
         self._risk.register_open()
@@ -612,28 +913,36 @@ class MT5Executor(PaperExecutor):
                 self._risk.register_close()
                 return False
 
+            # mt5_sym is guaranteed non-None here (resolved before deductions).
+            assert mt5_sym is not None  # noqa: S101
+
+            # Normalise SL price to the number of digits the broker accepts.
+            sym_info = mt5.symbol_info(mt5_sym)
+            digits: int = sym_info.digits if sym_info else 5
+            stop_loss_price = self._normalize_price(stop_loss_price, digits)
+
             # Fetch account equity from MT5 for lot-size calculation.
             acct = mt5.account_info()
             account_equity: float = acct.equity if acct else self._risk.balance
 
             lots = calculate_lot_size(
-                symbol=sym,
+                symbol=mt5_sym,
                 account_balance=account_equity,
                 sl_distance_price=max(entry_price - stop_loss_price, 1e-8),
                 risk_pct=self._risk_pct,
             )
 
             # Fetch latest ask price for the BUY order.
-            tick = mt5.symbol_info_tick(sym)
-            ask_price = tick.ask if tick else entry_price
+            tick = mt5.symbol_info_tick(mt5_sym)
+            ask_price = self._normalize_price(tick.ask if tick else entry_price, digits)
 
             request = self._build_buy_request(
-                symbol=sym,
+                symbol=mt5_sym,
                 lots=lots,
                 price=ask_price,
                 sl=stop_loss_price,
             )
-            result = self._send_order(request)
+            result = await self._send_order_with_retry(request)
             if result is None:
                 # Order rejected – roll back.
                 self._risk.credit(position_size)
@@ -739,39 +1048,47 @@ class MT5Executor(PaperExecutor):
                     "Closing in paper simulation only."
                 )
             else:
-                # Find the MT5 position ticket for this symbol tagged with our magic.
-                mt5_positions = mt5.positions_get(symbol=symbol)
-                if mt5_positions:
-                    for mt5_pos in mt5_positions:
-                        if mt5_pos.magic != self._magic:
-                            continue
-
-                        # Use the current bid price for a LONG close (SELL at bid).
-                        tick = mt5.symbol_info_tick(symbol)
-                        bid_price = tick.bid if tick else exit_price
-
-                        request = self._build_sell_request(
-                            symbol=symbol,
-                            lots=mt5_pos.volume,
-                            price=bid_price,
-                            position_id=mt5_pos.ticket,
-                        )
-                        result = self._send_order(request)
-                        if result is None:
-                            logger.error(
-                                "MT5 close order rejected for %s (ticket=%d) – "
-                                "removing from local state anyway to avoid ghost positions.",
-                                symbol,
-                                mt5_pos.ticket,
-                            )
-                        break
-                else:
-                    logger.warning(
-                        "[MT5] No open position found for %s with magic=%d – "
-                        "closing in paper simulation only.",
+                mt5_sym = self._resolve_symbol(symbol)
+                if mt5_sym is None:
+                    logger.error(
+                        "[MT5] Cannot send close order for '%s' – symbol not in SYMBOL_MAP. "
+                        "Removing from local state to avoid ghost positions.",
                         symbol,
-                        self._magic,
                     )
+                else:
+                    # Find the MT5 position ticket for this symbol tagged with our magic.
+                    mt5_positions = mt5.positions_get(symbol=mt5_sym)
+                    if mt5_positions:
+                        for mt5_pos in mt5_positions:
+                            if mt5_pos.magic != self._magic:
+                                continue
+
+                            # Use the current bid price for a LONG close (SELL at bid).
+                            tick = mt5.symbol_info_tick(mt5_sym)
+                            bid_price = tick.bid if tick else exit_price
+
+                            request = self._build_sell_request(
+                                symbol=mt5_sym,
+                                lots=mt5_pos.volume,
+                                price=bid_price,
+                                position_id=mt5_pos.ticket,
+                            )
+                            result = await self._send_order_with_retry(request)
+                            if result is None:
+                                logger.error(
+                                    "MT5 close order rejected for %s (ticket=%d) – "
+                                    "removing from local state anyway to avoid ghost positions.",
+                                    symbol,
+                                    mt5_pos.ticket,
+                                )
+                            break
+                    else:
+                        logger.warning(
+                            "[MT5] No open position found for %s with magic=%d – "
+                            "closing in paper simulation only.",
+                            symbol,
+                            self._magic,
+                        )
 
         # ── Paper book-keeping (identical to PaperExecutor) ────────────────
         if pos.trade_id is not None:
@@ -854,3 +1171,278 @@ class MT5Executor(PaperExecutor):
             )
 
         return len(live_symbols)
+
+    # ------------------------------------------------------------------
+    # Position modification and explicit close
+    # ------------------------------------------------------------------
+
+    async def modify_position(
+        self,
+        ticket: int,
+        new_sl: float,
+        new_tp: float = 0.0,
+        symbol: str | None = None,
+    ) -> bool:
+        """Modify the Stop Loss (and optionally Take Profit) of an open MT5 position.
+
+        Used by the trailing-stop logic to push the SL level upward as price
+        moves in favour of the trade.  Prices are normalised to the broker's
+        required number of decimal digits before being submitted.
+
+        Parameters
+        ----------
+        ticket:
+            MT5 position ticket number.
+        new_sl:
+            New stop-loss price (absolute, not a distance).
+        new_tp:
+            New take-profit price.  Pass ``0.0`` to leave TP unchanged /
+            unset (broker default).
+        symbol:
+            Internal symbol name used only for price-digit lookup.  When
+            *None* the executor's default ``self.symbol`` is used.
+
+        Returns
+        -------
+        bool
+            ``True`` if the modification was accepted by MT5, ``False``
+            otherwise (including paper-mode where no MT5 call is made).
+        """
+        if not self._live:
+            logger.debug("modify_position: not in live mode – skipping MT5 call.")
+            return True
+
+        if not _MT5_AVAILABLE:
+            logger.error("modify_position: MetaTrader5 library is not installed.")
+            return False
+
+        sym = symbol or self.symbol
+        mt5_sym = self._resolve_symbol(sym)
+        if mt5_sym is None:
+            return False
+
+        info = mt5.symbol_info(mt5_sym)
+        digits: int = info.digits if info else 5
+        norm_sl = self._normalize_price(new_sl, digits) if new_sl else 0.0
+        norm_tp = self._normalize_price(new_tp, digits) if new_tp else 0.0
+
+        request: dict = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "sl": norm_sl,
+            "tp": norm_tp,
+        }
+        result = await self._send_order_with_retry(request)
+        return result is not None
+
+    async def close_position_by_ticket(self, ticket: int) -> bool:
+        """Close an open MT5 position by its ticket number.
+
+        Identifies whether the position is a BUY or SELL and sends the
+        appropriate opposite order.  The close price is fetched live from the
+        MT5 terminal (bid for BUY positions, ask for SELL positions) to ensure
+        accurate fill prices.
+
+        Parameters
+        ----------
+        ticket:
+            MT5 position ticket to close.
+
+        Returns
+        -------
+        bool
+            ``True`` on successful close, ``False`` on failure or paper mode.
+        """
+        if not self._live:
+            logger.debug("close_position_by_ticket: not in live mode – skipping.")
+            return True
+
+        if not _MT5_AVAILABLE:
+            logger.error("close_position_by_ticket: MetaTrader5 library is not installed.")
+            return False
+
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            logger.warning(
+                "close_position_by_ticket: no MT5 position found for ticket=%d.", ticket
+            )
+            return False
+
+        pos = positions[0]
+        mt5_sym = pos.symbol
+        tick = mt5.symbol_info_tick(mt5_sym)
+
+        if pos.type == mt5.POSITION_TYPE_BUY:
+            order_type = mt5.ORDER_TYPE_SELL
+            price = tick.bid if tick else pos.price_current
+        else:
+            order_type = mt5.ORDER_TYPE_BUY
+            price = tick.ask if tick else pos.price_current
+
+        request: dict = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": mt5_sym,
+            "volume": pos.volume,
+            "type": order_type,
+            "position": ticket,
+            "price": price,
+            "deviation": self._deviation,
+            "magic": self._magic,
+            "comment": "ClawdBot CLOSE",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = await self._send_order_with_retry(request)
+        return result is not None
+
+    # ------------------------------------------------------------------
+    # Market data extraction
+    # ------------------------------------------------------------------
+
+    def fetch_candles(
+        self,
+        symbol: str,
+        timeframe: int = TIMEFRAME_M15,
+        count: int = 100,
+        start_pos: int = 0,
+    ) -> "pd.DataFrame | None":
+        """Fetch OHLCV candles from the MT5 terminal as a pandas DataFrame.
+
+        Parameters
+        ----------
+        symbol:
+            Internal symbol name (e.g. ``"BTC/USDT"``).  Translated via
+            :meth:`_resolve_symbol` before the MT5 call.
+        timeframe:
+            MT5 timeframe constant (e.g. :data:`TIMEFRAME_M15`,
+            :data:`TIMEFRAME_H1`).  Defaults to 15-minute candles.
+        count:
+            Number of bars to fetch (most recent first from *start_pos*).
+        start_pos:
+            Starting bar index (0 = the most recent/current bar).
+
+        Returns
+        -------
+        pd.DataFrame | None
+            DataFrame with columns ``time``, ``open``, ``high``, ``low``,
+            ``close``, ``tick_volume``, ``spread``, ``real_volume``.
+            Returns ``None`` when MT5 is unavailable or the symbol cannot be
+            resolved.
+        """
+        if not _MT5_AVAILABLE:
+            logger.warning("fetch_candles: MetaTrader5 library is not installed.")
+            return None
+
+        if not _PANDAS_AVAILABLE:
+            logger.warning("fetch_candles: pandas is not installed.")
+            return None
+
+        mt5_sym = self._resolve_symbol(symbol)
+        if mt5_sym is None:
+            return None
+
+        rates = mt5.copy_rates_from_pos(mt5_sym, timeframe, start_pos, count)
+        if rates is None or len(rates) == 0:
+            logger.warning(
+                "fetch_candles: mt5.copy_rates_from_pos returned no data for %s "
+                "(timeframe=%d, count=%d).",
+                mt5_sym,
+                timeframe,
+                count,
+            )
+            return None
+
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        return df
+
+    def fetch_tick(self, symbol: str) -> dict | None:
+        """Return the latest bid and ask prices for *symbol*.
+
+        Parameters
+        ----------
+        symbol:
+            Internal symbol name (e.g. ``"BTC/USDT"``).
+
+        Returns
+        -------
+        dict | None
+            Dictionary with keys ``"symbol"``, ``"bid"``, ``"ask"``,
+            ``"last"``, and ``"time"`` (UTC datetime), or ``None`` when MT5
+            is unavailable or the tick cannot be fetched.
+        """
+        if not _MT5_AVAILABLE:
+            logger.warning("fetch_tick: MetaTrader5 library is not installed.")
+            return None
+
+        mt5_sym = self._resolve_symbol(symbol)
+        if mt5_sym is None:
+            return None
+
+        tick = mt5.symbol_info_tick(mt5_sym)
+        if tick is None:
+            logger.warning("fetch_tick: mt5.symbol_info_tick('%s') returned None.", mt5_sym)
+            return None
+
+        return {
+            "symbol": mt5_sym,
+            "bid": tick.bid,
+            "ask": tick.ask,
+            "last": tick.last,
+            "time": datetime.fromtimestamp(tick.time, tz=timezone.utc),
+        }
+
+    def get_open_positions(self, symbol: str | None = None) -> list[dict]:
+        """Return open MT5 positions opened by this bot instance.
+
+        Filters by :attr:`_magic` so that manual trades made directly in the
+        MT5 terminal are not included.
+
+        Parameters
+        ----------
+        symbol:
+            Internal symbol name (e.g. ``"BTC/USDT"``).  When provided only
+            positions for that symbol are returned; when *None* all open
+            positions tagged with :attr:`_magic` are returned.
+
+        Returns
+        -------
+        list[dict]
+            Each entry contains:
+            ``ticket``, ``symbol`` (broker name), ``type`` (``"BUY"``/``"SELL"``),
+            ``volume``, ``price_open``, ``price_current``, ``sl``, ``tp``,
+            ``profit``, ``magic``.
+            Returns an empty list when MT5 is unavailable.
+        """
+        if not _MT5_AVAILABLE:
+            logger.warning("get_open_positions: MetaTrader5 library is not installed.")
+            return []
+
+        if symbol is not None:
+            mt5_sym = self._resolve_symbol(symbol)
+            if mt5_sym is None:
+                return []
+            raw = mt5.positions_get(symbol=mt5_sym)
+        else:
+            raw = mt5.positions_get()
+
+        if raw is None:
+            return []
+
+        result: list[dict] = []
+        for pos in raw:
+            if pos.magic != self._magic:
+                continue  # Ignore positions not opened by this bot instance.
+            result.append({
+                "ticket": pos.ticket,
+                "symbol": pos.symbol,
+                "type": "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL",
+                "volume": pos.volume,
+                "price_open": pos.price_open,
+                "price_current": pos.price_current,
+                "sl": pos.sl,
+                "tp": pos.tp,
+                "profit": pos.profit,
+                "magic": pos.magic,
+            })
+        return result
