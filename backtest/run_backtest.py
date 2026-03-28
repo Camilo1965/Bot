@@ -64,7 +64,7 @@ _MODEL_DIR = Path(__file__).parent.parent / "models"
 _MODEL_PATH = _MODEL_DIR / "xgb_live.json"
 
 # Simulated trade parameters (must mirror risk/risk_manager.py)
-_ACTIVATION_PCT = 0.015    # 1.5 % profit activates trailing stop
+_ACTIVATION_PCT = 0.02     # 2.0 % – floor enforced by risk_manager._ACTIVATION_PCT_MIN to outpace round-trip fees
 _TRAILING_DISTANCE = 0.005 # 0.5 % trailing gap below running peak
 _INITIAL_SL_PCT = 0.0075   # 0.75 % initial hard stop loss
 
