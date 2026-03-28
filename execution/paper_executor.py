@@ -52,9 +52,12 @@ second position on the same symbol is silently rejected.
 from __future__ import annotations
 
 import asyncio
+import csv
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import ccxt.async_support as ccxt_async
@@ -86,6 +89,25 @@ logger = logging.getLogger(__name__)
 # Hint appended to warning messages directing users to the debug log file.
 _DEBUG_LOG_HINT = "(Revisa bot_debug.log para detalles técnicos)"
 
+# ── Trade journal and state persistence paths ─────────────────────────────────
+_LOGS_DIR = Path(__file__).parent.parent / "logs"
+_JOURNAL_FILE = _LOGS_DIR / "trade_journal.csv"
+_STATE_FILE = Path(__file__).parent.parent / "state.json"
+
+# CSV column names for the trade journal.
+_JOURNAL_COLUMNS = [
+    "timestamp",
+    "symbol",
+    "action",
+    "execution_price",
+    "quantity",
+    "ml_confidence_at_entry",
+    "sentiment_score_at_entry",
+    "exit_reason",
+    "pnl_usdt",
+    "pnl_percent",
+]
+
 
 # Default TTL for open positions (hours).  Set to None to disable.
 _DEFAULT_TTL_HOURS: float = 12.0
@@ -113,6 +135,73 @@ _EXIT_REASON_LABELS: dict[str, str] = {
     "SMART_EXIT_SENTIMENT":  "SMART_EXIT_SENTIMENT: Gemini detectó un cambio brusco a sentimiento negativo.",
     "TTL_TIMEOUT":           "TTL_TIMEOUT: Tiempo máximo de exposición alcanzado.",
 }
+
+
+def record_trade(
+    *,
+    timestamp: datetime,
+    symbol: str,
+    action: str,
+    execution_price: float,
+    quantity: float,
+    ml_confidence_at_entry: float,
+    sentiment_score_at_entry: float,
+    exit_reason: str = "",
+    pnl_usdt: float | None = None,
+    pnl_percent: float | None = None,
+) -> None:
+    """Append a BUY or SELL event to the trade journal CSV.
+
+    The journal is written in append mode so all historical rows are preserved
+    across restarts.  If the file does not yet exist the CSV header row is
+    written first.  Directory creation is best-effort: errors are logged as
+    warnings rather than raised so the trading loop is never interrupted.
+
+    Parameters
+    ----------
+    timestamp:
+        UTC timestamp of the trade event.
+    symbol:
+        Trading pair (e.g. ``"BTC/USDT"``).
+    action:
+        ``"BUY"`` (position opened) or ``"SELL"`` (position closed).
+    execution_price:
+        Price at which the order was filled.
+    quantity:
+        Base-asset quantity traded (``position_size / execution_price``).
+    ml_confidence_at_entry:
+        XGBoost win-probability at the time the position was opened.
+    sentiment_score_at_entry:
+        Gemini sentiment score at the time the position was opened.
+    exit_reason:
+        Exit reason code (``SL_BASE``, ``TRAILING_STOP``, ``SMART_EXIT_ML``,
+        ``TTL_TIMEOUT``).  Empty for BUY rows.
+    pnl_usdt:
+        Realised PnL in USDT after fees.  ``None`` for BUY rows.
+    pnl_percent:
+        Realised PnL as a percentage of deployed margin.  ``None`` for BUY rows.
+    """
+    try:
+        _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        write_header = not _JOURNAL_FILE.exists()
+        with _JOURNAL_FILE.open("a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=_JOURNAL_COLUMNS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "timestamp": timestamp.isoformat(),
+                "symbol": symbol,
+                "action": action,
+                "execution_price": f"{execution_price:.8g}",
+                "quantity": f"{quantity:.8g}",
+                "ml_confidence_at_entry": f"{ml_confidence_at_entry:.6f}",
+                "sentiment_score_at_entry": f"{sentiment_score_at_entry:.6f}",
+                "exit_reason": exit_reason,
+                "pnl_usdt": f"{pnl_usdt:.6f}" if pnl_usdt is not None else "",
+                "pnl_percent": f"{pnl_percent:.4f}" if pnl_percent is not None else "",
+            })
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("record_trade: could not write to journal CSV: %s", exc)
 
 
 def _format_duration(total_seconds: float) -> str:
@@ -242,6 +331,9 @@ class OpenPosition:
     current_stop_loss: float = field(init=False)
     # [SMART EXIT] Maximum holding time in hours; None disables TTL (Layer 4).
     max_ttl_hours: float | None = _DEFAULT_TTL_HOURS
+    # [JOURNAL] Entry-time ML confidence and sentiment (persisted in CSV / state.json)
+    ml_confidence: float = 0.0
+    sentiment_score: float = 0.0
 
     def __post_init__(self) -> None:
         # Initialise peak_price to entry_price so it is always defined
@@ -301,8 +393,125 @@ class PaperExecutor:
         self.total_pnl: float = 0.0
 
     # ------------------------------------------------------------------
-    # Public API
+    # State persistence (paper-trading disaster recovery)
     # ------------------------------------------------------------------
+
+    def _save_state(self) -> None:
+        """Persist open positions and session PnL to ``state.json``.
+
+        Called automatically whenever a position is opened or closed.  The
+        file is written atomically (write to a temp file, then rename) so a
+        crash mid-write never leaves a corrupted file.  Errors are logged as
+        warnings rather than raised so the trading loop is never interrupted.
+        """
+        try:
+            payload: dict[str, Any] = {
+                "saved_at": datetime.now(tz=timezone.utc).isoformat(),
+                "total_pnl": self.total_pnl,
+                "positions": [],
+            }
+            for sym, pos in self.open_positions.items():
+                payload["positions"].append({
+                    "symbol": sym,
+                    "entry_price": pos.entry_price,
+                    "position_size": pos.position_size,
+                    "entry_time": pos.entry_time.isoformat(),
+                    "trade_id": pos.trade_id,
+                    "sl_pct": pos.sl_pct,
+                    "activation_pct": pos.activation_pct,
+                    "trailing_distance_pct": pos.trailing_distance_pct,
+                    "stop_loss_price": pos.stop_loss_price,
+                    "atr_trailing_distance": pos.atr_trailing_distance,
+                    "peak_price": pos.peak_price,
+                    "trailing_stop_active": pos.trailing_stop_active,
+                    "current_stop_loss": pos.current_stop_loss,
+                    "max_ttl_hours": pos.max_ttl_hours,
+                    "ml_confidence": pos.ml_confidence,
+                    "sentiment_score": pos.sentiment_score,
+                })
+            tmp = _STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(_STATE_FILE)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("_save_state: could not write state.json: %s", exc)
+
+    def load_state(self) -> int:
+        """Restore open positions from ``state.json`` at startup (paper trading).
+
+        Reads the persisted state file and re-creates :class:`OpenPosition`
+        objects for every position that was open when the bot last shut down.
+        The risk manager's open-position counter is incremented for each
+        restored position.  The saved ``total_pnl`` is also restored.
+
+        This method is only meaningful in pure paper-trading mode; when a live
+        exchange client is present the authoritative state comes from Binance
+        via :meth:`restore_position` and this method should not be called.
+
+        Returns
+        -------
+        int
+            Number of positions successfully restored (0 if the file is
+            absent, empty, or cannot be parsed).
+        """
+        if not _STATE_FILE.exists():
+            return 0
+        try:
+            data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("load_state: could not read state.json: %s", exc)
+            return 0
+
+        restored = 0
+        for raw in data.get("positions", []):
+            sym = raw.get("symbol", "")
+            if not sym or sym in self.open_positions:
+                continue
+            try:
+                entry_time = datetime.fromisoformat(raw["entry_time"])
+                pos = OpenPosition(
+                    symbol=sym,
+                    entry_price=float(raw["entry_price"]),
+                    position_size=float(raw["position_size"]),
+                    entry_time=entry_time,
+                    trade_id=raw.get("trade_id"),
+                    sl_pct=float(raw.get("sl_pct", BASE_SL)),
+                    activation_pct=float(raw.get("activation_pct", BASE_ACTIVATION_PCT)),
+                    trailing_distance_pct=float(raw.get("trailing_distance_pct", BASE_TRAILING_DISTANCE)),
+                    stop_loss_price=float(raw.get("stop_loss_price", 0.0)),
+                    atr_trailing_distance=float(raw.get("atr_trailing_distance", 0.0)),
+                    max_ttl_hours=raw["max_ttl_hours"] if "max_ttl_hours" in raw else _DEFAULT_TTL_HOURS,
+                    ml_confidence=float(raw.get("ml_confidence", 0.0)),
+                    sentiment_score=float(raw.get("sentiment_score", 0.0)),
+                )
+                # Restore mutable trailing-stop state that __post_init__ would overwrite
+                pos.peak_price = float(raw.get("peak_price", pos.entry_price))
+                pos.trailing_stop_active = raw.get("trailing_stop_active", False) is True
+                pos.current_stop_loss = float(raw.get("current_stop_loss", pos.stop_loss_price))
+                self.open_positions[sym] = pos
+                self._risk.register_open()
+                restored += 1
+                logger.info(
+                    "STATE RESTORED  symbol=%s  entry_price=%.2f  size=%.2f  "
+                    "peak=%.2f  trailing_active=%s",
+                    sym,
+                    pos.entry_price,
+                    pos.position_size,
+                    pos.peak_price,
+                    pos.trailing_stop_active,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("load_state: could not restore position %s: %s", sym, exc)
+
+        saved_pnl = data.get("total_pnl", 0.0)
+        self.total_pnl = float(saved_pnl)
+        if restored:
+            logger.info(
+                "✅ [STATE RECOVERY] Restored %d position(s) from state.json "
+                "(session PnL: %.4f USDT).",
+                restored,
+                self.total_pnl,
+            )
+        return restored
 
     def restore_position(
         self,
@@ -540,7 +749,21 @@ class PaperExecutor:
             trailing_distance_pct=thresholds.trailing_distance_pct,
             stop_loss_price=stop_loss_price,
             atr_trailing_distance=atr_trailing_distance,
+            ml_confidence=win_probability,
+            sentiment_score=sentiment_score,
         )
+        # ── Trade journal CSV (BUY row) ────────────────────────────────────
+        record_trade(
+            timestamp=ts,
+            symbol=sym,
+            action="BUY",
+            execution_price=entry_price,
+            quantity=position_size / entry_price,
+            ml_confidence_at_entry=win_probability,
+            sentiment_score_at_entry=sentiment_score,
+        )
+        # ── Persist state so the position survives a restart ───────────────
+        self._save_state()
         # Operational console line – visible on the terminal at INFO level.
         if sl_distance is not None:
             logger.info(
@@ -671,7 +894,7 @@ class PaperExecutor:
             ts = timestamp or datetime.now(tz=timezone.utc)
             reason = "TSL" if pos.trailing_stop_active else "SL"
             reason_code = "TRAILING_STOP" if pos.trailing_stop_active else "SL_BASE"
-            await self._close_position(symbol=sym, exit_price=current_price, exit_time=ts, pnl=pnl)
+            await self._close_position(symbol=sym, exit_price=current_price, exit_time=ts, pnl=pnl, exit_reason_code=reason_code)
             # Operational console line – visible on the terminal at INFO level.
             logger.info(
                 "💰 [CIERRE] %s | PnL: %.4f USDT | Motivo: %s",
@@ -789,6 +1012,7 @@ class PaperExecutor:
                     exit_price=current_price,
                     exit_time=ts,
                     pnl=pnl,
+                    exit_reason_code="SMART_EXIT_ML",
                 )
                 logger.info(
                     "🤖💰 [SMART EXIT] %s cerrado por Reversión de Tendencia "
@@ -832,6 +1056,7 @@ class PaperExecutor:
                     exit_price=current_price,
                     exit_time=ts,
                     pnl=pnl,
+                    exit_reason_code="TTL_TIMEOUT",
                 )
                 logger.info(
                     "⏳ [TTL EXIT] %s cerrado por tiempo máximo de exposición "
@@ -876,6 +1101,7 @@ class PaperExecutor:
         exit_price: float,
         exit_time: datetime,
         pnl: float,
+        exit_reason_code: str = "",
     ) -> None:
         """Persist the closed trade, update balance, and remove the open position."""
         pos = self.open_positions.get(symbol)
@@ -940,6 +1166,26 @@ class PaperExecutor:
             self._risk.record_daily_loss(-pnl)
         self.total_pnl += pnl
         del self.open_positions[symbol]
+
+        # ── Trade journal CSV (SELL row) ───────────────────────────────────
+        total_fees = pos.position_size * _TAKER_FEE_RATE * 2
+        net_pnl = pnl - total_fees
+        margin_used = pos.position_size / LEVERAGE
+        pnl_pct = (net_pnl / margin_used * 100) if margin_used > 0 else 0.0
+        record_trade(
+            timestamp=exit_time,
+            symbol=symbol,
+            action="SELL",
+            execution_price=exit_price,
+            quantity=pos.position_size / exit_price,
+            ml_confidence_at_entry=pos.ml_confidence,
+            sentiment_score_at_entry=pos.sentiment_score,
+            exit_reason=exit_reason_code,
+            pnl_usdt=net_pnl,
+            pnl_percent=pnl_pct,
+        )
+        # ── Persist updated state (position removed) ───────────────────────
+        self._save_state()
 
     async def sync_positions_with_exchange(self) -> int:
         """Re-sync local open-position state against live Binance Futures positions.

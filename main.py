@@ -51,6 +51,7 @@ from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE, RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor, compute_htf_trend
 from strategy.feature_engineer import FeatureEngineer
 from strategy.sentiment_llm import get_gemini_sentiment
+from utils.telegram_notifier import send_telegram_alert
 
 load_dotenv()
 
@@ -200,7 +201,7 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
       at ``DEBUG`` level using :class:`_JsonFormatter`.  Every price tick,
       indicator calculation, and AI message is captured here with a full
       ISO-8601 timestamp for post-session auditing.  The file rotates at
-      10 MB and keeps up to 5 backup files.
+      5 MB and keeps 1 backup file.
 
     * **Console** (stdout):  :class:`~logging.StreamHandler` at ``INFO``
       level using :class:`_ConsoleFormatter`.  Only operational events
@@ -225,8 +226,8 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     log_file = Path(__file__).parent / "bot_debug.log"
     file_handler = logging.handlers.RotatingFileHandler(
         log_file,
-        maxBytes=10 * 1024 * 1024,  # 10 MB per file
-        backupCount=5,
+        maxBytes=5 * 1024 * 1024,  # 5 MB per file
+        backupCount=1,
         encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
@@ -1248,6 +1249,10 @@ async def position_sync_loop(
 async def main() -> None:
     logger = setup_logging()
 
+    # ── Ensure logs/ directory exists for trade journal and audit files ────────
+    _logs_dir = Path(__file__).parent / "logs"
+    _logs_dir.mkdir(exist_ok=True)
+
     # ── Rich console & Live dashboard setup ───────────────────────────────────
     # Replace the plain StreamHandler with a RichHandler so that any log
     # messages emitted while the Live table is active are rendered above the
@@ -1269,6 +1274,9 @@ async def main() -> None:
     root_logger.addHandler(_rich_handler)
 
     logger.info("🚀 ClawdBot starting up...")
+
+    # ── Telegram startup notification ─────────────────────────────────────────
+    asyncio.create_task(send_telegram_alert("🚀 *ClawdBot* ha iniciado correctamente."))
 
     # ── Record bot start time for uptime display ──────────────────────────────
     global _BOT_START_TIME
@@ -1447,6 +1455,17 @@ async def main() -> None:
                 logger.info("🔄 [SYNC] No existing open positions found on Binance.")
         except Exception as exc:  # noqa: BLE001
             logger.warning("⚠️ [SYNC] Could not sync open positions from Binance: %s", exc)
+    else:
+        # ------------------------------------------------------------------
+        # [PAPER] Restore open positions from local state.json (paper trading)
+        # ------------------------------------------------------------------
+        # In pure paper-trading mode there is no Binance exchange to query.
+        # Load the last saved state so that positions survive a bot restart.
+        _paper_restored = paper_executor.load_state()
+        if _paper_restored == 0:
+            logger.info(
+                "📝 [PAPER] No previous state.json found – starting fresh session."
+            )
 
     # ------------------------------------------------------------------
     # Attempt to load a pre-trained model; fall back to warm-start
@@ -1529,6 +1548,20 @@ async def main() -> None:
             funding_rate_client.run(),
             position_sync_loop(paper_executor, interval=60),
         )
+    except Exception as _critical_exc:  # noqa: BLE001
+        logger.critical(
+            "🚨 [CRITICAL] Bot loop terminated unexpectedly: %s – check bot_debug.log.",
+            _critical_exc,
+            exc_info=True,
+        )
+        try:
+            await send_telegram_alert(
+                f"🚨 *ERROR CRÍTICO* – ClawdBot se ha detenido inesperadamente.\n"
+                f"Causa: `{type(_critical_exc).__name__}: {str(_critical_exc)[:200]}`"
+            )
+        except Exception:  # noqa: BLE001
+            pass  # never let the Telegram call block the shutdown path
+        raise
     finally:
         _live.stop()
         if exchange_client is not None:
