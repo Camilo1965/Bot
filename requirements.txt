@@ -39,3 +39,6 @@ rich>=13.0.0
 # Desktop GUI
 PyQt6
 pyqtgraph
+
+# MetaTrader 5 execution layer (Windows only – requires local MT5 terminal)
+MetaTrader5
