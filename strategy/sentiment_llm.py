@@ -13,7 +13,9 @@ float in **[-1.0, +1.0]**:
 
 The ``GEMINI_API_KEY`` environment variable (populated via ``.env``) is
 required.  If the API call fails or is rate-limited the function falls back
-to ``0.0`` so the trading loop is never interrupted.
+to ``_FALLBACK_SENTIMENT`` (-0.1, i.e. exactly at ``BUY_SENTIMENT_THRESHOLD``)
+so the trading loop is never interrupted and no overly-optimistic sentiment
+value biases signal generation during an outage.
 
 Usage
 -----
@@ -33,11 +35,31 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
+# Explicit import for rate-limit (HTTP 429) detection.  google-api-core is a
+# transitive dependency of google-genai so this import should always succeed.
+# A private sentinel class is used as a fallback so ``isinstance`` comparisons
+# remain valid even if the import somehow fails (avoids ``isinstance(x, None)``
+# which raises TypeError).
+class _NeverRaised(Exception):
+    """Private sentinel; never actually raised.  Stands in for unavailable types."""
+
+
+try:
+    from google.api_core.exceptions import ResourceExhausted as _ResourceExhausted
+except ImportError:  # pragma: no cover – guard against unusual install layouts
+    _ResourceExhausted = _NeverRaised  # type: ignore[assignment,misc]
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 _MODEL_NAME = "gemini-2.5-flash"
+
+# Safe fallback returned whenever the Gemini API is unavailable.  Using -0.1
+# (exactly at BUY_SENTIMENT_THRESHOLD) prevents an artificially optimistic
+# sentiment value from triggering BUY signals while the LLM is down, without
+# completely suppressing signals that are already supported by the ML model.
+_FALLBACK_SENTIMENT: float = -0.1
 
 _SYSTEM_INSTRUCTION = (
     "You are an elite cryptocurrency quantitative analyst for a high-frequency futures trading desk.\n"
@@ -95,7 +117,9 @@ def _get_client() -> genai.Client:
 def get_gemini_sentiment(headlines: list[str]) -> float:
     """Return a sentiment score in [-1.0, 1.0] for the given *headlines*.
 
-    Calls the Gemini API synchronously.  Falls back to ``0.0`` on any error.
+    Calls the Gemini API synchronously.  Falls back to ``_FALLBACK_SENTIMENT``
+    (-0.1) on any error so that the trading loop is never interrupted and no
+    falsely-optimistic sentiment can trigger BUY signals during an outage.
 
     Parameters
     ----------
@@ -105,10 +129,11 @@ def get_gemini_sentiment(headlines: list[str]) -> float:
     Returns
     -------
     float
-        Sentiment score in the range [-1.0, +1.0], or ``0.0`` on failure.
+        Sentiment score in the range [-1.0, +1.0], or ``_FALLBACK_SENTIMENT``
+        (-0.1) on failure.
     """
     if not headlines:
-        return 0.0
+        return _FALLBACK_SENTIMENT
 
     if len(headlines) < 5:
         logger.warning(
@@ -149,23 +174,36 @@ def get_gemini_sentiment(headlines: list[str]) -> float:
                     )
                 except ValueError:
                     logger.warning(
-                        "Gemini returned non-numeric response: %r -- falling back to 0.0", raw
+                        "Gemini returned non-numeric response: %r -- falling back to %.1f",
+                        raw,
+                        _FALLBACK_SENTIMENT,
                     )
-                    return 0.0
+                    return _FALLBACK_SENTIMENT
             else:
                 logger.warning(
-                    "Gemini returned non-numeric response: %r -- falling back to 0.0", raw
+                    "Gemini returned non-numeric response: %r -- falling back to %.1f",
+                    raw,
+                    _FALLBACK_SENTIMENT,
                 )
-                return 0.0
+                return _FALLBACK_SENTIMENT
         score = max(-1.0, min(1.0, score))
         logger.info(
             "Gemini sentiment score=%.4f (headlines=%d)", score, len(headlines)
         )
         return score
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Gemini API error (%s): %s – falling back to 0.0",
-            type(exc).__name__,
-            exc,
-        )
-        return 0.0
+        # Distinguish rate-limit (HTTP 429) from other API failures for clarity.
+        if isinstance(exc, _ResourceExhausted):
+            logger.warning(
+                "Gemini API rate-limited (HTTP 429) – falling back to %.1f.  "
+                "The bot will retry on the next sentiment refresh cycle.",
+                _FALLBACK_SENTIMENT,
+            )
+        else:
+            logger.warning(
+                "Gemini API error (%s): %s – falling back to %.1f",
+                type(exc).__name__,
+                exc,
+                _FALLBACK_SENTIMENT,
+            )
+        return _FALLBACK_SENTIMENT
