@@ -503,9 +503,15 @@ class PaperExecutor:
             except (CcxtAuthenticationError, CcxtExchangeError, CcxtInsufficientFunds, CcxtNetworkError):
                 logger.exception(
                     "Failed to place Binance Futures buy order for %s – "
-                    "position recorded in paper simulation only.",
+                    "rolling back balance deduction and aborting trade.",
                     sym,
                 )
+                # Roll back the balance deduction and open-position counter that
+                # were applied before the order attempt.  No paper position should
+                # be recorded because no real order was submitted successfully.
+                self._risk.credit(position_size)
+                self._risk.register_close()
+                return False
 
         trade_id = await self._db.insert_open_trade(
             symbol=sym,
