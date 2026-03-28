@@ -309,7 +309,7 @@ async def gemini_sentiment_refresher(
                     await db.insert_sentiment(
                         headline=f"[Gemini batch: {len(headlines)} headlines]",
                         sentiment_score=score,
-                        source="gemini-1.5-flash",
+                        source="gemini-2.5-flash",
                         timestamp=ts,
                     )
                 except Exception as exc:  # noqa: BLE001

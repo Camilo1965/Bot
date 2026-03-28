@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 FEED_URLS: Final[list[str]] = [
     "https://cointelegraph.com/rss",
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cryptoslate.com/feed/",
+    "https://decrypt.co/feed",
 ]
 
 #: Maximum number of headlines to collect per feed.

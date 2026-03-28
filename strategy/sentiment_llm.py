@@ -2,7 +2,7 @@
 strategy.sentiment_llm
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Scores crypto-news headlines using Google's Gemini LLM (``gemini-1.5-flash``).
+Scores crypto-news headlines using Google's Gemini LLM (``gemini-2.5-flash``).
 
 The model acts as an expert crypto quantitative analyst and returns a single
 float in **[-1.0, +1.0]**:
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 from google import genai
 from google.genai import types
@@ -44,30 +45,38 @@ _SYSTEM_INSTRUCTION = (
     "\n"
     "Output:\n"
     "- Return ONLY one float in [-1.0, 1.0].\n"
-    "- -1.0 = extreme bearish/panic, 1.0 = extreme bullish/euphoria.\n"
-    "- No text, no markdown, no units, no explanation.\n"
+    "- -1.0 = extreme bearish/panic, 0.0 = neutral/no impact, 1.0 = extreme bullish/euphoria.\n"
+    "- No text, no markdown, no units, no explanation — ONLY the bare float.\n"
     "\n"
-    "Input normalization:\n"
-    "- Lowercase, strip accents, map leetspeak (4→a, 0→o, 3→e, 1→i, 5→s).\n"
+    "Scoring scale (objective, symmetric):\n"
+    "- Use the FULL range symmetrically: positive events score positively, negative events score negatively.\n"
+    "- +0.7 to +1.0: major bullish catalysts (ETF approval, institutional mass adoption, rate cut, major upgrade).\n"
+    "- +0.3 to +0.6: moderate bullish (positive regulation news, L2 launch, big partnership, exchange listing).\n"
+    "- -0.1 to +0.2: mildly bullish or neutral market noise.\n"
+    "- -0.2 to -0.4: moderate bearish (uncertain regulation, minor exploit, macro headwind).\n"
+    "- -0.5 to -1.0: major bearish catalysts (exchange hack/collapse, ETF denial, major law enforcement action, chain halt).\n"
     "\n"
-    "Priority weighting (in order):\n"
-    "1) Regulatory/institutional: SEC/CFTC/ETF approvals/denials, lawsuits, settlements, enforcement, exchange license actions.\n"
-    "2) Security events: hacks, exploits, chain halts, exchange freezes/delistings, bridge/rugpulls.\n"
-    "3) Macroeconomic: CPI/FED/ECB rate decisions, liquidity programs, payrolls; risk-on/off transmission to crypto.\n"
-    "4) Infra/corporate: major chain upgrades/forks, L2 launches, big integrations/listings, major VC raises for core infra.\n"
-    "5) Downweight/ignore: influencer opinions, generic clickbait, vague/\"rumor\"/\"alleged\"/\"reportedly\", non-crypto topics.\n"
-    "\n"
-    "Asset-specific:\n"
-    "- If clearly tied to one asset (e.g., SOL outage), bias the score to that asset's likely move but still emit a single scalar for overall majors' momentum.\n"
+    "Event weighting (by IMPACT MAGNITUDE – both positive and negative apply equally):\n"
+    "1) Regulatory/institutional — both bullish (ETF approval, legal clarity, institutional adoption) and\n"
+    "   bearish (enforcement action, exchange shutdown, lawsuit) events carry high weight.\n"
+    "2) Security events — exchange hacks/collapses are bearish; successful audits/upgrades are bullish.\n"
+    "3) Macroeconomic — risk-on events (rate cuts, liquidity injections) are bullish;\n"
+    "   risk-off (rate hikes, recession signals) are bearish.\n"
+    "4) Infrastructure/corporate — major protocol upgrades, big integrations, or large VC funding are bullish;\n"
+    "   forks/splits, major bugs, or project failures are bearish.\n"
+    "5) Ignore/downweight: influencer opinions, generic clickbait, vague rumors, non-crypto topics.\n"
     "\n"
     "Conflict resolution:\n"
-    "- If headlines conflict, weight higher the regulatory/security items; do not average blindly.\n"
+    "- When headlines conflict, weight by IMPACT MAGNITUDE, not by category.\n"
+    "- A confirmed ETF approval outweighs a minor exploit; a major exchange collapse outweighs a routine upgrade.\n"
+    "- Do NOT systematically bias toward negative events — positive and negative catalysts of equal magnitude deserve equal weight.\n"
     "\n"
-    "Off-topic/too vague:\n"
-    "- If insufficient signal, return 0.0.\n"
+    "Off-topic/insufficient signal:\n"
+    "- If headlines provide no actionable price signal, return 0.0.\n"
     "\n"
-    "Safety/consistency guard:\n"
-    "- Never return text, NaN, or values outside [-1.0, 1.0]."
+    "Consistency guard:\n"
+    "- Never return text, NaN, or values outside [-1.0, 1.0].\n"
+    "- Return ONLY the bare float value, nothing else."
 )
 
 _client: genai.Client | None = None
@@ -101,7 +110,19 @@ def get_gemini_sentiment(headlines: list[str]) -> float:
     if not headlines:
         return 0.0
 
+    if len(headlines) < 5:
+        logger.warning(
+            "Low headline count (%d) – sentiment signal may be unreliable; "
+            "consider checking news feed availability.",
+            len(headlines),
+        )
+
     prompt = "\n".join(f"- {h}" for h in headlines)
+    logger.debug(
+        "[LLM] Sending %d headline(s) to Gemini:\n%s",
+        len(headlines),
+        prompt,
+    )
     try:
         client = _get_client()
         response = client.models.generate_content(
@@ -112,11 +133,30 @@ def get_gemini_sentiment(headlines: list[str]) -> float:
             ),
         )
         raw = response.text.strip()
+        logger.debug("[LLM] Gemini raw response: %r", raw[:200])
         try:
             score = float(raw)
         except ValueError:
-            logger.warning("Gemini returned non-numeric response: %r -- falling back to 0.0", raw)
-            return 0.0
+            # Gemini occasionally returns a brief explanation alongside the number
+            # (e.g. thinking-model output).  Extract the LAST numeric token so we
+            # skip any leading counts/dates in the text (e.g. "Based on 5 headlines…").
+            matches = re.findall(r"[-+]?\d*\.?\d+", raw)
+            if matches:
+                try:
+                    score = float(matches[-1])
+                    logger.debug(
+                        "[LLM] Extracted float %s from verbose response via regex.", matches[-1]
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Gemini returned non-numeric response: %r -- falling back to 0.0", raw
+                    )
+                    return 0.0
+            else:
+                logger.warning(
+                    "Gemini returned non-numeric response: %r -- falling back to 0.0", raw
+                )
+                return 0.0
         score = max(-1.0, min(1.0, score))
         logger.info(
             "Gemini sentiment score=%.4f (headlines=%d)", score, len(headlines)
