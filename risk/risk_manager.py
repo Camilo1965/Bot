@@ -47,6 +47,16 @@ day, all new trades are blocked for 24 hours.  Call
 :meth:`reset_daily_stats` once a day (e.g. at midnight UTC) to lift the
 block and refresh the reference balance.
 
+Portfolio drawdown circuit-breaker
+-----------------------------------
+A second, session-level safety net protects the starting capital from
+"black swan" events.  If the running balance ever falls more than
+``MAX_PORTFOLIO_DD_PCT`` (15 %) below the balance recorded at
+instantiation time, :meth:`is_portfolio_dd_exceeded` returns *True* and
+all new positions are permanently blocked for that session.  Unlike the
+daily-loss halt this guard is **not** reset at midnight – it requires a
+deliberate bot restart with fresh capital to resume trading.
+
 Multi-asset risk controls:
 
 * ``max_positions`` limits the number of simultaneously open positions.
@@ -77,6 +87,9 @@ MAX_DAILY_LOSS_PCT: float = 0.03    # 3 % maximum daily loss before halting
 _HALT_DURATION: timedelta = timedelta(hours=24)
 
 MAX_POSITIONS: int = 3          # Maximum simultaneous open positions
+
+# ── Portfolio drawdown circuit-breaker ───────────────────────────────────────
+MAX_PORTFOLIO_DD_PCT: float = 0.15  # 15 % max peak-to-trough loss from initial balance
 
 # ── Sector / correlation-group mapping ────────────────────────────────────────
 # Used by :func:`get_sector` and :meth:`RiskManager.is_sector_exposed` to
@@ -228,6 +241,9 @@ class RiskManager:
         self.balance: float = initial_balance
         self.max_positions: int = max_positions
         self._open_count: int = 0
+        # Portfolio drawdown circuit-breaker – fixed reference, never modified
+        self._initial_balance: float = initial_balance
+        self._portfolio_dd_floor: float = initial_balance * (1.0 - MAX_PORTFOLIO_DD_PCT)
         # Daily-loss tracking
         self._daily_start_balance: float = initial_balance
         self._daily_loss: float = 0.0
@@ -308,6 +324,35 @@ class RiskManager:
             self._trading_halted_until = None
             return False
         return True
+
+    # ------------------------------------------------------------------
+    # Portfolio drawdown circuit-breaker
+    # ------------------------------------------------------------------
+
+    def is_portfolio_dd_exceeded(self) -> bool:
+        """Return *True* when the account has lost more than ``MAX_PORTFOLIO_DD_PCT``
+        of the balance recorded at instantiation time.
+
+        This session-level guard fires on "black swan" events (e.g. a flash
+        crash that triggers multiple stop-losses in quick succession).  Unlike
+        the daily-loss halt it is **not** auto-lifted at midnight; a bot
+        restart with fresh capital is required to resume trading.
+
+        For a $50 live account the default 15 % threshold corresponds to a
+        $7.50 maximum tolerable loss before the engine goes fully defensive.
+        """
+        if self.balance < self._portfolio_dd_floor:
+            logger.critical(
+                "🚨 [CIRCUIT BREAKER] Portfolio drawdown limit breached – "
+                "balance=%.2f initial=%.2f threshold=%.0f%% (floor=%.2f). "
+                "All new positions BLOCKED for this session.",
+                self.balance,
+                self._initial_balance,
+                MAX_PORTFOLIO_DD_PCT * 100,
+                self._portfolio_dd_floor,
+            )
+            return True
+        return False
 
     def record_daily_loss(self, loss: float) -> None:
         """Accumulate a realised loss and trigger the safety break if needed.

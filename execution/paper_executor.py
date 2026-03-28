@@ -581,6 +581,7 @@ class PaperExecutor:
         Returns *False* (and does nothing) if:
 
         * Trading is currently halted due to the daily loss limit.
+        * The portfolio drawdown circuit-breaker has been triggered.
         * A position for *symbol* is already open.
         * The maximum number of concurrent positions has been reached.
         * The simulated balance is insufficient.
@@ -612,6 +613,15 @@ class PaperExecutor:
         if self._risk.is_trading_halted():
             logger.warning(
                 "⚠️ [ALERTA] Trading detenido por límite de pérdida diaria (symbol=%s) %s",
+                sym,
+                _DEBUG_LOG_HINT,
+            )
+            return False
+
+        if self._risk.is_portfolio_dd_exceeded():
+            logger.warning(
+                "🚨 [CIRCUIT BREAKER] Todas las nuevas posiciones bloqueadas – "
+                "límite de drawdown de cartera alcanzado (symbol=%s) %s",
                 sym,
                 _DEBUG_LOG_HINT,
             )
