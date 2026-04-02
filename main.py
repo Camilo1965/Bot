@@ -46,7 +46,7 @@ from data_ingestion.news_scraper import fetch_crypto_headlines
 from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
 from execution.binance_executor import create_exchange, fetch_open_positions, fetch_total_wallet_balance
-from execution.mt5_executor import MT5Executor, initialize_mt5, shutdown_mt5
+from execution.mt5_executor import MT5Executor, fetch_mt5_account_balance, initialize_mt5, shutdown_mt5
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE, RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor, compute_htf_trend
@@ -1395,6 +1395,23 @@ async def main() -> None:
                         initial_balance,
                     )
                     execution_mode = "paper"
+                else:
+                    # Fetch the real account balance from the connected MT5 terminal
+                    # so that RiskManager is seeded with the actual capital, not the
+                    # hardcoded 10 000 USDT default.
+                    mt5_balance = fetch_mt5_account_balance()
+                    if mt5_balance is not None and mt5_balance > 0.0:
+                        initial_balance = mt5_balance
+                        logger.info(
+                            "✅ [MT5] Account balance fetched: %.2f USDT",
+                            initial_balance,
+                        )
+                    else:
+                        logger.warning(
+                            "⚠️ [MT5] Could not fetch account balance – "
+                            "using default %.2f USDT.",
+                            initial_balance,
+                        )
 
     if execution_mode != "mt5" and use_testnet:
         # USE_BINANCE_TESTNET takes priority over PAPER_TRADING.
@@ -1466,19 +1483,27 @@ async def main() -> None:
             "✅ [MT5] MT5Executor initialised in LIVE mode – "
             "orders will be sent to MetaTrader 5."
         )
+        asyncio.create_task(
+            send_telegram_alert(
+                f"✅ *ClawdBot [MT5 LIVE]* conectado\n"
+                f"Servidor: `{mt5_server}` | Login: `{mt5_login}`\n"
+                f"Balance: *{initial_balance:,.2f} USDT*"
+            )
+        )
     else:
         paper_executor = PaperExecutor(db=db, risk_manager=risk_manager, exchange=exchange_client)
 
     # ------------------------------------------------------------------
-    # [SYNC] Re-sync open positions from Binance on restart
+    # [SYNC] Re-sync open positions from exchange on restart
     # ------------------------------------------------------------------
     # When the bot restarts it must not assume all positions are closed.
-    # Fetch the actual open positions from Binance and restore them in
-    # the local PaperExecutor/RiskManager state so that:
+    # Fetch the actual open positions and restore them in the local
+    # PaperExecutor/RiskManager state so that:
     #   - `can_open_position()` returns the correct headroom.
     #   - The per-symbol duplicate guard in `try_open_trade()` works.
-    # NOTE: the balance was fetched from Binance above and already reflects
-    # the margin tied up in open positions, so no further deduction is made.
+    # NOTE: the balance was fetched from the exchange above and already
+    # reflects the margin tied up in open positions, so no further
+    # deduction is made.
     if exchange_client is not None:
         try:
             existing_positions = await fetch_open_positions(exchange_client)
@@ -1519,11 +1544,39 @@ async def main() -> None:
                 logger.info("🔄 [SYNC] No existing open positions found on Binance.")
         except Exception as exc:  # noqa: BLE001
             logger.warning("⚠️ [SYNC] Could not sync open positions from Binance: %s", exc)
+    elif execution_mode == "mt5" and _mt5_initialized:
+        # ------------------------------------------------------------------
+        # [MT5] Restore positions: load saved local state first, then
+        # reconcile against live MT5 positions to remove any ghosts.
+        # ------------------------------------------------------------------
+        paper_executor.load_state()
+        try:
+            real_count = await paper_executor.sync_positions_with_exchange()
+            if real_count > 0:
+                logger.info(
+                    "✅ [MT5 SYNC] Startup reconcile complete – "
+                    "%d live position(s) confirmed on MT5 "
+                    "(Open positions: %d/%d).",
+                    real_count,
+                    risk_manager.open_count,
+                    risk_manager.max_positions,
+                )
+            else:
+                logger.info(
+                    "🔄 [MT5 SYNC] No live MT5 positions at startup – "
+                    "starting fresh session."
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "⚠️ [MT5 SYNC] Startup position sync failed: %s – "
+                "local state.json will be used as-is.",
+                exc,
+            )
     else:
         # ------------------------------------------------------------------
         # [PAPER] Restore open positions from local state.json (paper trading)
         # ------------------------------------------------------------------
-        # In pure paper-trading mode there is no Binance exchange to query.
+        # In pure paper-trading mode there is no exchange to query.
         # Load the last saved state so that positions survive a bot restart.
         _paper_restored = paper_executor.load_state()
         if _paper_restored == 0:

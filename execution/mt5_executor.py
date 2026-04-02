@@ -305,6 +305,35 @@ def shutdown_mt5() -> None:
         logger.info("[MT5] Connection closed.")
 
 
+def fetch_mt5_account_balance() -> float | None:
+    """Return the current balance of the connected MT5 account.
+
+    Must be called after :func:`initialize_mt5` has returned ``True``.
+    Uses ``mt5.account_info().balance`` (the cash balance, not equity)
+    so that the value is consistent with what Binance returns as the
+    *totalWalletBalance* field in its account-info endpoint.
+
+    Returns
+    -------
+    float | None
+        Account balance in account currency, or ``None`` when MT5 is
+        unavailable or ``mt5.account_info()`` returns ``None``.
+    """
+    if not _MT5_AVAILABLE:
+        return None
+    acct = mt5.account_info()
+    if acct is None:
+        logger.warning("[MT5] account_info() returned None – cannot fetch balance.")
+        return None
+    logger.debug(
+        "[MT5] Account balance=%.2f  equity=%.2f  currency=%s",
+        acct.balance,
+        acct.equity,
+        acct.currency,
+    )
+    return acct.balance
+
+
 # ── Lot size calculation ───────────────────────────────────────────────────────
 
 
