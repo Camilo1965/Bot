@@ -56,9 +56,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import time
 from datetime import datetime, timezone
+from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING, Any
 
 try:
@@ -405,15 +405,23 @@ def calculate_lot_size(
     risk_amount = account_balance * risk_pct
     lots_raw = risk_amount / (sl_distance_price * contract_size)
 
-    # Round DOWN to the nearest volume_step so we never exceed the risk budget.
-    lots_stepped = math.floor(lots_raw / volume_step) * volume_step
+    # Use Decimal arithmetic to avoid floating-point precision errors when
+    # stepping down to the nearest broker volume_step (e.g. 0.12000000001).
+    lots_decimal = Decimal(str(lots_raw))
+    volume_step_decimal = Decimal(str(volume_step))
+    lots_quotient = (lots_decimal / volume_step_decimal).quantize(
+        Decimal(1),
+        rounding=ROUND_DOWN,
+    )
+    lots_stepped = float(lots_quotient * volume_step_decimal)
+
     # Clamp to broker limits.
     lots = max(volume_min, min(volume_max, lots_stepped))
 
     logger.debug(
         "calculate_lot_size: symbol=%s  balance=%.2f  risk_pct=%.4f  "
         "sl_distance=%.4f  contract_size=%.4f  "
-        "lots_raw=%.4f  lots_stepped=%.4f  lots=%.4f",
+        "lots_raw=%.4f  lots_stepped=%.4f (precise)  lots=%.4f",
         symbol,
         account_balance,
         risk_pct,
@@ -480,9 +488,23 @@ class MT5Executor(PaperExecutor):
         # Pass exchange=None so the parent class skips its Binance code paths.
         super().__init__(db=db, risk_manager=risk_manager, symbol=symbol, exchange=None)
         self._live = live
-        self._risk_pct = risk_pct
         self._magic = magic
         self._deviation = deviation
+
+        # Issue 3 – warn if risk_pct exceeds prop-firm safe threshold.
+        if risk_pct > 0.02:
+            logger.warning(
+                "[MT5] ⚠️ RISK ALERT: risk_pct=%.4f exceeds 2%%. "
+                "For prop-firm trading keep risk_pct <= 1%%.",
+                risk_pct,
+            )
+        self._risk_pct = risk_pct
+
+        # Issue 6 – circuit breaker counters to detect MT5 terminal outages.
+        self._mt5_failure_count: int = 0
+        self._mt5_last_failure_time: float = 0.0
+        self._mt5_max_consecutive_failures: int = 10
+        self._mt5_cooldown_seconds: float = 300.0  # 5 minutes
 
     # ------------------------------------------------------------------
     # Spread helper
@@ -508,12 +530,13 @@ class MT5Executor(PaperExecutor):
                 return _SPREAD_BUFFER_FALLBACK
             spread_price = tick.ask - tick.bid
             return spread_price / entry_price if entry_price > 0 else _SPREAD_BUFFER_FALLBACK
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, TimeoutError, AttributeError, TypeError) as exc:
             logger.debug(
-                "_get_spread_fraction: failed to fetch tick for %s (%s) – "
-                "using fallback spread buffer.",
+                "_get_spread_fraction: failed to fetch tick for %s – "
+                "using fallback spread buffer. Error: %s",
                 symbol,
                 exc,
+                exc_info=True,
             )
             return _SPREAD_BUFFER_FALLBACK
 
@@ -587,8 +610,7 @@ class MT5Executor(PaperExecutor):
         broker_sym = SYMBOL_MAP.get(sym)
         if broker_sym is None:
             logger.error(
-                "[MT5] Símbolo no mapeado para MT5: '%s'.  "
-                "Agréguelo a SYMBOL_MAP en mt5_executor.py.",
+                "[MT5] Unmapped symbol: '%s'. Add it to SYMBOL_MAP in mt5_executor.py.",
                 sym,
             )
             return None
@@ -600,7 +622,7 @@ class MT5Executor(PaperExecutor):
         if info is None:
             logger.error(
                 "[MT5] mt5.symbol_info('%s') returned None – "
-                "el símbolo no existe en el servidor del broker.",
+                "symbol does not exist on the broker server.",
                 broker_sym,
             )
             return None
@@ -608,12 +630,12 @@ class MT5Executor(PaperExecutor):
         if not info.visible:
             if not mt5.symbol_select(broker_sym, True):
                 logger.error(
-                    "[MT5] No se pudo agregar '%s' al Market Watch. "
-                    "Añádalo manualmente en MetaTrader 5.",
+                    "[MT5] Could not add '%s' to Market Watch. "
+                    "Add it manually in MetaTrader 5.",
                     broker_sym,
                 )
                 return None
-            logger.info("[MT5] Símbolo '%s' agregado al Market Watch.", broker_sym)
+            logger.info("[MT5] Symbol '%s' added to Market Watch.", broker_sym)
 
         return broker_sym
 
@@ -686,6 +708,225 @@ class MT5Executor(PaperExecutor):
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
+    # ------------------------------------------------------------------
+    # Pre-trade validation helpers (Issues 1, 2, 4)
+    # ------------------------------------------------------------------
+
+    def _validate_stops(
+        self,
+        symbol: str,
+        entry_price: float,
+        sl: float,
+        tp: float = 0.0,
+    ) -> bool:
+        """Check that SL/TP distances satisfy the broker's minimum stops_level.
+
+        MT5 rejects orders with INVALID_STOPS (10016) when the SL or TP is
+        closer to the entry price than ``symbol_info.trade_stops_level`` points.
+        This guard prevents that rejection before the order is ever sent.
+
+        Parameters
+        ----------
+        symbol:
+            Resolved MT5 broker symbol (e.g. ``"BTCUSD-T"``).
+        entry_price:
+            Expected entry price for the order.
+        sl:
+            Absolute stop-loss price.
+        tp:
+            Absolute take-profit price (``0.0`` = no TP check).
+
+        Returns
+        -------
+        bool
+            ``True`` when both SL (and TP if given) are far enough from the
+            entry price, ``False`` otherwise.
+        """
+        if not _MT5_AVAILABLE:
+            return True
+
+        info = mt5.symbol_info(symbol)
+        if not info:
+            logger.error("[MT5] Cannot fetch symbol_info for stops validation on %s.", symbol)
+            return False
+
+        min_distance_price = info.trade_stops_level * info.point
+
+        sl_distance = abs(entry_price - sl)
+        if sl_distance < min_distance_price:
+            logger.error(
+                "[MT5 VALIDATION] SL too close to entry for %s: "
+                "%.2f points required, current distance %.2f points. "
+                "Entry: %.5f | SL: %.5f",
+                symbol,
+                info.trade_stops_level,
+                sl_distance / info.point if info.point > 0 else 0,
+                entry_price,
+                sl,
+            )
+            return False
+
+        if tp > 0.0:
+            tp_distance = abs(entry_price - tp)
+            if tp_distance < min_distance_price:
+                logger.error(
+                    "[MT5 VALIDATION] TP too close to entry for %s: "
+                    "%.2f points required, current distance %.2f points. "
+                    "Entry: %.5f | TP: %.5f",
+                    symbol,
+                    info.trade_stops_level,
+                    tp_distance / info.point if info.point > 0 else 0,
+                    entry_price,
+                    tp,
+                )
+                return False
+
+        logger.debug(
+            "[MT5 VALIDATION] SL/TP OK – min_distance=%.2f pts, "
+            "sl_distance=%.2f pts, tp_distance=%.2f pts",
+            info.trade_stops_level,
+            sl_distance / info.point if info.point > 0 else 0,
+            (abs(entry_price - tp) / info.point if tp > 0 and info.point > 0 else 0),
+        )
+        return True
+
+    def _check_margin_available(self, symbol: str, lots: float, entry_price: float) -> bool:
+        """Verify the account has sufficient free margin to open the trade.
+
+        Prevents MT5 from returning NO_MONEY (10019) by comparing the required
+        margin against the account's current free margin before sending the
+        order.
+
+        Parameters
+        ----------
+        symbol:
+            Resolved MT5 broker symbol (e.g. ``"BTCUSD-T"``).
+        lots:
+            Position size in lots.
+        entry_price:
+            Expected entry price, used as a fallback when ``margin_initial``
+            is not available from the broker.
+
+        Returns
+        -------
+        bool
+            ``True`` when free margin is sufficient, ``False`` otherwise.
+        """
+        if not _MT5_AVAILABLE:
+            return True
+
+        info = mt5.symbol_info(symbol)
+        acct = mt5.account_info()
+
+        if not info:
+            logger.error("[MT5] Cannot fetch symbol_info for margin check on %s.", symbol)
+            return False
+
+        if not acct:
+            logger.error("[MT5] Cannot fetch account_info for margin check.")
+            return False
+
+        margin_per_lot = (
+            info.margin_initial
+            if info.margin_initial > 0
+            else (info.trade_contract_size * entry_price / 100)
+        )
+        margin_required = lots * margin_per_lot
+
+        if acct.margin_free < margin_required:
+            logger.error(
+                "[MT5] INSUFFICIENT MARGIN for %s: "
+                "%.2f required, %.2f available "
+                "(equity=%.2f, balance=%.2f, used=%.2f).",
+                symbol,
+                margin_required,
+                acct.margin_free,
+                acct.equity,
+                acct.balance,
+                acct.margin,
+            )
+            return False
+
+        margin_ratio = (
+            (acct.margin_free - margin_required) / acct.equity
+            if acct.equity > 0
+            else 0.0
+        )
+        if margin_ratio < 0.2:
+            logger.warning(
+                "[MT5] Margin is tight after this trade: %.1f%% of equity remaining. "
+                "Consider reducing position size.",
+                margin_ratio * 100,
+            )
+
+        logger.debug(
+            "[MT5] Margin OK – required=%.2f, free=%.2f, post_trade_ratio=%.1f%%",
+            margin_required,
+            acct.margin_free,
+            margin_ratio * 100,
+        )
+        return True
+
+    def _validate_tick_freshness(
+        self,
+        tick: Any,
+        symbol: str,
+        max_age_seconds: float = 5.0,
+    ) -> bool:
+        """Reject a tick that is stale or has invalid bid/ask prices.
+
+        Guards against entering at a bad price when the MT5 terminal has not
+        yet received a fresh quote from the broker (e.g. immediately after
+        market open or a connection drop).
+
+        Parameters
+        ----------
+        tick:
+            ``TickInfo`` object returned by ``mt5.symbol_info_tick()``, or
+            ``None`` if the call failed.
+        symbol:
+            MT5 symbol name, used only for log messages.
+        max_age_seconds:
+            Maximum acceptable age of the tick in seconds (default: 5 s).
+
+        Returns
+        -------
+        bool
+            ``True`` when the tick is valid and fresh, ``False`` otherwise.
+        """
+        if tick is None:
+            logger.error("[MT5] Tick is None for %s – cannot validate freshness.", symbol)
+            return False
+
+        if tick.ask <= 0 or tick.bid <= 0:
+            logger.error(
+                "[MT5] Invalid tick prices for %s: bid=%.5f, ask=%.5f",
+                symbol,
+                tick.bid,
+                tick.ask,
+            )
+            return False
+
+        tick_age = time.time() - tick.time
+        if tick_age > max_age_seconds:
+            logger.error(
+                "[MT5] Stale tick for %s: %.1f s old (max: %.1f s).",
+                symbol,
+                tick_age,
+                max_age_seconds,
+            )
+            return False
+
+        logger.debug(
+            "[MT5] Tick fresh for %s: age=%.2f s, bid=%.5f, ask=%.5f, spread=%.5f",
+            symbol,
+            tick_age,
+            tick.bid,
+            tick.ask,
+            tick.ask - tick.bid,
+        )
+        return True
+
     def _send_order(self, request: dict) -> Any | None:
         """Send an order via ``mt5.order_send`` and log the result.
 
@@ -739,6 +980,11 @@ class MT5Executor(PaperExecutor):
         :data:`_RETRYABLE_RETCODES` (e.g. requote, price changed, connection
         error).  Each attempt waits an increasing back-off before retrying.
 
+        A circuit breaker prevents hammering the broker when the MT5 terminal
+        is down: after ``_mt5_max_consecutive_failures`` consecutive failures
+        the executor pauses for ``_mt5_cooldown_seconds`` before accepting
+        new orders.  The counter resets on the first successful order.
+
         Parameters
         ----------
         request:
@@ -751,6 +997,28 @@ class MT5Executor(PaperExecutor):
         Any | None
             The ``order_send`` result on success, or ``None`` on final failure.
         """
+        # Issue 6 – circuit breaker: refuse new orders while terminal is down.
+        if self._mt5_failure_count >= self._mt5_max_consecutive_failures:
+            elapsed = time.time() - self._mt5_last_failure_time
+            if elapsed < self._mt5_cooldown_seconds:
+                remaining = self._mt5_cooldown_seconds - elapsed
+                logger.error(
+                    "[MT5 CIRCUIT BREAKER] Too many consecutive failures (%d). "
+                    "System paused for %.0f s. Retry in %.0f s.",
+                    self._mt5_failure_count,
+                    self._mt5_cooldown_seconds,
+                    remaining,
+                )
+                return None
+            else:
+                # Cooldown expired – reset and allow a new attempt.
+                logger.info(
+                    "[MT5 CIRCUIT BREAKER] Cooldown expired. "
+                    "Resetting failure counter (was %d).",
+                    self._mt5_failure_count,
+                )
+                self._mt5_failure_count = 0
+
         if not _MT5_AVAILABLE:
             return None
 
@@ -758,11 +1026,14 @@ class MT5Executor(PaperExecutor):
             result = mt5.order_send(request)
 
             if result is None:
+                self._mt5_failure_count += 1
+                self._mt5_last_failure_time = time.time()
                 logger.error(
-                    "mt5.order_send returned None (attempt %d/%d) for %s. "
+                    "mt5.order_send returned None (attempt %d/%d, failure_count=%d) for %s. "
                     "Last error: %s",
                     attempt,
                     max_retries,
+                    self._mt5_failure_count,
                     request.get("symbol"),
                     mt5.last_error(),
                 )
@@ -772,10 +1043,21 @@ class MT5Executor(PaperExecutor):
 
             _log_mt5_retcode(
                 result.retcode,
-                context=f"attempt {attempt}/{max_retries}  symbol={request.get('symbol')}",
+                context=(
+                    f"attempt {attempt}/{max_retries}  symbol={request.get('symbol')}  "
+                    f"failure_count={self._mt5_failure_count}"
+                ),
             )
 
             if result.retcode == mt5.TRADE_RETCODE_DONE:
+                # Success – reset circuit breaker counter.
+                if self._mt5_failure_count > 0:
+                    logger.info(
+                        "[MT5] Order succeeded – resetting failure counter (was %d).",
+                        self._mt5_failure_count,
+                    )
+                self._mt5_failure_count = 0
+
                 action = request.get("action")
                 if action == mt5.TRADE_ACTION_SLTP:
                     logger.info(
@@ -798,18 +1080,28 @@ class MT5Executor(PaperExecutor):
                 return result
 
             if result.retcode in _RETRYABLE_RETCODES and attempt < max_retries:
+                self._mt5_failure_count += 1
+                self._mt5_last_failure_time = time.time()
                 back_off = 0.5 * attempt
                 logger.warning(
-                    "[MT5] Transient error for %s (attempt %d/%d) – "
+                    "[MT5] Transient error for %s (attempt %d/%d, failure_count=%d) – "
                     "retrying in %.1f s...",
                     request.get("symbol"),
                     attempt,
                     max_retries,
+                    self._mt5_failure_count,
                     back_off,
                 )
                 await asyncio.sleep(back_off)
             else:
-                return None  # Non-retryable failure or final attempt exhausted.
+                self._mt5_failure_count += 1
+                self._mt5_last_failure_time = time.time()
+                logger.error(
+                    "[MT5] Non-retryable error or final attempt exhausted "
+                    "(failure_count=%d).",
+                    self._mt5_failure_count,
+                )
+                return None
 
         return None
 
@@ -849,15 +1141,15 @@ class MT5Executor(PaperExecutor):
         # ── Duplicate and circuit-breaker checks (inherited logic) ─────────
         if self._risk.is_trading_halted():
             logger.warning(
-                "⚠️ [ALERTA] Trading detenido por límite de pérdida diaria (symbol=%s)",
+                "⚠️ [ALERT] Trading halted due to daily loss limit (symbol=%s).",
                 sym,
             )
             return False
 
         if self._risk.is_portfolio_dd_exceeded():
             logger.warning(
-                "🚨 [CIRCUIT BREAKER] Todas las nuevas posiciones bloqueadas – "
-                "límite de drawdown de cartera alcanzado (symbol=%s)",
+                "🚨 [CIRCUIT BREAKER] All new positions blocked – "
+                "portfolio drawdown limit reached (symbol=%s).",
                 sym,
             )
             return False
@@ -876,8 +1168,8 @@ class MT5Executor(PaperExecutor):
         if self._risk.is_sector_exposed(sym, list(self.open_positions.keys())):
             sector = get_sector(sym)
             logger.warning(
-                "🛡️ [RISK CONTROL] Señal de BUY para %s ignorada. "
-                "Exposición máxima alcanzada para el sector: %s.",
+                "🛡️ [RISK CONTROL] BUY signal for %s ignored – "
+                "maximum sector exposure reached: %s.",
                 sym,
                 sector,
             )
@@ -886,7 +1178,7 @@ class MT5Executor(PaperExecutor):
         position_size = self._risk.calculate_position_size(win_probability)
         if not self._risk.has_sufficient_balance(position_size):
             logger.warning(
-                "⚠️ [ALERTA] Balance insuficiente (%.2f) para tamaño de posición %.2f",
+                "⚠️ [ALERT] Insufficient balance (%.2f) for position size %.2f.",
                 self._risk.balance,
                 position_size,
             )
@@ -950,6 +1242,13 @@ class MT5Executor(PaperExecutor):
             digits: int = sym_info.digits if sym_info else 5
             stop_loss_price = self._normalize_price(stop_loss_price, digits)
 
+            # Issue 1 – validate SL distance against broker stops_level.
+            if not self._validate_stops(mt5_sym, entry_price, stop_loss_price):
+                logger.error("[MT5] Stop validation failed – aborting trade for %s.", sym)
+                self._risk.credit(position_size)
+                self._risk.register_close()
+                return False
+
             # Fetch account equity from MT5 for lot-size calculation.
             acct = mt5.account_info()
             account_equity: float = acct.equity if acct else self._risk.balance
@@ -961,9 +1260,22 @@ class MT5Executor(PaperExecutor):
                 risk_pct=self._risk_pct,
             )
 
-            # Fetch latest ask price for the BUY order.
+            # Issue 2 – verify sufficient margin before sending the order.
+            if not self._check_margin_available(mt5_sym, lots, entry_price):
+                logger.error("[MT5] Margin check failed – aborting trade for %s.", sym)
+                self._risk.credit(position_size)
+                self._risk.register_close()
+                return False
+
+            # Issue 4 – reject stale tick prices before entering.
             tick = mt5.symbol_info_tick(mt5_sym)
-            ask_price = self._normalize_price(tick.ask if tick else entry_price, digits)
+            if not self._validate_tick_freshness(tick, mt5_sym, max_age_seconds=5.0):
+                logger.error("[MT5] Tick freshness check failed – aborting trade for %s.", sym)
+                self._risk.credit(position_size)
+                self._risk.register_close()
+                return False
+
+            ask_price = self._normalize_price(tick.ask, digits)
 
             request = self._build_buy_request(
                 symbol=mt5_sym,
@@ -1013,7 +1325,7 @@ class MT5Executor(PaperExecutor):
 
         if sl_distance is not None:
             logger.info(
-                "✅ [OPEN LONG] %s a %.2f. SL Dinámico (ATR): %.2f (Distancia: %.2f)",
+                "✅ [OPEN LONG] %s at %.2f. Dynamic SL (ATR): %.2f (distance: %.2f).",
                 sym,
                 entry_price,
                 stop_loss_price,
@@ -1021,8 +1333,8 @@ class MT5Executor(PaperExecutor):
             )
         else:
             logger.info(
-                "🚀 [ENTRADA] %s | Lado: BUY | Confianza: %.1f%% | "
-                "SL: %.2f%% | TP activ.: %.2f%%",
+                "🚀 [ENTRY] %s | Side: BUY | Confidence: %.1f%% | "
+                "SL: %.2f%% | TP activation: %.2f%%.",
                 sym,
                 win_probability * 100,
                 thresholds.sl_pct * 100,
@@ -1085,9 +1397,10 @@ class MT5Executor(PaperExecutor):
                         symbol,
                     )
                 else:
-                    # Find the MT5 position ticket for this symbol tagged with our magic.
+                    # Find all MT5 positions for this symbol tagged with our magic.
                     mt5_positions = mt5.positions_get(symbol=mt5_sym)
                     if mt5_positions:
+                        closed_count = 0
                         for mt5_pos in mt5_positions:
                             if mt5_pos.magic != self._magic:
                                 continue
@@ -1103,14 +1416,35 @@ class MT5Executor(PaperExecutor):
                                 position_id=mt5_pos.ticket,
                             )
                             result = await self._send_order_with_retry(request)
-                            if result is None:
+                            if result is not None:
+                                closed_count += 1
+                                logger.info(
+                                    "[MT5] Position closed: ticket=%d, symbol=%s.",
+                                    mt5_pos.ticket,
+                                    symbol,
+                                )
+                            else:
                                 logger.error(
                                     "MT5 close order rejected for %s (ticket=%d) – "
-                                    "removing from local state anyway to avoid ghost positions.",
+                                    "position will still be removed from local state "
+                                    "by the paper book-keeping below.",
                                     symbol,
                                     mt5_pos.ticket,
                                 )
-                            break
+
+                        if closed_count == 0:
+                            logger.warning(
+                                "[MT5] No positions closed for %s with magic=%d.",
+                                symbol,
+                                self._magic,
+                            )
+                        elif closed_count > 1:
+                            logger.warning(
+                                "[MT5] Closed %d positions for %s (expected 1) – "
+                                "possible overlap after restart.",
+                                closed_count,
+                                symbol,
+                            )
                     else:
                         logger.warning(
                             "[MT5] No open position found for %s with magic=%d – "
@@ -1328,7 +1662,7 @@ class MT5Executor(PaperExecutor):
     # Market data extraction
     # ------------------------------------------------------------------
 
-    def fetch_candles(
+    async def fetch_candles(
         self,
         symbol: str,
         timeframe: int = TIMEFRAME_M15,
@@ -1336,6 +1670,10 @@ class MT5Executor(PaperExecutor):
         start_pos: int = 0,
     ) -> "pd.DataFrame | None":
         """Fetch OHLCV candles from the MT5 terminal as a pandas DataFrame.
+
+        The synchronous ``mt5.copy_rates_from_pos`` call is offloaded to a
+        thread-pool executor via :func:`asyncio.get_event_loop().run_in_executor`
+        so it does not block the event loop while waiting for the MT5 terminal.
 
         Parameters
         ----------
@@ -1370,7 +1708,24 @@ class MT5Executor(PaperExecutor):
         if mt5_sym is None:
             return None
 
-        rates = mt5.copy_rates_from_pos(mt5_sym, timeframe, start_pos, count)
+        loop = asyncio.get_event_loop()
+        try:
+            rates = await loop.run_in_executor(
+                None,
+                mt5.copy_rates_from_pos,
+                mt5_sym,
+                timeframe,
+                start_pos,
+                count,
+            )
+        except (OSError, TimeoutError, AttributeError, TypeError) as exc:
+            logger.error(
+                "fetch_candles: mt5.copy_rates_from_pos failed for %s: %s",
+                mt5_sym,
+                exc,
+            )
+            return None
+
         if rates is None or len(rates) == 0:
             logger.warning(
                 "fetch_candles: mt5.copy_rates_from_pos returned no data for %s "
@@ -1385,8 +1740,12 @@ class MT5Executor(PaperExecutor):
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
         return df
 
-    def fetch_tick(self, symbol: str) -> dict | None:
+    async def fetch_tick(self, symbol: str) -> dict | None:
         """Return the latest bid and ask prices for *symbol*.
+
+        The synchronous ``mt5.symbol_info_tick`` call is offloaded to a
+        thread-pool executor via :func:`asyncio.get_event_loop().run_in_executor`
+        so it does not block the event loop.
 
         Parameters
         ----------
@@ -1408,7 +1767,13 @@ class MT5Executor(PaperExecutor):
         if mt5_sym is None:
             return None
 
-        tick = mt5.symbol_info_tick(mt5_sym)
+        loop = asyncio.get_event_loop()
+        try:
+            tick = await loop.run_in_executor(None, mt5.symbol_info_tick, mt5_sym)
+        except (OSError, TimeoutError, AttributeError, TypeError) as exc:
+            logger.error("fetch_tick: mt5.symbol_info_tick failed for %s: %s", mt5_sym, exc)
+            return None
+
         if tick is None:
             logger.warning("fetch_tick: mt5.symbol_info_tick('%s') returned None.", mt5_sym)
             return None
