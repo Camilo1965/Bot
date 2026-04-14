@@ -68,37 +68,38 @@ _RESET  = "\033[0m"
 # ── Mega-Dashboard state ─────────────────────────────────────────────────────
 _BOT_START_TIME: datetime | None = None
 _DASHBOARD_EVENTS: deque[str] = deque(maxlen=5)
+_GEMINI_ENABLED: bool = False
 
 
 def _check_env() -> None:
-    """Validate required environment variables before the bot starts.
+    """Validate environment variables before the bot starts.
 
     * Verifies that a ``.env`` file exists next to this module.
-    * Confirms that ``GEMINI_API_KEY`` is set and non-empty.
-
-    On failure a human-readable, colorized message is printed to *stderr* and
-    the process exits with code 1 so no messy traceback reaches the user.
+    * Detects whether ``GEMINI_API_KEY`` is set and non-empty.
+    * Runs in degraded mode when Gemini credentials are missing.
     """
+    global _GEMINI_ENABLED  # noqa: PLW0603
     env_path = Path(__file__).parent / ".env"
     if not env_path.exists():
         print(
-            f"\n{_BOLD}{_RED}⚠️  ERROR:{_RESET}{_RED} .env file not found.{_RESET}\n"
+            f"\n{_BOLD}{_YELLOW}⚠️  WARNING:{_RESET}{_YELLOW} .env file not found.{_RESET}\n"
             f"  Please copy {_YELLOW}.env.example{_RESET} to {_YELLOW}.env{_RESET}"
             " and fill in your credentials:\n"
             f"    cp .env.example .env\n"
-            f"  Then set {_BOLD}GEMINI_API_KEY{_RESET} inside .env.\n",
+            "  Running with current process environment variables.\n",
             file=sys.stderr,
         )
-        sys.exit(1)
 
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not gemini_key:
+    _GEMINI_ENABLED = bool(gemini_key)
+    if not _GEMINI_ENABLED:
         print(
-            f"\n{_BOLD}{_RED}⚠️  ERROR:{_RESET}{_RED} GEMINI_API_KEY is missing or empty.{_RESET}\n"
+            f"\n{_BOLD}{_YELLOW}⚠️  WARNING:{_RESET}{_YELLOW} GEMINI_API_KEY is missing or empty.{_RESET}\n"
             f"  Open your {_YELLOW}.env{_RESET} file and add:\n"
             f"    {_BOLD}GEMINI_API_KEY=your_gemini_api_key_here{_RESET}\n"
             f"  You can obtain a free key at "
-            f"{_YELLOW}https://aistudio.google.com/app/apikey{_RESET}\n",
+            f"{_YELLOW}https://aistudio.google.com/app/apikey{_RESET}\n"
+            "  Bot will run in degraded mode with neutral sentiment.\n",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -340,6 +341,7 @@ async def market_consumer(
     _last_price_log: dict[str, float] = {}  # symbol → last log timestamp (monotonic)
     while True:
         message = await market_queue.get()
+        state["last_market_message_at"] = datetime.now(tz=timezone.utc)
         symbol: str = message.get("symbol", "BTC/USDT")
 
         if message.get("type") == "trade":
@@ -675,7 +677,7 @@ async def signal_emitter(
                         entry_price=entry_price,
                         win_probability=win_prob,
                         symbol=symbol,
-                        sentiment_score=sentiment,
+                        sentiment_score=effective_sentiment,
                         current_atr=current_atr,
                     )
                     if not opened:
@@ -1049,6 +1051,9 @@ def generate_dashboard(
 
     # ── Footer: Risk & Wallet + Events Log ──────────────────────────────────
     n_pos = len(paper_executor.open_positions)
+    pending_closes = sum(
+        1 for p in paper_executor.open_positions.values() if getattr(p, "close_pending", False)
+    )
     balance = risk_manager.balance
     total_pnl = paper_executor.total_pnl
     max_drawdown: float = state.get("max_drawdown", 0.0)
@@ -1076,7 +1081,10 @@ def generate_dashboard(
     risk_text.append("📉 Max Drawdown:      ", style="dim")
     risk_text.append(f"{max_drawdown:>+12.4f} USDT\n", style=f"bold {dd_color}")
     risk_text.append("🔄 Posiciones:        ", style="dim")
-    risk_text.append(f"{n_pos}/{risk_manager.max_positions}", style="bold white")
+    risk_text.append(f"{n_pos}/{risk_manager.max_positions}\n", style="bold white")
+    risk_text.append("⏳ Cierres pendientes:", style="dim")
+    pending_style = "bold bright_red" if pending_closes > 0 else "bold bright_green"
+    risk_text.append(f"{pending_closes}", style=pending_style)
 
     risk_panel = Panel(
         risk_text,
@@ -1101,7 +1109,33 @@ def generate_dashboard(
         box=rich_box.ROUNDED,
     )
 
-    footer = Columns([risk_panel, events_panel], equal=True)
+    # Operations panel (live positions and pending-close status)
+    ops_text = Text()
+    if paper_executor.open_positions:
+        for sym, pos in list(paper_executor.open_positions.items())[:4]:
+            px_buf = state.get("prices", {}).get(sym, [])
+            mark = float(px_buf[-1]) if px_buf else pos.entry_price
+            qty = pos.position_size / pos.entry_price if pos.entry_price > 0 else 0.0
+            unrl = (mark - pos.entry_price) * qty
+            pnl_color = "bright_green" if unrl >= 0 else "bright_red"
+            pending = getattr(pos, "close_pending", False)
+            status = "[red]PENDING_CLOSE[/red]" if pending else "[green]OPEN[/green]"
+            ops_text.append_text(
+                Text.from_markup(
+                    f"{sym:<10} {status}  PnL [{pnl_color}]{unrl:+.2f}[/{pnl_color}]\n"
+                )
+            )
+    else:
+        ops_text.append_text(Text.from_markup("[dim]Sin posiciones abiertas[/dim]"))
+
+    ops_panel = Panel(
+        ops_text,
+        title="[bold magenta]🧾 OPERACIONES EN VIVO[/bold magenta]",
+        border_style="magenta",
+        box=rich_box.ROUNDED,
+    )
+
+    footer = Columns([risk_panel, ops_panel, events_panel], equal=True)
 
     return Group(header_panel, table, footer)
 
@@ -1248,6 +1282,146 @@ async def position_sync_loop(
             )
 
 
+async def health_monitor_loop(
+    state: dict[str, Any],
+    market_queue: asyncio.Queue[dict[str, Any]],
+    paper_executor: PaperExecutor,
+    interval: int = 30,
+) -> None:
+    """Periodic health checks for feed freshness and processing backlog."""
+    logger = logging.getLogger("clawdbot.health")
+    stale_alert_sent = False
+    backlog_alert_sent = False
+    pending_alert_streak = 0
+    while True:
+        await asyncio.sleep(interval)
+        now = datetime.now(tz=timezone.utc)
+        last_msg: datetime | None = state.get("last_market_message_at")
+        queue_size = market_queue.qsize()
+        open_positions = len(paper_executor.open_positions)
+        stale_seconds: float | None = None
+        if last_msg is not None:
+            stale_seconds = (now - last_msg).total_seconds()
+
+        logger.debug(
+            "[HEALTH] queue=%d open_positions=%d stale_seconds=%s",
+            queue_size,
+            open_positions,
+            f"{stale_seconds:.1f}" if stale_seconds is not None else "n/a",
+        )
+
+        if queue_size > 2000:
+            logger.warning(
+                "[HEALTH] market queue backlog is high (%d messages). "
+                "Consumer may be lagging.",
+                queue_size,
+            )
+            if not backlog_alert_sent:
+                backlog_alert_sent = True
+                try:
+                    await db.insert_health_event(
+                        level="WARNING",
+                        component="health_monitor",
+                        event_code="QUEUE_BACKLOG_HIGH",
+                        message=f"Queue backlog high: {queue_size}",
+                        payload_json=json.dumps({"queue_size": queue_size}),
+                    )
+                except Exception:
+                    pass
+        else:
+            backlog_alert_sent = False
+        if stale_seconds is not None and stale_seconds > 120:
+            logger.warning(
+                "[HEALTH] market feed appears stale (%.1fs without messages).",
+                stale_seconds,
+            )
+            if not stale_alert_sent:
+                stale_alert_sent = True
+                try:
+                    await db.insert_health_event(
+                        level="WARNING",
+                        component="health_monitor",
+                        event_code="MARKET_FEED_STALE",
+                        message=f"Market feed stale for {stale_seconds:.1f}s",
+                        payload_json=json.dumps({"stale_seconds": stale_seconds}),
+                    )
+                except Exception:
+                    pass
+                asyncio.create_task(
+                    send_telegram_alert(
+                        "⚠️ *HEALTH ALERT* Feed de mercado sin mensajes recientes (>120s)."
+                    )
+                )
+        else:
+            stale_alert_sent = False
+
+        pending_count = sum(
+            1 for p in paper_executor.open_positions.values() if getattr(p, "close_pending", False)
+        )
+        if pending_count > 0:
+            pending_alert_streak += 1
+            if pending_alert_streak >= 3:
+                pending_alert_streak = 0
+                details = []
+                for sym, pos in paper_executor.open_positions.items():
+                    if getattr(pos, "close_pending", False):
+                        details.append(f"{sym}:{getattr(pos, 'last_close_error', 'unknown')}")
+                try:
+                    await db.insert_health_event(
+                        level="ERROR",
+                        component="reconciler",
+                        event_code="PENDING_CLOSE_PERSISTENT",
+                        message=f"Pending closes persist: {pending_count}",
+                        payload_json=json.dumps({"pending": details}),
+                    )
+                except Exception:
+                    pass
+                asyncio.create_task(
+                    send_telegram_alert(
+                        "🚨 *RECONCILER ALERT* Cierres pendientes persistentes: "
+                        f"{pending_count}\n" + "\n".join(details[:5])
+                    )
+                )
+        else:
+            pending_alert_streak = 0
+
+
+async def close_pending_reconciler_loop(
+    state: dict[str, Any],
+    paper_executor: PaperExecutor,
+    interval: int = 20,
+) -> None:
+    """Retry loop for positions marked as close_pending."""
+    logger = logging.getLogger("clawdbot.reconciler")
+    while True:
+        await asyncio.sleep(interval)
+        pending = [
+            sym
+            for sym, pos in paper_executor.open_positions.items()
+            if getattr(pos, "close_pending", False)
+        ]
+        if not pending:
+            continue
+        latest_prices: dict[str, float] = {}
+        prices_state: dict[str, deque[float]] = state.get("prices", {})
+        for sym in pending:
+            buf = prices_state.get(sym, deque())
+            if buf:
+                latest_prices[sym] = float(buf[-1])
+        if not latest_prices:
+            logger.debug("[RECONCILER] pending closes exist but no latest prices available.")
+            continue
+        try:
+            closed = await paper_executor.retry_close_pending_positions(latest_prices)
+            if closed > 0:
+                logger.info(
+                    "[RECONCILER] Successfully closed %d pending position(s).",
+                    closed,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[RECONCILER] retry loop failed: %s", exc)
+
+
 async def main() -> None:
     logger = setup_logging()
 
@@ -1288,7 +1462,7 @@ async def main() -> None:
 
     market_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     shared_state: dict[str, Any] = {
-        "sentiment": None,  # None until first Gemini reading (prevents false swing on startup)
+        "sentiment": None if _GEMINI_ENABLED else 0.0,
         "prices": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         # [ELITE] OHLCV buffers for ADX / ATR computation
         "highs": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
@@ -1327,6 +1501,7 @@ async def main() -> None:
         # [DASHBOARD] Mega-dashboard telemetry
         "api_latency_ms": 0.0,   # REST/WS round-trip latency in milliseconds
         "max_drawdown": 0.0,     # most negative unrealised PnL seen this session
+        "last_market_message_at": None,  # datetime | None
     }
 
     predictor = MLPredictor()
@@ -1636,8 +1811,9 @@ async def main() -> None:
     )
     logger.info(
         "🔍 [AUDIT] Session state reset: "
-        "sentiment=None  news_hold_until=None  max_drawdown=0.0  "
+        "sentiment=%s  news_hold_until=None  max_drawdown=0.0  "
         "trading_halted=%s",
+        shared_state.get("sentiment"),
         risk_manager.is_trading_halted(),
     )
 
@@ -1654,17 +1830,27 @@ async def main() -> None:
     )
     _live.start(refresh=True)
 
-    try:
-        await asyncio.gather(
-            ws_client.run(),
-            gemini_sentiment_refresher(shared_state),
-            market_consumer(market_queue, shared_state, paper_executor),
-            signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
-            dashboard_logger(paper_executor, risk_manager, shared_state, _live, interval=1, exchange=exchange_client),
-            weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
-            funding_rate_client.run(),
-            position_sync_loop(paper_executor, interval=60),
+    run_tasks: list[asyncio.Future[Any] | asyncio.Task[Any] | Any] = [
+        ws_client.run(),
+        market_consumer(market_queue, shared_state, paper_executor),
+        signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
+        dashboard_logger(paper_executor, risk_manager, shared_state, _live, interval=1, exchange=exchange_client),
+        weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
+        funding_rate_client.run(),
+        position_sync_loop(paper_executor, interval=60),
+        health_monitor_loop(shared_state, market_queue, paper_executor, interval=30),
+        close_pending_reconciler_loop(shared_state, paper_executor, interval=20),
+    ]
+    if _GEMINI_ENABLED:
+        run_tasks.append(gemini_sentiment_refresher(shared_state))
+    else:
+        logger.warning(
+            "[LLM] Gemini sentiment refresher disabled (GEMINI_API_KEY missing). "
+            "Using neutral sentiment baseline."
         )
+
+    try:
+        await asyncio.gather(*run_tasks)
     except Exception as _critical_exc:  # noqa: BLE001
         logger.critical(
             "🚨 [CRITICAL] Bot loop terminated unexpectedly: %s – check bot_debug.log.",

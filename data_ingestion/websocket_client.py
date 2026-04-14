@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from typing import Any
 
 import ccxt.pro as ccxtpro
@@ -36,6 +37,12 @@ class BinanceWebSocketClient:
         # *watchlist* takes priority; fall back to the legacy *symbol* parameter
         self.watchlist: list[str] = watchlist if watchlist is not None else [symbol]
         self._exchange: ccxtpro.binance | None = None
+        self._seen_trade_ids: dict[str, deque[str]] = {
+            sym: deque(maxlen=5000) for sym in self.watchlist
+        }
+        self._seen_trade_ids_set: dict[str, set[str]] = {
+            sym: set() for sym in self.watchlist
+        }
 
     # ------------------------------------------------------------------
     # Public interface
@@ -109,10 +116,22 @@ class BinanceWebSocketClient:
         while self._exchange is not None:
             trades = await self._exchange.watch_trades(symbol)
             for trade in trades:
+                trade_id = trade.get("id")
+                if trade_id is not None:
+                    trade_id_str = str(trade_id)
+                    seen_deque = self._seen_trade_ids[symbol]
+                    seen_set = self._seen_trade_ids_set[symbol]
+                    if trade_id_str in seen_set:
+                        continue
+                    if len(seen_deque) == seen_deque.maxlen:
+                        evicted = seen_deque[0]
+                        seen_set.discard(evicted)
+                    seen_deque.append(trade_id_str)
+                    seen_set.add(trade_id_str)
                 message: dict[str, Any] = {
                     "type": "trade",
                     "symbol": symbol,
-                    "id": trade.get("id"),
+                    "id": trade_id,
                     "price": trade.get("price"),
                     "amount": trade.get("amount"),
                     "side": trade.get("side"),

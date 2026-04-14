@@ -85,7 +85,7 @@ _FETCH_MARKET_DATA = """
 SELECT timestamp, best_bid, best_ask
 FROM market_data
 WHERE symbol = $1
-ORDER BY timestamp ASC
+ORDER BY timestamp DESC
 LIMIT $2;
 """
 
@@ -164,6 +164,23 @@ SET trend = EXCLUDED.trend, updated_at = NOW();
 _FETCH_HTF_TRENDS = """
 SELECT symbol, timeframe, trend
 FROM htf_trend_status;
+"""
+
+_CREATE_HEALTH_EVENTS = """
+CREATE TABLE IF NOT EXISTS health_events (
+    timestamp    TIMESTAMPTZ      NOT NULL,
+    level        TEXT             NOT NULL,
+    component    TEXT             NOT NULL,
+    event_code   TEXT             NOT NULL,
+    message      TEXT             NOT NULL,
+    payload_json TEXT             NOT NULL DEFAULT '{}'
+);
+"""
+
+_INSERT_HEALTH_EVENT = """
+INSERT INTO health_events
+    (timestamp, level, component, event_code, message, payload_json)
+VALUES ($1, $2, $3, $4, $5, $6);
 """
 
 
@@ -286,8 +303,10 @@ class DatabaseManager:
             raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(_FETCH_MARKET_DATA, symbol, limit)
-        # Rows come back in ascending timestamp order; return as-is
-        return [(float(r["best_bid"]) + float(r["best_ask"])) / 2.0 for r in rows]
+        # Query returns newest-first (DESC) for efficient LIMIT; reverse so callers
+        # receive chronological order (oldest -> newest).
+        rows_chrono = list(reversed(rows))
+        return [(float(r["best_bid"]) + float(r["best_ask"])) / 2.0 for r in rows_chrono]
 
     async def insert_open_trade(
         self,
@@ -381,6 +400,46 @@ class DatabaseManager:
             row = await conn.fetchrow(_FETCH_TOTAL_PNL)
         return float(row["total_pnl"])  # type: ignore[index]
 
+    async def insert_health_event(
+        self,
+        level: str,
+        component: str,
+        event_code: str,
+        message: str,
+        payload_json: str = "{}",
+        timestamp: datetime | None = None,
+    ) -> None:
+        """Insert one operational/health event row.
+
+        Parameters
+        ----------
+        level:
+            Severity (e.g. ``INFO``, ``WARNING``, ``ERROR``).
+        component:
+            Subsystem name (e.g. ``health_monitor``, ``reconciler``).
+        event_code:
+            Stable short code for alert type.
+        message:
+            Human-readable description.
+        payload_json:
+            JSON string with extra metadata.
+        timestamp:
+            Event time in UTC. Defaults to now.
+        """
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        ts = timestamp or datetime.now(tz=timezone.utc)
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                _INSERT_HEALTH_EVENT,
+                ts,
+                level,
+                component,
+                event_code,
+                message,
+                payload_json,
+            )
+
     async def fetch_pending_commands(self) -> list[dict]:
         """Return all unread rows from the *commands* table.
 
@@ -418,6 +477,7 @@ class DatabaseManager:
             await conn.execute(_CREATE_TRADES_HISTORY)
             await conn.execute(_CREATE_COMMANDS)
             await conn.execute(_CREATE_HTF_TREND_STATUS)
+            await conn.execute(_CREATE_HEALTH_EVENTS)
             await conn.execute(_CREATE_HYPERTABLE_MARKET)
             await conn.execute(_CREATE_HYPERTABLE_SENTIMENT)
         logger.info("TimescaleDB schema initialised.")

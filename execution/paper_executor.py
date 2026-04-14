@@ -334,6 +334,9 @@ class OpenPosition:
     # [JOURNAL] Entry-time ML confidence and sentiment (persisted in CSV / state.json)
     ml_confidence: float = 0.0
     sentiment_score: float = 0.0
+    # Close coordination flags: avoid dropping local state when live close fails.
+    close_pending: bool = False
+    last_close_error: str = ""
 
     def __post_init__(self) -> None:
         # Initialise peak_price to entry_price so it is always defined
@@ -391,6 +394,8 @@ class PaperExecutor:
         self._exchange = exchange
         self.open_positions: dict[str, OpenPosition] = {}
         self.total_pnl: float = 0.0
+        # Serialises open_positions mutations across async tasks.
+        self._positions_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # State persistence (paper-trading disaster recovery)
@@ -428,6 +433,8 @@ class PaperExecutor:
                     "max_ttl_hours": pos.max_ttl_hours,
                     "ml_confidence": pos.ml_confidence,
                     "sentiment_score": pos.sentiment_score,
+                    "close_pending": pos.close_pending,
+                    "last_close_error": pos.last_close_error,
                 })
             tmp = _STATE_FILE.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -482,6 +489,8 @@ class PaperExecutor:
                     max_ttl_hours=raw["max_ttl_hours"] if "max_ttl_hours" in raw else _DEFAULT_TTL_HOURS,
                     ml_confidence=float(raw.get("ml_confidence", 0.0)),
                     sentiment_score=float(raw.get("sentiment_score", 0.0)),
+                    close_pending=bool(raw.get("close_pending", False)),
+                    last_close_error=str(raw.get("last_close_error", "")),
                 )
                 # Restore mutable trailing-stop state that __post_init__ would overwrite
                 pos.peak_price = float(raw.get("peak_price", pos.entry_price))
@@ -610,58 +619,59 @@ class PaperExecutor:
         """
         sym = symbol or self.symbol
 
-        if self._risk.is_trading_halted():
-            logger.warning(
-                "⚠️ [ALERTA] Trading detenido por límite de pérdida diaria (symbol=%s) %s",
-                sym,
-                _DEBUG_LOG_HINT,
-            )
-            return False
+        async with self._positions_lock:
+            if self._risk.is_trading_halted():
+                logger.warning(
+                    "⚠️ [ALERTA] Trading detenido por límite de pérdida diaria (symbol=%s) %s",
+                    sym,
+                    _DEBUG_LOG_HINT,
+                )
+                return False
 
-        if self._risk.is_portfolio_dd_exceeded():
-            logger.warning(
-                "🚨 [CIRCUIT BREAKER] Todas las nuevas posiciones bloqueadas – "
-                "límite de drawdown de cartera alcanzado (symbol=%s) %s",
-                sym,
-                _DEBUG_LOG_HINT,
-            )
-            return False
+            if self._risk.is_portfolio_dd_exceeded():
+                logger.warning(
+                    "🚨 [CIRCUIT BREAKER] Todas las nuevas posiciones bloqueadas – "
+                    "límite de drawdown de cartera alcanzado (symbol=%s) %s",
+                    sym,
+                    _DEBUG_LOG_HINT,
+                )
+                return False
 
-        if sym in self.open_positions:
-            logger.debug("Trade skipped – a position for %s is already open.", sym)
-            return False
+            if sym in self.open_positions:
+                logger.debug("Trade skipped – a position for %s is already open.", sym)
+                return False
 
-        if not self._risk.can_open_position():
-            logger.debug(
-                "Trade skipped – max open positions (%d) reached.",
-                self._risk.max_positions,
-            )
-            return False
+            if not self._risk.can_open_position():
+                logger.debug(
+                    "Trade skipped – max open positions (%d) reached.",
+                    self._risk.max_positions,
+                )
+                return False
 
-        # ── Sector / correlation-group exposure check ──────────────────────
-        if self._risk.is_sector_exposed(sym, list(self.open_positions.keys())):
-            sector = get_sector(sym)
-            logger.warning(
-                "🛡️ [RISK CONTROL] Señal de BUY para %s ignorada. "
-                "Exposición máxima alcanzada para el sector: %s.",
-                sym,
-                sector,
-            )
-            return False
+            # ── Sector / correlation-group exposure check ──────────────────────
+            if self._risk.is_sector_exposed(sym, list(self.open_positions.keys())):
+                sector = get_sector(sym)
+                logger.warning(
+                    "🛡️ [RISK CONTROL] Señal de BUY para %s ignorada. "
+                    "Exposición máxima alcanzada para el sector: %s.",
+                    sym,
+                    sector,
+                )
+                return False
 
-        position_size = self._risk.calculate_position_size(win_probability)
-        if not self._risk.has_sufficient_balance(position_size):
-            logger.warning(
-                "⚠️ [ALERTA] Balance insuficiente (%.2f) para tamaño de posición %.2f %s",
-                self._risk.balance,
-                position_size,
-                _DEBUG_LOG_HINT,
-            )
-            return False
+            position_size = self._risk.calculate_position_size(win_probability)
+            if not self._risk.has_sufficient_balance(position_size):
+                logger.warning(
+                    "⚠️ [ALERTA] Balance insuficiente (%.2f) para tamaño de posición %.2f %s",
+                    self._risk.balance,
+                    position_size,
+                    _DEBUG_LOG_HINT,
+                )
+                return False
 
-        ts = timestamp or datetime.now(tz=timezone.utc)
-        self._risk.deduct(position_size)
-        self._risk.register_open()
+            ts = timestamp or datetime.now(tz=timezone.utc)
+            self._risk.deduct(position_size)
+            self._risk.register_open()
 
         # ── Compute dynamic risk thresholds from sentiment ─────────────────
         thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
@@ -848,64 +858,66 @@ class PaperExecutor:
             so the stop adapts to changing volatility.
         """
         sym = symbol or self.symbol
-        if sym not in self.open_positions:
-            return None
+        async with self._positions_lock:
+            if sym not in self.open_positions:
+                return None
 
-        pos = self.open_positions[sym]
-        price_change_pct = (current_price - pos.entry_price) / pos.entry_price
+            pos = self.open_positions[sym]
+            price_change_pct = (current_price - pos.entry_price) / pos.entry_price
 
-        # ------------------------------------------------------------------
-        # Trailing Stop logic
-        # ------------------------------------------------------------------
-        # 1. Update the running peak price whenever the price makes a new high.
-        if current_price > pos.peak_price:
-            pos.peak_price = current_price
+            # ------------------------------------------------------------------
+            # Trailing Stop logic
+            # ------------------------------------------------------------------
+            if current_price > pos.peak_price:
+                pos.peak_price = current_price
 
-        # 2. Activate the trailing stop once the position crosses activation_pct.
-        if not pos.trailing_stop_active and price_change_pct >= pos.activation_pct:
-            pos.trailing_stop_active = True
+            if not pos.trailing_stop_active and price_change_pct >= pos.activation_pct:
+                pos.trailing_stop_active = True
+                logger.debug(
+                    "Trailing Stop ACTIVATED  symbol=%s  entry=%.2f  current=%.2f  profit=%.2f%%",
+                    sym,
+                    pos.entry_price,
+                    current_price,
+                    price_change_pct * 100,
+                )
+
+            initial_sl_price = pos.stop_loss_price
+            if pos.trailing_stop_active:
+                if current_atr is not None and current_atr > 0.0:
+                    pos.atr_trailing_distance = current_atr * ATR_TRAILING_MULTIPLIER
+                if pos.atr_trailing_distance > 0.0:
+                    trailing_sl = pos.peak_price - pos.atr_trailing_distance
+                else:
+                    trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
+                active_sl = max(trailing_sl, initial_sl_price)
+            else:
+                active_sl = initial_sl_price
+
+            pos.current_stop_loss = max(active_sl, pos.current_stop_loss)
             logger.debug(
-                "Trailing Stop ACTIVATED  symbol=%s  entry=%.2f  current=%.2f  profit=%.2f%%",
-                sym,
-                pos.entry_price,
+                "[DEBUG] Precio: %.4f | Stop Activo: %.4f | Distancia al Stop: %.4f",
                 current_price,
-                price_change_pct * 100,
+                pos.current_stop_loss,
+                current_price - pos.current_stop_loss,
             )
 
-        # 3. Compute the active stop loss level.
-        initial_sl_price = pos.stop_loss_price  # set at open (ATR or pct-based)
-        if pos.trailing_stop_active:
-            # Refresh the ATR-based trailing distance if a live ATR is available.
-            if current_atr is not None and current_atr > 0.0:
-                pos.atr_trailing_distance = current_atr * ATR_TRAILING_MULTIPLIER
-            # Trailing SL: prefer ATR-based fixed distance; fall back to pct.
-            if pos.atr_trailing_distance > 0.0:
-                trailing_sl = pos.peak_price - pos.atr_trailing_distance
-            else:
-                trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
-            active_sl = max(trailing_sl, initial_sl_price)
-        else:
-            active_sl = initial_sl_price
+            if current_price > pos.current_stop_loss:
+                return None
 
-        # Ratchet: the stored stop only ever moves up, guarding against both
-        # ATR spikes that would otherwise widen the distance and stale values.
-        pos.current_stop_loss = max(active_sl, pos.current_stop_loss)
-
-        logger.debug(
-            "[DEBUG] Precio: %.4f | Stop Activo: %.4f | Distancia al Stop: %.4f",
-            current_price,
-            pos.current_stop_loss,
-            current_price - pos.current_stop_loss,
-        )
-
-        # 4. Close the position if the current price hits the ratcheted SL.
-        if current_price <= pos.current_stop_loss:
             pnl = price_change_pct * pos.position_size
             ts = timestamp or datetime.now(tz=timezone.utc)
             reason = "TSL" if pos.trailing_stop_active else "SL"
             reason_code = "TRAILING_STOP" if pos.trailing_stop_active else "SL_BASE"
-            await self._close_position(symbol=sym, exit_price=current_price, exit_time=ts, pnl=pnl, exit_reason_code=reason_code)
-            # Operational console line – visible on the terminal at INFO level.
+            closed = await self._close_position(
+                symbol=sym,
+                exit_price=current_price,
+                exit_time=ts,
+                pnl=pnl,
+                exit_reason_code=reason_code,
+            )
+            if not closed:
+                return None
+
             logger.info(
                 "💰 [CIERRE] %s | PnL: %.4f USDT | Motivo: %s",
                 sym,
@@ -925,7 +937,6 @@ class PaperExecutor:
                     )
                 )
             )
-            # Full technical details go to the debug log file only.
             logger.debug(
                 "TRADE CLOSED [%s]  symbol=%s  entry=%.2f  peak=%.2f  exit=%.2f  pnl=%.4f",
                 reason,
@@ -936,8 +947,6 @@ class PaperExecutor:
                 pnl,
             )
             return pnl
-
-        return None
 
     async def check_ml_exit(
         self,
@@ -997,109 +1006,103 @@ class PaperExecutor:
         Realised PnL if the position was closed, ``None`` otherwise.
         """
         sym = symbol or self.symbol
-        if sym not in self.open_positions:
+        async with self._positions_lock:
+            if sym not in self.open_positions:
+                return None
+
+            pos = self.open_positions[sym]
+            price_change_pct = (current_price - pos.entry_price) / pos.entry_price
+            pnl = price_change_pct * pos.position_size
+            ts = timestamp or datetime.now(tz=timezone.utc)
+
+            if ml_signal == "SELL" and ml_probability is not None:
+                sell_confidence = 1.0 - ml_probability
+                confidence_gate = min_confidence * _ML_EXIT_CONFIDENCE_FACTOR
+                if sell_confidence >= confidence_gate:
+                    closed = await self._close_position(
+                        symbol=sym,
+                        exit_price=current_price,
+                        exit_time=ts,
+                        pnl=pnl,
+                        exit_reason_code="SMART_EXIT_ML",
+                    )
+                    if not closed:
+                        return None
+                    logger.info(
+                        "🤖💰 [SMART EXIT] %s cerrado por Reversión de Tendencia "
+                        "(ML Exhaustion). PnL estimado: %.4f",
+                        sym,
+                        pnl,
+                    )
+                    asyncio.create_task(
+                        send_telegram_alert(
+                            _build_trade_report(
+                                sym=sym,
+                                pos=pos,
+                                exit_price=current_price,
+                                exit_time=ts,
+                                gross_pnl=pnl,
+                                exit_reason_code="SMART_EXIT_ML",
+                                current_balance=self._risk.balance,
+                            )
+                        )
+                    )
+                    logger.debug(
+                        "TRADE CLOSED [ML_EXHAUSTION]  symbol=%s  entry=%.2f  "
+                        "exit=%.2f  sell_confidence=%.4f  gate=%.4f  pnl=%.4f",
+                        sym,
+                        pos.entry_price,
+                        current_price,
+                        sell_confidence,
+                        confidence_gate,
+                        pnl,
+                    )
+                    return pnl
+
+            if pos.max_ttl_hours is not None:
+                age_hours = (ts - pos.entry_time).total_seconds() / 3600.0
+                if age_hours >= pos.max_ttl_hours:
+                    closed = await self._close_position(
+                        symbol=sym,
+                        exit_price=current_price,
+                        exit_time=ts,
+                        pnl=pnl,
+                        exit_reason_code="TTL_TIMEOUT",
+                    )
+                    if not closed:
+                        return None
+                    logger.info(
+                        "⏳ [TTL EXIT] %s cerrado por tiempo máximo de exposición "
+                        "alcanzado. PnL: %.4f",
+                        sym,
+                        pnl,
+                    )
+                    asyncio.create_task(
+                        send_telegram_alert(
+                            _build_trade_report(
+                                sym=sym,
+                                pos=pos,
+                                exit_price=current_price,
+                                exit_time=ts,
+                                gross_pnl=pnl,
+                                exit_reason_code="TTL_TIMEOUT",
+                                current_balance=self._risk.balance,
+                            )
+                        )
+                    )
+                    logger.debug(
+                        "TRADE CLOSED [TTL]  symbol=%s  entry=%.2f  exit=%.2f  "
+                        "age_hours=%.2f  max_ttl=%.2f  pnl=%.4f",
+                        sym,
+                        pos.entry_price,
+                        current_price,
+                        age_hours,
+                        pos.max_ttl_hours,
+                        pnl,
+                    )
+                    return pnl
+
             return None
-
-        pos = self.open_positions[sym]
-        price_change_pct = (current_price - pos.entry_price) / pos.entry_price
-        pnl = price_change_pct * pos.position_size
-        ts = timestamp or datetime.now(tz=timezone.utc)
-
-        # ------------------------------------------------------------------
-        # Layer 1: ML Exhaustion / Reversal Exit
-        # ------------------------------------------------------------------
-        # For a LONG position: close if ML signals a high-confidence SELL.
-        # The downward-move confidence = 1 - ml_probability.
-        # Threshold = min_confidence * _ML_EXIT_CONFIDENCE_FACTOR (default 0.44).
-        # Skip Layer 1 entirely when ml_probability is unavailable (model not
-        # yet trained) to avoid acting on a signal without probability support.
-        if ml_signal == "SELL" and ml_probability is not None:
-            sell_confidence = 1.0 - ml_probability
-            confidence_gate = min_confidence * _ML_EXIT_CONFIDENCE_FACTOR
-            if sell_confidence >= confidence_gate:
-                await self._close_position(
-                    symbol=sym,
-                    exit_price=current_price,
-                    exit_time=ts,
-                    pnl=pnl,
-                    exit_reason_code="SMART_EXIT_ML",
-                )
-                logger.info(
-                    "🤖💰 [SMART EXIT] %s cerrado por Reversión de Tendencia "
-                    "(ML Exhaustion). PnL estimado: %.4f",
-                    sym,
-                    pnl,
-                )
-                asyncio.create_task(
-                    send_telegram_alert(
-                        _build_trade_report(
-                            sym=sym,
-                            pos=pos,
-                            exit_price=current_price,
-                            exit_time=ts,
-                            gross_pnl=pnl,
-                            exit_reason_code="SMART_EXIT_ML",
-                            current_balance=self._risk.balance,
-                        )
-                    )
-                )
-                logger.debug(
-                    "TRADE CLOSED [ML_EXHAUSTION]  symbol=%s  entry=%.2f  "
-                    "exit=%.2f  sell_confidence=%.4f  gate=%.4f  pnl=%.4f",
-                    sym,
-                    pos.entry_price,
-                    current_price,
-                    sell_confidence,
-                    confidence_gate,
-                    pnl,
-                )
-                return pnl
-
-        # ------------------------------------------------------------------
-        # Layer 4: Time-To-Live (TTL) Exit
-        # ------------------------------------------------------------------
-        if pos.max_ttl_hours is not None:
-            age_hours = (ts - pos.entry_time).total_seconds() / 3600.0
-            if age_hours >= pos.max_ttl_hours:
-                await self._close_position(
-                    symbol=sym,
-                    exit_price=current_price,
-                    exit_time=ts,
-                    pnl=pnl,
-                    exit_reason_code="TTL_TIMEOUT",
-                )
-                logger.info(
-                    "⏳ [TTL EXIT] %s cerrado por tiempo máximo de exposición "
-                    "alcanzado. PnL: %.4f",
-                    sym,
-                    pnl,
-                )
-                asyncio.create_task(
-                    send_telegram_alert(
-                        _build_trade_report(
-                            sym=sym,
-                            pos=pos,
-                            exit_price=current_price,
-                            exit_time=ts,
-                            gross_pnl=pnl,
-                            exit_reason_code="TTL_TIMEOUT",
-                            current_balance=self._risk.balance,
-                        )
-                    )
-                )
-                logger.debug(
-                    "TRADE CLOSED [TTL]  symbol=%s  entry=%.2f  exit=%.2f  "
-                    "age_hours=%.2f  max_ttl=%.2f  pnl=%.4f",
-                    sym,
-                    pos.entry_price,
-                    current_price,
-                    age_hours,
-                    pos.max_ttl_hours,
-                    pnl,
-                )
-                return pnl
-
-        return None
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -1112,7 +1115,7 @@ class PaperExecutor:
         exit_time: datetime,
         pnl: float,
         exit_reason_code: str = "",
-    ) -> None:
+    ) -> bool:
         """Persist the closed trade, update balance, and remove the open position."""
         pos = self.open_positions.get(symbol)
         if pos is None:
@@ -1120,9 +1123,10 @@ class PaperExecutor:
                 "_close_position called for %s but no open position found – skipping.",
                 symbol,
             )
-            return
+            return False
 
         # ── Live Binance Futures order ─────────────────────────────────────
+        close_error: str | None = None
         if self._exchange is not None:
             try:
                 # position_size is the leveraged notional value; convert to base
@@ -1156,9 +1160,18 @@ class PaperExecutor:
             except (CcxtAuthenticationError, CcxtExchangeError, CcxtInsufficientFunds, CcxtNetworkError):
                 logger.exception(
                     "Failed to place Binance Futures sell order for %s – "
-                    "position closed in paper simulation only.",
+                    "position kept local with close_pending for retry.",
                     symbol,
                 )
+                close_error = "binance_close_failed"
+
+        # Keep local state in sync with the broker truth:
+        # if live close failed, do not remove the position locally.
+        if close_error is not None:
+            pos.close_pending = True
+            pos.last_close_error = close_error
+            self._save_state()
+            return False
 
         if pos.trade_id is not None:
             await self._db.close_trade(
@@ -1196,6 +1209,7 @@ class PaperExecutor:
         )
         # ── Persist updated state (position removed) ───────────────────────
         self._save_state()
+        return True
 
     async def sync_positions_with_exchange(self) -> int:
         """Re-sync local open-position state against live Binance Futures positions.
@@ -1226,35 +1240,36 @@ class PaperExecutor:
         live_symbols: set[str] = {p["symbol"].split(":")[0] for p in live_positions}
 
         # ── Ghost detection: in memory but gone on exchange ────────────────
-        ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
-        for sym in ghost_symbols:
-            logger.info(
-                "[SYNC] 👻 Ghost position detected: %s exists in bot memory but is "
-                "no longer open on Binance. Removing from local state.",
-                sym,
-            )
-            await self._cancel_open_orders(sym)
-            pos = self.open_positions.pop(sym, None)
-            if pos is not None:
-                self._risk.register_close()
+        async with self._positions_lock:
+            ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
+            for sym in ghost_symbols:
                 logger.info(
-                    "[SYNC] ✅ Ghost position %s removed. Local positions now: %d.",
+                    "[SYNC] 👻 Ghost position detected: %s exists in bot memory but is "
+                    "no longer open on Binance. Removing from local state.",
                     sym,
-                    len(self.open_positions),
                 )
+                await self._cancel_open_orders(sym)
+                pos = self.open_positions.pop(sym, None)
+                if pos is not None:
+                    self._risk.register_close()
+                    logger.info(
+                        "[SYNC] ✅ Ghost position %s removed. Local positions now: %d.",
+                        sym,
+                        len(self.open_positions),
+                    )
 
         # ── Discrepancy detection: on exchange but not tracked locally ─────
-        untracked_symbols = [sym for sym in live_symbols if sym not in self.open_positions]
-        for sym in untracked_symbols:
-            logger.warning(
-                "[SYNC] ⚠️ Discrepancy detected: position for %s is open on Binance "
-                "but is NOT tracked in local bot state. "
-                "Consider restarting the bot or manually reconciling. "
-                "Local positions: %d, Binance positions: %d.",
-                sym,
-                len(self.open_positions),
-                len(live_symbols),
-            )
+            untracked_symbols = [sym for sym in live_symbols if sym not in self.open_positions]
+            for sym in untracked_symbols:
+                logger.warning(
+                    "[SYNC] ⚠️ Discrepancy detected: position for %s is open on Binance "
+                    "but is NOT tracked in local bot state. "
+                    "Consider restarting the bot or manually reconciling. "
+                    "Local positions: %d, Binance positions: %d.",
+                    sym,
+                    len(self.open_positions),
+                    len(live_symbols),
+                )
 
         return len(live_symbols)
 
@@ -1299,4 +1314,55 @@ class PaperExecutor:
                     symbol,
                     exc,
                 )
+
+    async def retry_close_pending_positions(
+        self,
+        latest_prices: dict[str, float],
+        timestamp: datetime | None = None,
+    ) -> int:
+        """Retry force-closing positions flagged as ``close_pending``.
+
+        Parameters
+        ----------
+        latest_prices:
+            Mapping ``symbol -> latest tradable price`` used as exit price.
+        timestamp:
+            Optional close timestamp. Defaults to current UTC time.
+
+        Returns
+        -------
+        int
+            Number of positions successfully closed in this retry cycle.
+        """
+        closed_count = 0
+        ts = timestamp or datetime.now(tz=timezone.utc)
+        async with self._positions_lock:
+            pending_symbols = [
+                sym for sym, pos in self.open_positions.items() if pos.close_pending
+            ]
+            for sym in pending_symbols:
+                pos = self.open_positions.get(sym)
+                if pos is None:
+                    continue
+                px = latest_prices.get(sym)
+                if px is None or px <= 0:
+                    continue
+                pnl = ((px - pos.entry_price) / pos.entry_price) * pos.position_size
+                closed = await self._close_position(
+                    symbol=sym,
+                    exit_price=px,
+                    exit_time=ts,
+                    pnl=pnl,
+                    exit_reason_code="CLOSE_RETRY",
+                )
+                if closed:
+                    closed_count += 1
+                else:
+                    # Keep the flag set for future retries.
+                    pos.close_pending = True
+                    if not pos.last_close_error:
+                        pos.last_close_error = "retry_failed"
+            if pending_symbols:
+                self._save_state()
+        return closed_count
 

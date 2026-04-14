@@ -607,7 +607,11 @@ class MT5Executor(PaperExecutor):
             The broker symbol string (e.g. ``"BTCUSD-T"``), or ``None`` when
             the symbol is not in :data:`SYMBOL_MAP` or cannot be validated.
         """
-        broker_sym = SYMBOL_MAP.get(sym)
+        # Allow direct broker symbols (e.g. "BTCUSD-T") to pass through.
+        if sym in SYMBOL_MAP.values():
+            broker_sym = sym
+        else:
+            broker_sym = SYMBOL_MAP.get(sym)
         if broker_sym is None:
             logger.error(
                 "[MT5] Unmapped symbol: '%s'. Add it to SYMBOL_MAP in mt5_executor.py.",
@@ -638,6 +642,12 @@ class MT5Executor(PaperExecutor):
             logger.info("[MT5] Symbol '%s' added to Market Watch.", broker_sym)
 
         return broker_sym
+
+    @staticmethod
+    def _local_symbol_from_broker(broker_symbol: str) -> str:
+        """Map broker MT5 symbol back to the local/internal symbol name."""
+        reverse_map = {v: k for k, v in SYMBOL_MAP.items() if "/" in k}
+        return reverse_map.get(broker_symbol, broker_symbol)
 
     @staticmethod
     def _normalize_price(price: float, digits: int) -> float:
@@ -1361,7 +1371,7 @@ class MT5Executor(PaperExecutor):
         exit_time: datetime,
         pnl: float,
         exit_reason_code: str = "",
-    ) -> None:
+    ) -> bool:
         """Close a live MT5 position and update the paper book.
 
         When *live=True* a market SELL order is sent via ``mt5.order_send``
@@ -1379,23 +1389,26 @@ class MT5Executor(PaperExecutor):
                 "_close_position called for %s but no open position found – skipping.",
                 symbol,
             )
-            return
+            return False
 
         # ── Live MT5 order ─────────────────────────────────────────────────
+        close_error: str | None = None
         if self._live:
             if not _MT5_AVAILABLE:
                 logger.error(
                     "MT5 live mode requested but MetaTrader5 library is not installed. "
-                    "Closing in paper simulation only."
+                    "Keeping position with close_pending for retry."
                 )
+                close_error = "mt5_library_unavailable"
             else:
                 mt5_sym = self._resolve_symbol(symbol)
                 if mt5_sym is None:
                     logger.error(
                         "[MT5] Cannot send close order for '%s' – symbol not in SYMBOL_MAP. "
-                        "Removing from local state to avoid ghost positions.",
+                        "keeping local position for retry.",
                         symbol,
                     )
+                    close_error = "mt5_symbol_unresolved"
                 else:
                     # Find all MT5 positions for this symbol tagged with our magic.
                     mt5_positions = mt5.positions_get(symbol=mt5_sym)
@@ -1426,11 +1439,11 @@ class MT5Executor(PaperExecutor):
                             else:
                                 logger.error(
                                     "MT5 close order rejected for %s (ticket=%d) – "
-                                    "position will still be removed from local state "
-                                    "by the paper book-keeping below.",
+                                    "keeping local position for retry.",
                                     symbol,
                                     mt5_pos.ticket,
                                 )
+                                close_error = "mt5_close_rejected"
 
                         if closed_count == 0:
                             logger.warning(
@@ -1438,6 +1451,7 @@ class MT5Executor(PaperExecutor):
                                 symbol,
                                 self._magic,
                             )
+                            close_error = close_error or "mt5_no_positions_closed"
                         elif closed_count > 1:
                             logger.warning(
                                 "[MT5] Closed %d positions for %s (expected 1) – "
@@ -1448,10 +1462,17 @@ class MT5Executor(PaperExecutor):
                     else:
                         logger.warning(
                             "[MT5] No open position found for %s with magic=%d – "
-                            "closing in paper simulation only.",
+                            "keeping local position for retry.",
                             symbol,
                             self._magic,
                         )
+                        close_error = "mt5_position_not_found"
+
+        if close_error is not None:
+            pos.close_pending = True
+            pos.last_close_error = close_error
+            self._save_state()
+            return False
 
         # ── Paper book-keeping (identical to PaperExecutor) ────────────────
         if pos.trade_id is not None:
@@ -1486,6 +1507,7 @@ class MT5Executor(PaperExecutor):
             pnl_percent=pnl_pct,
         )
         self._save_state()
+        return True
 
     # ------------------------------------------------------------------
     # sync_positions_with_exchange override
@@ -1510,8 +1532,12 @@ class MT5Executor(PaperExecutor):
             logger.warning("[MT5 SYNC] mt5.positions_get() returned None.")
             return len(self.open_positions)
 
+        # Convert broker symbols (e.g. BTCUSD-T) to local symbols (BTC/USDT)
+        # so comparisons against self.open_positions keys are consistent.
         live_symbols: set[str] = {
-            p.symbol for p in mt5_positions if p.magic == self._magic
+            self._local_symbol_from_broker(p.symbol)
+            for p in mt5_positions
+            if p.magic == self._magic
         }
 
         # Ghost detection
