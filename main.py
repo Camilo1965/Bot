@@ -2,10 +2,10 @@
 ClawdBot – entry point.
 
 Sets up a structured JSON logger and starts the asyncio event loop.
-Runs the Binance WebSocket client (for all symbols in WATCHLIST) and a
+Runs an MT5 market-data poller (ticks + multi-timeframe candles) and a
 Gemini-powered sentiment refresher concurrently; each incoming trade is
-logged together with the latest sentiment score.  Every order-book snapshot
-and scored headline is persisted to TimescaleDB.
+logged together with the latest sentiment score.  Every synthetic top-of-book
+snapshot and scored headline is persisted to TimescaleDB.
 
 An ML predictor (XGBoost) is warm-started from historical market data at
 startup and emits a BUY / SELL / HOLD signal for each symbol independently.
@@ -14,23 +14,26 @@ When the signal is BUY the RiskManager sizes a position via the Half-Kelly
 Criterion (capped to 1/max_positions of the portfolio) and the PaperExecutor
 simulates the trade entry.  Up to max_positions trades may be open
 simultaneously, one per symbol.
+
+Before first live run, execute ``preflight.py`` (same venv as ``main.py``) to
+verify PostgreSQL/TimescaleDB, MT5 login, and Telegram.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import logging.handlers
-import json
 import os
 import sys
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import ccxt.async_support as ccxt_async
 from dotenv import load_dotenv
 from rich.columns import Columns
 from rich.console import Console, Group
@@ -41,12 +44,18 @@ from rich.text import Text
 from rich import box as rich_box
 from rich.logging import RichHandler
 
-from data_ingestion.funding_rate_client import FundingRateClient
+from data_ingestion.mt5_market_client import MT5MarketDataClient
 from data_ingestion.news_scraper import fetch_crypto_headlines
-from data_ingestion.websocket_client import BinanceWebSocketClient
 from database.db_manager import close_db, db, init_db
-from execution.binance_executor import create_exchange, fetch_open_positions, fetch_total_wallet_balance
-from execution.mt5_executor import MT5Executor, fetch_mt5_account_balance, initialize_mt5, shutdown_mt5
+from execution.mt5_executor import (
+    MT5Executor,
+    TIMEFRAME_H1,
+    TIMEFRAME_H4,
+    TIMEFRAME_M15,
+    fetch_mt5_account_balance,
+    initialize_mt5,
+    shutdown_mt5,
+)
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE, RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor, compute_htf_trend
@@ -102,17 +111,17 @@ def _check_env() -> None:
             "  Bot will run in degraded mode with neutral sentiment.\n",
             file=sys.stderr,
         )
-        sys.exit(1)
 
 
 _check_env()
 
 # ── Multi-asset watchlist ─────────────────────────────────────────────────────
+# Keep this aligned with symbols that exist in *Market Watch* on your MT5 broker
+# (see SYMBOL_MAP in execution/mt5_executor.py). Many brokers only offer majors.
 WATCHLIST: list[str] = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",  # L1_MAJOR
-    "LINK/USDT", "INJ/USDT",                           # DEFI
-    "FET/USDT", "RENDER/USDT",                         # AI
-    "DOGE/USDT", "PEPE/USDT",                          # MEME
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
 ]
 
 # ── [PRO] News Filter parameters ─────────────────────────────────────────────
@@ -126,22 +135,39 @@ _RETRAINER_DATA_LIMIT: int = 10_000   # price rows to fetch for retraining
 _MODEL_PATH = Path(__file__).parent / "models" / "xgb_live.json"
 
 # Hint appended to warning messages that have more detail in the debug log.
-_DEBUG_LOG_HINT = "(Revisa bot_debug.log para detalles técnicos)"
+_DEBUG_LOG_HINT = "(Revisa logs/last_session.log o bot_debug.log para detalles)"
+
+# Set once per process in :func:`setup_logging` — also embedded in JSON lines.
+_LOG_SESSION_ID: str = ""
+
+
+class _DropDashboardDebugFilter(logging.Filter):
+    """Avoid filling ``bot_debug.log`` with per-second dashboard DEBUG heartbeats."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == "clawdbot.dashboard" and record.levelno == logging.DEBUG:
+            return False
+        return True
 
 
 class _JsonFormatter(logging.Formatter):
-    """Emit log records as single-line JSON objects."""
+    """Emit log records as single-line JSON objects (includes ``session_id``)."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__()
+        self._session_id = session_id
 
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "session_id": self._session_id,
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
         }
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload)
+        return json.dumps(payload, ensure_ascii=False)
 
 
 class _ConsoleFormatter(logging.Formatter):
@@ -197,44 +223,52 @@ class _DashboardEventHandler(logging.Handler):
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
     """Configure dual-channel logging and return the root *clawdbot* logger.
 
-    Two output channels are configured on the **root** logger:
+    * **File** (``bot_debug.log``): JSON lines at ``DEBUG`` with
+      ``session_id`` on every record.  Rotates at 5 MB (3 backups).
+      Per-second ``clawdbot.dashboard`` DEBUG heartbeats are filtered out.
 
-    * **File** (``bot_debug.log``):  :class:`~logging.handlers.RotatingFileHandler`
-      at ``DEBUG`` level using :class:`_JsonFormatter`.  Every price tick,
-      indicator calculation, and AI message is captured here with a full
-      ISO-8601 timestamp for post-session auditing.  The file rotates at
-      5 MB and keeps 1 backup file.
+    * **File** (``logs/last_session.log``): human-readable ``INFO+`` only,
+      **truncated on each process start** — use this to see *what happened
+      this run* without parsing huge JSON.
 
-    * **Console** (stdout):  :class:`~logging.StreamHandler` at ``INFO``
-      level using :class:`_ConsoleFormatter`.  Only operational events
-      (trade entries/closes, system heartbeat, alerts, startup messages)
-      reach the terminal.  Verbose data-pipeline noise (kline ticks,
-      buffer updates, per-symbol AI thoughts) is demoted to ``DEBUG`` in
-      the calling code so it never reaches the console handler.
+    * **Console** (stdout): :class:`~logging.StreamHandler` at ``INFO``.
 
-    A third, isolated channel is also configured:
-
-    * **Audit** (``audit.log``): a dedicated :class:`~logging.FileHandler`
-      attached **only** to the ``clawdbot.audit`` logger (``propagate=False``)
-      so its output never reaches the console.  It records per-position
-      risk telemetry (trailing stop, ATR, high-watermark) in a
-      human-readable pipe-delimited format for post-session analysis.
+    * **Audit** (``audit.log``): ``clawdbot.audit`` only, ``propagate=False``.
     """
+    global _LOG_SESSION_ID  # noqa: PLW0603
+
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(logging.DEBUG)
 
-    # ── File handler: full DEBUG log in JSON ─────────────────────────────────
+    _LOG_SESSION_ID = uuid.uuid4().hex[:12]
+    _logs_dir = Path(__file__).parent / "logs"
+    _logs_dir.mkdir(exist_ok=True)
+
+    # ── File handler: full DEBUG log in JSON (session-scoped, no dashboard spam)
     log_file = Path(__file__).parent / "bot_debug.log"
     file_handler = logging.handlers.RotatingFileHandler(
         log_file,
         maxBytes=5 * 1024 * 1024,  # 5 MB per file
-        backupCount=1,
+        backupCount=3,
         encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(_JsonFormatter())
+    file_handler.setFormatter(_JsonFormatter(session_id=_LOG_SESSION_ID))
+    file_handler.addFilter(_DropDashboardDebugFilter())
     root.addHandler(file_handler)
+
+    # ── Human-readable session log (this run only) ─────────────────────────
+    session_log = _logs_dir / "last_session.log"
+    session_handler = logging.FileHandler(session_log, mode="w", encoding="utf-8")
+    session_handler.setLevel(logging.INFO)
+    session_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    root.addHandler(session_handler)
 
     # ── Console handler: filtered INFO + WARNING/ERROR ────────────────────────
     console_handler = logging.StreamHandler(sys.stdout)
@@ -262,7 +296,13 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         "# [HORA]    | [MONEDA]   | PRECIO_ACTUAL | PICO_MÁX    | ATR_VAL  | STOP_CALCULADO | XGB_CONF | DISTANCIA_%"
     )
 
-    return logging.getLogger("clawdbot")
+    boot = logging.getLogger("clawdbot")
+    boot.info(
+        "SESSION_START session_id=%s pid=%s | full JSON: bot_debug.log | esta sesión: logs/last_session.log",
+        _LOG_SESSION_ID,
+        os.getpid(),
+    )
+    return boot
 
 
 async def gemini_sentiment_refresher(
@@ -771,81 +811,67 @@ async def weekly_retrainer(
             )
 
 
-async def preload_historical_data(
+async def preload_historical_data_mt5(
     state: dict[str, Any],
     watchlist: list[str],
-    timeframe: str = "15m",
+    executor: MT5Executor,
     limit: int = 1000,
 ) -> None:
-    """[ELITE] Fast REST Warmup – populate price/high/low buffers before WebSocket starts.
-
-    Fetches *limit* historical OHLCV candles for every symbol in *watchlist*
-    via the Binance REST API (ccxt.async_support) and appends the close, high,
-    and low values to the respective shared-state deques.  This means that when
-    the first live WebSocket kline arrives the buffer is already pre-filled,
-    bypassing the ``[AI WARMUP]`` phase entirely.
-
-    Also fetches 1H and 4H candles (up to *limit* each) to pre-fill the
-    higher-timeframe buffers used by the Multi-Timeframe Analysis (MTA) trend
-    filter, providing a deep history for fractal analysis.
-    """
+    """Preload 15m/1h/4h candles from MT5 to warm up buffers."""
     log = logging.getLogger("clawdbot.preload")
-    exchange = ccxt_async.binance({"enableRateLimit": True})
-    try:
-        for symbol in watchlist:
-            # ── 15m primary buffer ─────────────────────────────────────────
-            try:
-                ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-                # ohlcv rows: [timestamp, open, high, low, close, volume]
-                for candle in ohlcv:
-                    _, open_price, high, low, close, _volume = candle
+    for symbol in watchlist:
+        try:
+            df_15m = await executor.fetch_candles(
+                symbol=symbol,
+                timeframe=TIMEFRAME_M15,
+                count=limit,
+                start_pos=0,
+            )
+            if df_15m is not None and not df_15m.empty:
+                for _, row in df_15m.iterrows():
+                    close = row.get("close")
+                    high = row.get("high")
+                    low = row.get("low")
                     if close is not None and symbol in state["prices"]:
                         state["prices"][symbol].append(float(close))
                     if high is not None and symbol in state.get("highs", {}):
                         state["highs"][symbol].append(float(high))
                     if low is not None and symbol in state.get("lows", {}):
                         state["lows"][symbol].append(float(low))
-                log.info(
-                    "[ELITE] Preloaded %d historical candles for %s.",
-                    len(ohlcv),
-                    symbol,
+                log.info("[MT5] Preloaded %d 15m candles for %s.", len(df_15m), symbol)
+            else:
+                log.warning("[MT5] No 15m candles available for %s.", symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[MT5] Could not preload 15m candles for %s: %s", symbol, exc)
+
+        for tf_name, tf_value in (("1h", TIMEFRAME_H1), ("4h", TIMEFRAME_H4)):
+            try:
+                df_htf = await executor.fetch_candles(
+                    symbol=symbol,
+                    timeframe=tf_value,
+                    count=limit,
+                    start_pos=0,
                 )
+                if df_htf is None or df_htf.empty:
+                    log.warning("[MT5] No %s candles available for %s.", tf_name.upper(), symbol)
+                    continue
+                htf_closes = state.get("htf_closes", {}).get(symbol, {})
+                htf_opens = state.get("htf_opens", {}).get(symbol, {})
+                for _, row in df_htf.iterrows():
+                    close = row.get("close")
+                    open_price = row.get("open")
+                    if close is not None and tf_name in htf_closes:
+                        htf_closes[tf_name].append(float(close))
+                    if open_price is not None and tf_name in htf_opens:
+                        htf_opens[tf_name].append(float(open_price))
+                log.info("[MT5] Preloaded %d %s candles for %s.", len(df_htf), tf_name.upper(), symbol)
             except Exception as exc:  # noqa: BLE001
                 log.warning(
-                    "[ELITE] Could not preload historical candles for %s: %s",
+                    "[MT5] Could not preload %s candles for %s: %s",
+                    tf_name.upper(),
                     symbol,
                     exc,
                 )
-
-            # ── 1H and 4H HTF buffers ──────────────────────────────────────
-            for htf in ("1h", "4h"):
-                try:
-                    htf_ohlcv = await exchange.fetch_ohlcv(
-                        symbol, timeframe=htf, limit=limit
-                    )
-                    htf_closes = state.get("htf_closes", {}).get(symbol, {})
-                    htf_opens = state.get("htf_opens", {}).get(symbol, {})
-                    for candle in htf_ohlcv:
-                        _, open_price, _high, _low, close, _volume = candle
-                        if close is not None and htf in htf_closes:
-                            htf_closes[htf].append(float(close))
-                        if open_price is not None and htf in htf_opens:
-                            htf_opens[htf].append(float(open_price))
-                    log.info(
-                        "[MTA] Preloaded %d %s candles for %s.",
-                        len(htf_ohlcv),
-                        htf.upper(),
-                        symbol,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.warning(
-                        "[MTA] Could not preload %s candles for %s: %s",
-                        htf.upper(),
-                        symbol,
-                        exc,
-                    )
-    finally:
-        await exchange.close()
 
 
 def _compute_rsi(prices: list[float], period: int = 14) -> float | None:
@@ -1146,7 +1172,6 @@ async def dashboard_logger(
     state: dict[str, Any],
     live: Live,
     interval: int = 1,
-    exchange: ccxt_async.binanceusdm | None = None,
 ) -> None:
     """Refresh the Rich Live dashboard every *interval* seconds.
 
@@ -1166,21 +1191,8 @@ async def dashboard_logger(
     """
     logger_dash = logging.getLogger("clawdbot.dashboard")
     audit = logging.getLogger("clawdbot.audit")
-    _latency_tick: int = 0
-    _LATENCY_INTERVAL: int = 10  # measure API latency every 10 iterations
     while True:
         await asyncio.sleep(interval)
-
-        # ── API latency measurement (every ~10 seconds) ───────────────────────
-        _latency_tick += 1
-        if exchange is not None and _latency_tick >= _LATENCY_INTERVAL:
-            _latency_tick = 0
-            try:
-                t_before = time.monotonic()
-                await exchange.fetch_time()
-                state["api_latency_ms"] = (time.monotonic() - t_before) * 1000.0
-            except Exception:  # noqa: BLE001
-                pass  # keep stale latency value; do not spam events panel
 
         # ── Refresh the live TUI table ────────────────────────────────────────
         live.update(generate_dashboard(state, paper_executor, risk_manager, WATCHLIST))
@@ -1505,21 +1517,9 @@ async def main() -> None:
     }
 
     predictor = MLPredictor()
-    ws_client = BinanceWebSocketClient(queue=market_queue, watchlist=WATCHLIST)
-    funding_rate_client = FundingRateClient(symbols=WATCHLIST, state=shared_state)
 
-    # ── Execution mode: MT5 / Testnet / Live / Paper ────────────────────────
-    execution_mode: str = os.environ.get("EXECUTION_MODE", "paper").strip().lower()
-    use_testnet: bool = os.environ.get("USE_BINANCE_TESTNET", "False").strip().lower() in (
-        "true", "1", "yes"
-    )
-    paper_trading: bool = os.environ.get("PAPER_TRADING", "True").strip().lower() in (
-        "true", "1", "yes"
-    )
-    api_key: str = os.environ.get("EXCHANGE_API_KEY", "").strip()
-    api_secret: str = os.environ.get("EXCHANGE_SECRET", "").strip()
-
-    exchange_client: ccxt_async.binanceusdm | None = None
+    # ── Execution mode: MT5-first (Binance removed) ─────────────────────────
+    execution_mode: str = os.environ.get("EXECUTION_MODE", "mt5").strip().lower()
     initial_balance: float = 10_000.0
     _mt5_initialized: bool = False
 
@@ -1588,61 +1588,11 @@ async def main() -> None:
                             initial_balance,
                         )
 
-    if execution_mode != "mt5" and use_testnet:
-        # USE_BINANCE_TESTNET takes priority over PAPER_TRADING.
-        if not api_key or not api_secret:
-            logger.warning(
-                "USE_BINANCE_TESTNET=True but EXCHANGE_API_KEY/EXCHANGE_SECRET are not "
-                "set – falling back to paper trading with %.2f USDT.",
-                initial_balance,
-            )
-        else:
-            exchange_client = create_exchange(api_key, api_secret, testnet=True)
-            fetched: float | None = await fetch_total_wallet_balance(exchange_client)
-            if fetched is not None:
-                initial_balance = fetched
-                logger.info(
-                    "✅ [TESTNET] Binance Futures Testnet total wallet balance fetched: %.2f",
-                    initial_balance,
-                )
-            else:
-                logger.warning(
-                    "[TESTNET] Could not fetch balance from Binance Testnet – "
-                    "using default %.2f USDT.",
-                    initial_balance,
-                )
-            logger.info(
-                "🔗 [TESTNET] Orders will be sent to Binance Futures Testnet API."
-            )
-    elif execution_mode != "mt5" and not paper_trading:
-        # Live trading (non-testnet).
-        if not api_key or not api_secret:
-            logger.warning(
-                "PAPER_TRADING=False but EXCHANGE_API_KEY/EXCHANGE_SECRET are not "
-                "set – running in pure paper trading mode."
-            )
-        else:
-            exchange_client = create_exchange(api_key, api_secret, testnet=False)
-            fetched = await fetch_total_wallet_balance(exchange_client)
-            if fetched is not None:
-                initial_balance = fetched
-                logger.info(
-                    "✅ [LIVE] Binance Futures live total wallet balance fetched: %.2f",
-                    initial_balance,
-                )
-            else:
-                logger.warning(
-                    "[LIVE] Could not fetch balance from Binance live API – "
-                    "using default %.2f USDT.",
-                    initial_balance,
-                )
-            logger.info(
-                "🔗 [LIVE] Orders will be sent to Binance Futures live API."
-            )
-    elif execution_mode != "mt5":
+    if execution_mode != "mt5":
         logger.info(
-            "📝 [PAPER] Running in pure paper trading mode (internal simulation) "
-            "with %.2f USDT.",
+            "📝 [PAPER] EXECUTION_MODE=%s (MT5 not selected). "
+            "Running in paper mode with %.2f USDT.",
+            execution_mode,
             initial_balance,
         )
 
@@ -1666,7 +1616,27 @@ async def main() -> None:
             )
         )
     else:
-        paper_executor = PaperExecutor(db=db, risk_manager=risk_manager, exchange=exchange_client)
+        paper_executor = PaperExecutor(db=db, risk_manager=risk_manager, exchange=None)
+
+    mt5_market_client: MT5MarketDataClient | None = None
+    if execution_mode == "mt5" and _mt5_initialized and isinstance(paper_executor, MT5Executor):
+        mt5_market_client = MT5MarketDataClient(
+            queue=market_queue,
+            executor=paper_executor,
+            watchlist=WATCHLIST,
+        )
+
+    logger.info(
+        "SESSION_CONFIG session_id=%s execution_mode=%s mt5_initialized=%s "
+        "market_feed=%s initial_balance=%.2f gemini_enabled=%s watchlist=%s",
+        _LOG_SESSION_ID,
+        execution_mode,
+        _mt5_initialized,
+        mt5_market_client is not None,
+        initial_balance,
+        _GEMINI_ENABLED,
+        WATCHLIST,
+    )
 
     # ------------------------------------------------------------------
     # [SYNC] Re-sync open positions from exchange on restart
@@ -1679,47 +1649,7 @@ async def main() -> None:
     # NOTE: the balance was fetched from the exchange above and already
     # reflects the margin tied up in open positions, so no further
     # deduction is made.
-    if exchange_client is not None:
-        try:
-            existing_positions = await fetch_open_positions(exchange_client)
-            synced = 0
-            for pos_info in existing_positions:
-                # Normalize CCXT linear-futures symbol suffix, e.g.
-                # 'ETH/USDT:USDT' → 'ETH/USDT', before matching WATCHLIST.
-                sym: str = pos_info["symbol"].split(":")[0]
-                if sym not in WATCHLIST:
-                    logger.info(
-                        "🔄 [SYNC] Skipping position for %s (not in watchlist).",
-                        sym,
-                    )
-                    continue
-                restored = paper_executor.restore_position(
-                    symbol=sym,
-                    entry_price=pos_info["entry_price"],
-                    position_size=pos_info["position_size"],
-                )
-                if restored:
-                    synced += 1
-                    logger.info(
-                        "🔄 [SYNC] Restored open position: %s @ %.2f (notional=%.2f USDT, side=%s)",
-                        sym,
-                        pos_info["entry_price"],
-                        pos_info["position_size"],
-                        pos_info["side"],
-                    )
-            if synced > 0:
-                logger.info(
-                    "✅ [SYNC] Re-synced %d open position(s) from Binance "
-                    "(Open positions: %d/%d).",
-                    synced,
-                    risk_manager.open_count,
-                    risk_manager.max_positions,
-                )
-            else:
-                logger.info("🔄 [SYNC] No existing open positions found on Binance.")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("⚠️ [SYNC] Could not sync open positions from Binance: %s", exc)
-    elif execution_mode == "mt5" and _mt5_initialized:
+    if execution_mode == "mt5" and _mt5_initialized:
         # ------------------------------------------------------------------
         # [MT5] Restore positions: load saved local state first, then
         # reconcile against live MT5 positions to remove any ghosts.
@@ -1792,9 +1722,14 @@ async def main() -> None:
                 logger.warning("Could not warm-start for %s: %s", sym, exc)
 
     # ------------------------------------------------------------------
-    # [ELITE] Fast REST Warmup – pre-fill buffers before WebSocket starts
+    # [MT5] Warmup – pre-fill buffers from MT5 candle history
     # ------------------------------------------------------------------
-    await preload_historical_data(shared_state, WATCHLIST)
+    if execution_mode == "mt5" and _mt5_initialized and isinstance(paper_executor, MT5Executor):
+        await preload_historical_data_mt5(shared_state, WATCHLIST, paper_executor)
+    else:
+        logger.warning(
+            "[MT5] Historical preload skipped because MT5 is not active."
+        )
 
     # ------------------------------------------------------------------
     # [AUDIT] Decision pipeline diagnostics – log active thresholds and
@@ -1830,13 +1765,17 @@ async def main() -> None:
     )
     _live.start(refresh=True)
 
+    if mt5_market_client is None:
+        logger.error("❌ [MT5] Market feed client not available; cannot start bot loop.")
+        await close_db()
+        return
+
     run_tasks: list[asyncio.Future[Any] | asyncio.Task[Any] | Any] = [
-        ws_client.run(),
+        mt5_market_client.run(),
         market_consumer(market_queue, shared_state, paper_executor),
         signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
-        dashboard_logger(paper_executor, risk_manager, shared_state, _live, interval=1, exchange=exchange_client),
+        dashboard_logger(paper_executor, risk_manager, shared_state, _live, interval=1),
         weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
-        funding_rate_client.run(),
         position_sync_loop(paper_executor, interval=60),
         health_monitor_loop(shared_state, market_queue, paper_executor, interval=30),
         close_pending_reconciler_loop(shared_state, paper_executor, interval=20),
@@ -1869,8 +1808,6 @@ async def main() -> None:
         _live.stop()
         if _mt5_initialized:
             shutdown_mt5()
-        if exchange_client is not None:
-            await exchange_client.close()
         await close_db()
 
     logger.info("🛑 ClawdBot shut down cleanly")

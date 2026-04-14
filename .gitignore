@@ -5,6 +5,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv312/
 venv/
 env/
 
@@ -23,3 +24,8 @@ build/
 # Bot debug log (runtime artefact – not to be committed)
 bot_debug.log
 bot_debug.log.*
+audit.log
+state.json
+
+# Runtime logs and session output
+logs/

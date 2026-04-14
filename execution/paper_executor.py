@@ -60,14 +60,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import ccxt.async_support as ccxt_async
-from ccxt.base.errors import (
-    AuthenticationError as CcxtAuthenticationError,
-    ExchangeError as CcxtExchangeError,
-    InsufficientFunds as CcxtInsufficientFunds,
-    NetworkError as CcxtNetworkError,
-    NotSupported as CcxtNotSupported,
-)
+try:
+    from ccxt.base.errors import (
+        AuthenticationError as CcxtAuthenticationError,
+        ExchangeError as CcxtExchangeError,
+        InsufficientFunds as CcxtInsufficientFunds,
+        NetworkError as CcxtNetworkError,
+        NotSupported as CcxtNotSupported,
+    )
+except Exception:  # noqa: BLE001
+    # MT5-only deployments should still run without ccxt installed.
+    class _CcxtFallbackError(Exception):
+        pass
+
+    CcxtAuthenticationError = _CcxtFallbackError
+    CcxtExchangeError = _CcxtFallbackError
+    CcxtInsufficientFunds = _CcxtFallbackError
+    CcxtNetworkError = _CcxtFallbackError
+    CcxtNotSupported = _CcxtFallbackError
 
 from risk.risk_manager import (
     BASE_ACTIVATION_PCT,
@@ -1231,12 +1241,23 @@ class PaperExecutor:
         if self._exchange is None:
             return len(self.open_positions)
 
-        # Local import to avoid a circular dependency at module level
-        # (both modules live in the execution package).
-        from execution.binance_executor import fetch_open_positions
+        live_positions: list[dict[str, Any]] = []
+        try:
+            # Generic CCXT fallback for non-MT5 live exchange integrations.
+            raw_positions: list[dict[str, Any]] = await self._exchange.fetch_positions()
+            for pos in raw_positions:
+                contracts = float(pos.get("contracts") or 0.0)
+                if contracts <= 0.0:
+                    continue
+                symbol = str(pos.get("symbol") or "")
+                if not symbol:
+                    continue
+                live_positions.append({"symbol": symbol})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[SYNC] Could not fetch live positions: %s", exc)
+            return len(self.open_positions)
 
-        live_positions = await fetch_open_positions(self._exchange)
-        # Normalise symbols: strip settle suffix (e.g. "BTC/USDT:USDT" → "BTC/USDT")
+        # Normalise symbols: strip settle suffix (e.g. "BTC/USDT:USDT" -> "BTC/USDT")
         live_symbols: set[str] = {p["symbol"].split(":")[0] for p in live_positions}
 
         # ── Ghost detection: in memory but gone on exchange ────────────────
