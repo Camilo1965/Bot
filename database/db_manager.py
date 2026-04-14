@@ -69,6 +69,10 @@ SELECT create_hypertable(
 );
 """
 
+_ENABLE_TIMESCALE_EXTENSION = """
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+"""
+
 _INSERT_MARKET_TICK = """
 INSERT INTO market_data
     (timestamp, symbol, best_bid, bid_volume, best_ask, ask_volume)
@@ -478,9 +482,25 @@ class DatabaseManager:
             await conn.execute(_CREATE_COMMANDS)
             await conn.execute(_CREATE_HTF_TREND_STATUS)
             await conn.execute(_CREATE_HEALTH_EVENTS)
-            await conn.execute(_CREATE_HYPERTABLE_MARKET)
-            await conn.execute(_CREATE_HYPERTABLE_SENTIMENT)
-        logger.info("TimescaleDB schema initialised.")
+            # Try TimescaleDB when available, but continue gracefully on plain
+            # PostgreSQL so VPS deployments without the extension can still run.
+            try:
+                await conn.execute(_ENABLE_TIMESCALE_EXTENSION)
+                await conn.execute(_CREATE_HYPERTABLE_MARKET)
+                await conn.execute(_CREATE_HYPERTABLE_SENTIMENT)
+                logger.info("TimescaleDB hypertables enabled.")
+            except (
+                asyncpg.UndefinedFunctionError,
+                asyncpg.FeatureNotSupportedError,
+                asyncpg.InsufficientPrivilegeError,
+                asyncpg.PostgresError,
+            ) as exc:
+                logger.warning(
+                    "TimescaleDB not available; continuing with regular PostgreSQL tables. "
+                    "Reason: %s",
+                    exc,
+                )
+        logger.info("Database schema initialised.")
 
     @staticmethod
     def _build_dsn() -> str:
