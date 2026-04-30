@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,12 +33,14 @@ class MT5MarketDataClient:
         queue: asyncio.Queue[dict[str, Any]],
         executor: MT5Executor,
         watchlist: list[str],
+        shared_state: dict[str, Any] | None = None,
         tick_interval_s: float = 1.0,
         kline_interval_s: float = 10.0,
     ) -> None:
         self.queue = queue
         self.executor = executor
         self.watchlist = watchlist
+        self.shared_state = shared_state
         self.tick_interval_s = tick_interval_s
         self.kline_interval_s = kline_interval_s
         self._last_kline_ts: dict[str, dict[str, int]] = {
@@ -55,7 +58,14 @@ class MT5MarketDataClient:
         while True:
             for sym in self.watchlist:
                 try:
+                    start_t = time.perf_counter()
                     tick = await self.executor.fetch_tick(sym)
+                    end_t = time.perf_counter()
+                    
+                    if self.shared_state is not None:
+                        # Update api_latency_ms (round-trip time in milliseconds)
+                        self.shared_state["api_latency_ms"] = (end_t - start_t) * 1000.0
+                        
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[MT5 FEED] tick fetch failed for %s: %s", sym, exc)
                     continue

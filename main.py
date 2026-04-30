@@ -574,6 +574,7 @@ async def main() -> None:
             queue=market_queue,
             executor=paper_executor,
             watchlist=WATCHLIST,
+            shared_state=shared_state,
             tick_interval_s=_tick_iv,
             kline_interval_s=_kline_iv,
         )
