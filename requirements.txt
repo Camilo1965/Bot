@@ -13,7 +13,7 @@ numpy
 
 # Machine learning
 xgboost
-# scikit-learn  # Comentado: No se usa directamente (xgboost usa su propia API)
+scikit-learn
 # transformers  # Comentado: Muy pesado, no se usa actualmente en el código
 
 # Sentiment analysis
