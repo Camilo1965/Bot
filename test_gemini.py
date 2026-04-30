@@ -13,8 +13,8 @@ def test_gemini():
 
     print(f"Testing Gemini API with key: {api_key[:10]}...")
     
-    # Probamos con 1.5-flash que es el más estable
-    model_name = "gemini-1.5-flash" 
+    # Probamos con 2.0-flash que es la versión más moderna y probable para tu cuota
+    model_name = "gemini-2.0-flash" 
     
     try:
         client = genai.Client(api_key=api_key)
