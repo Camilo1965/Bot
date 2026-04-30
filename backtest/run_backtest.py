@@ -13,6 +13,10 @@ instead of training from scratch.
 Usage
 -----
     python -m backtest.run_backtest
+
+Contrast with ``backtest.py`` at repo root: that script runs a longer exploratory
+window (often ~6 months of data) with its own training split. This module is the
+“validate the artefact” path that saves ``models/xgb_live.json`` for ``main.py``.
 """
 
 from __future__ import annotations

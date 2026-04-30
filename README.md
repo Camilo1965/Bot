@@ -1,7 +1,11 @@
 # ClawdBot 🐾
 
 > **Institutional-grade algorithmic trading system built on an Event-Driven Architecture (EDA)**
-> Python 3.10+ · asyncio · PostgreSQL / TimescaleDB · Redis
+> Python 3.10+ · asyncio · PostgreSQL / TimescaleDB (optional infra; Redis not required for the default `main.py` loop)
+
+The diagram below describes the **target** modular layout. The live entrypoint today
+uses **asyncio tasks**, in-memory shared state, and direct calls between strategy,
+risk, and execution rather than a dedicated central bus or Redis cache.
 
 ---
 
@@ -62,7 +66,7 @@ central **Event Bus**.
 | **Loose coupling** | Modules communicate only via events; no direct imports across domain boundaries |
 | **Non-blocking I/O** | Every network call uses `asyncio` coroutines (`asyncpg`, `redis-py async`, `ccxt.async_support`) |
 | **Time-series storage** | TimescaleDB hypertables give sub-second query performance on millions of OHLCV rows |
-| **Low-latency cache** | Redis holds the latest order book snapshots and computed feature vectors |
+| **Low-latency cache** | Optional Redis for order-book snapshots (planned); features are computed in-process |
 | **Reproducible ML** | Feature engineering pipelines are version-controlled inside `/strategy` |
 
 ---
@@ -170,9 +174,9 @@ The **Order Management System** converts signals into exchange orders via
 confirmation.
 
 ### `risk/`
-Subscribes to `SignalEvent` and `FillEvent` to enforce **position limits**,
-**max drawdown** guards, and **Kelly-criterion-based position sizing** before
-orders reach the exchange.
+Enforces **position limits**, **max drawdown** guards, and **fixed-fractional**
+position sizing (see `RISK_PER_TRADE` / leverage in `risk/risk_manager.py`), not
+Kelly sizing (possible future enhancement).
 
 ### `utils/`
 Provides a reusable **structured JSON logger** and a `Config` class that loads
@@ -201,7 +205,7 @@ Copy `.env.example` and populate the values:
 - [ ] Add WebSocket feed in `data_ingestion/`
 - [ ] Build feature engineering pipeline in `strategy/`
 - [ ] Implement OMS in `execution/`
-- [ ] Add Kelly-criterion position sizing in `risk/`
+- [ ] Optional: Kelly-criterion or regime-aware sizing in `risk/` (today: fixed fractional)
 - [ ] Wire up structured config loader in `utils/`
 - [ ] Add pytest test suite
 - [ ] CI/CD pipeline with GitHub Actions
@@ -215,7 +219,7 @@ El sistema está construido para minimizar la latencia y procesar grandes volúm
 
 * **Motor Principal:** Python 3.10+ utilizando `asyncio` para concurrencia y manejo de WebSockets.
 * **Base de Datos (Series Temporales):** PostgreSQL con la extensión TimescaleDB, optimizado para almacenar millones de velas (OHLCV) y datos de ticks históricos.
-* **Caché en Memoria:** Redis, utilizado para almacenar el estado del libro de órdenes (Order Book) en tiempo real y gestionar el bus de eventos de forma ultrarrápida.
+* **Caché en Memoria (opcional):** Redis puede usarse para libro de órdenes y pub/sub; el bucle por defecto no lo requiere.
 * **Inteligencia Artificial:** Módulos de Machine Learning (XGBoost/LightGBM) para datos tabulares y NLP (Modelos LLM/FinBERT) para análisis de sentimiento de noticias financieras.
 
 ## 📂 Estructura del Proyecto
@@ -226,7 +230,7 @@ El código está modularizado siguiendo los estándares de la industria cuantita
 * `/data_ingestion`: Conexiones asíncronas vía WebSockets a exchanges (APIs) y recolección de noticias.
 * `/strategy`: El "cerebro". Ingeniería de características (Feature Engineering), modelos predictivos de Machine Learning y generador de señales.
 * `/execution`: Sistema de Gestión de Órdenes (OMS). Lógica para enrutar órdenes (Market/Limit), cálculo de comisiones y control de *slippage*.
-* `/risk`: Gestión de capital institucional, dimensionamiento dinámico de posiciones (Criterio de Kelly) y Stop Loss/Take Profit.
+* `/risk`: Gestión de capital, dimensionamiento por fracción fija (`RISK_PER_TRADE`) y límites de riesgo.
 * `/utils`: Configuraciones de variables de entorno, sistemas de logging y métricas de rendimiento (Ratio de Sharpe).
 
 ## 🚀 Instalación y Despliegue Local

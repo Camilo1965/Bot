@@ -334,6 +334,36 @@ def fetch_mt5_account_balance() -> float | None:
     return acct.balance
 
 
+def fetch_mt5_wallet_snapshot() -> dict[str, float | str] | None:
+    """Return live account figures from the connected MT5 terminal.
+
+    Used by the Rich dashboard to show the same balance / equity / margin
+    fields as the MT5 terminal status bar.  Must be called after a successful
+    :func:`initialize_mt5` (or equivalent ``mt5.login``) in the same process.
+
+    Returns
+    -------
+    dict[str, float | str] | None
+        Keys: ``balance``, ``equity``, ``margin`` (used), ``margin_free``,
+        and ``currency`` (account currency string).
+        ``None`` when the MetaTrader5 module is unavailable or
+        ``mt5.account_info()`` returns ``None``.
+    """
+    if not _MT5_AVAILABLE:
+        return None
+    acct = mt5.account_info()
+    if acct is None:
+        return None
+    cur = getattr(acct, "currency", "") or "USD"
+    return {
+        "balance": float(acct.balance),
+        "equity": float(acct.equity),
+        "margin": float(acct.margin),
+        "margin_free": float(acct.margin_free),
+        "currency": cur,
+    }
+
+
 # ── Lot size calculation ───────────────────────────────────────────────────────
 
 
@@ -1234,6 +1264,7 @@ class MT5Executor(PaperExecutor):
         )
 
         # ── Live MT5 order ─────────────────────────────────────────────────
+        mt5_ticket: int | None = None
         if self._live:
             if not _MT5_AVAILABLE:
                 logger.error(
@@ -1299,6 +1330,7 @@ class MT5Executor(PaperExecutor):
                 self._risk.credit(position_size)
                 self._risk.register_close()
                 return False
+            mt5_ticket = await self._resolve_position_ticket_after_buy(mt5_sym, result)
 
         trade_id = await self._db.insert_open_trade(
             symbol=sym,
@@ -1320,6 +1352,7 @@ class MT5Executor(PaperExecutor):
             atr_trailing_distance=atr_trailing_distance,
             ml_confidence=win_probability,
             sentiment_score=sentiment_score,
+            mt5_position_ticket=mt5_ticket,
         )
 
         record_trade(
@@ -1617,12 +1650,142 @@ class MT5Executor(PaperExecutor):
 
         request: dict = {
             "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": mt5_sym,
             "position": ticket,
             "sl": norm_sl,
             "tp": norm_tp,
         }
         result = await self._send_order_with_retry(request)
         return result is not None
+
+    async def _resolve_position_ticket_after_buy(self, mt5_sym: str, result: Any) -> int | None:
+        """Return the hedging-mode position ticket after a successful market BUY."""
+        if not _MT5_AVAILABLE:
+            return None
+        pos_id = int(getattr(result, "position", 0) or 0)
+        if pos_id > 0:
+            chk = mt5.positions_get(ticket=pos_id)
+            if chk:
+                return pos_id
+        await asyncio.sleep(0.05)
+        raw = mt5.positions_get(symbol=mt5_sym)
+        if raw is None:
+            return None
+        ours = [
+            p for p in raw
+            if p.magic == self._magic and p.type == mt5.POSITION_TYPE_BUY
+        ]
+        if not ours:
+            logger.warning(
+                "[MT5] Could not resolve position ticket after BUY on %s (magic=%d).",
+                mt5_sym,
+                self._magic,
+            )
+            return None
+        return int(max(ours, key=lambda p: p.ticket).ticket)
+
+    def _find_magic_long_ticket(self, sym: str) -> int | None:
+        """Locate a BUY position ticket for *sym* tagged with :attr:`_magic`."""
+        if not _MT5_AVAILABLE:
+            return None
+        mt5_sym = self._resolve_symbol(sym)
+        if mt5_sym is None:
+            return None
+        raw = mt5.positions_get(symbol=mt5_sym)
+        if raw is None:
+            return None
+        ours = [
+            p for p in raw
+            if p.magic == self._magic and p.type == mt5.POSITION_TYPE_BUY
+        ]
+        if not ours:
+            return None
+        return int(max(ours, key=lambda p: p.ticket).ticket)
+
+    def _dynamic_tp_for_long(self, pos: OpenPosition) -> float | None:
+        """Optional profit target above the peak once the trailing stop is active."""
+        if not pos.trailing_stop_active:
+            return None
+        gap_pct = max(float(pos.trailing_distance_pct), 0.004)
+        gap_abs = float(pos.atr_trailing_distance) * 1.25 if pos.atr_trailing_distance > 0.0 else 0.0
+        gap = max(pos.peak_price * gap_pct, gap_abs, pos.peak_price * 0.006)
+        return float(pos.peak_price + gap)
+
+    async def _sync_exchange_stops(
+        self,
+        sym: str,
+        pos: OpenPosition,
+        current_price: float,
+        current_atr: float | None,
+    ) -> None:
+        """Push ratcheted SL and optional dynamic TP to MT5 (``TRADE_ACTION_SLTP``)."""
+        if not self._live or not _MT5_AVAILABLE:
+            return
+
+        ticket = pos.mt5_position_ticket or self._find_magic_long_ticket(sym)
+        if ticket is None:
+            return
+        pos.mt5_position_ticket = ticket
+
+        mt5_sym = self._resolve_symbol(sym)
+        if mt5_sym is None:
+            return
+
+        now = time.monotonic()
+        if now - pos.last_mt5_modify_mono < 0.12:
+            return
+
+        tick = mt5.symbol_info_tick(mt5_sym)
+        if tick is None or tick.ask <= 0.0 or tick.bid <= 0.0:
+            return
+        ask = float(tick.ask)
+        bid = float(tick.bid)
+
+        pins = mt5.positions_get(ticket=ticket)
+        if not pins:
+            return
+        bpos = pins[0]
+        cur_sl_br = float(bpos.sl) if bpos.sl else 0.0
+        cur_tp_br = float(bpos.tp) if bpos.tp else 0.0
+
+        info = mt5.symbol_info(mt5_sym)
+        if info is None:
+            return
+        point = float(info.point) if info.point else 0.01
+        digits = int(info.digits) if info.digits else 5
+        min_step = max(point * 4.0, 10.0 ** (-max(digits - 1, 1)))
+
+        send_sl = self._normalize_price(pos.current_stop_loss, digits)
+
+        cand_tp = self._dynamic_tp_for_long(pos)
+        send_tp = cur_tp_br
+        if cand_tp is not None:
+            cn = self._normalize_price(cand_tp, digits)
+            if cn > ask + min_step and self._validate_stops(mt5_sym, ask, send_sl, cn):
+                send_tp = max(cur_tp_br, cn)
+
+        sl_delta = abs(send_sl - cur_sl_br)
+        tp_delta = abs(send_tp - cur_tp_br) if send_tp > 0.0 or cur_tp_br > 0.0 else 0.0
+        if sl_delta < min_step * 0.35 and tp_delta < min_step * 0.35:
+            return
+
+        ok = await self.modify_position(
+            ticket,
+            new_sl=send_sl,
+            new_tp=send_tp if send_tp > 0.0 else 0.0,
+            symbol=sym,
+        )
+        if ok:
+            pos.last_broker_sl_synced = send_sl
+            pos.last_broker_tp_synced = send_tp
+            pos.last_mt5_modify_mono = now
+            logger.debug(
+                "[MT5 SYNC] SL/TP pushed  sym=%s  ticket=%d  sl=%.5f  tp=%.5f",
+                sym,
+                ticket,
+                send_sl,
+                send_tp,
+            )
 
     async def close_position_by_ticket(self, ticket: int) -> bool:
         """Close an open MT5 position by its ticket number.

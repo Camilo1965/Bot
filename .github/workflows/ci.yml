@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          out = []
+          for line in Path("requirements.txt").read_text(encoding="utf-8").splitlines():
+              s = line.strip()
+              if not s or s.startswith("#"):
+                  continue
+              if re.search(r"MetaTrader5|PyQt6|pyqtgraph", s):
+                  continue
+              out.append(line)
+          Path("/tmp/requirements_ci.txt").write_text("\n".join(out) + "\n", encoding="utf-8")
+          PY
+          pip install -r /tmp/requirements_ci.txt
+          pip install pytest
+
+      - name: Run pytest
+        run: python -m pytest tests/ -q --tb=short

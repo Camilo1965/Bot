@@ -347,6 +347,11 @@ class OpenPosition:
     # Close coordination flags: avoid dropping local state when live close fails.
     close_pending: bool = False
     last_close_error: str = ""
+    # Live MT5: position ticket + last levels pushed to the broker (SL/TP sync).
+    mt5_position_ticket: int | None = None
+    last_broker_sl_synced: float = 0.0
+    last_broker_tp_synced: float = 0.0
+    last_mt5_modify_mono: float = 0.0
 
     def __post_init__(self) -> None:
         # Initialise peak_price to entry_price so it is always defined
@@ -356,6 +361,8 @@ class OpenPosition:
             self.stop_loss_price = self.entry_price * (1.0 - self.sl_pct)
         # Seed the ratcheted stop at the initial SL level.
         self.current_stop_loss = self.stop_loss_price
+        if self.last_broker_sl_synced <= 0.0:
+            self.last_broker_sl_synced = self.current_stop_loss
 
     @property
     def max_price_seen(self) -> float:
@@ -445,6 +452,10 @@ class PaperExecutor:
                     "sentiment_score": pos.sentiment_score,
                     "close_pending": pos.close_pending,
                     "last_close_error": pos.last_close_error,
+                    "mt5_position_ticket": pos.mt5_position_ticket,
+                    "last_broker_sl_synced": pos.last_broker_sl_synced,
+                    "last_broker_tp_synced": pos.last_broker_tp_synced,
+                    "last_mt5_modify_mono": pos.last_mt5_modify_mono,
                 })
             tmp = _STATE_FILE.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -501,6 +512,14 @@ class PaperExecutor:
                     sentiment_score=float(raw.get("sentiment_score", 0.0)),
                     close_pending=bool(raw.get("close_pending", False)),
                     last_close_error=str(raw.get("last_close_error", "")),
+                    mt5_position_ticket=(
+                        int(raw["mt5_position_ticket"])
+                        if raw.get("mt5_position_ticket") is not None
+                        else None
+                    ),
+                    last_broker_sl_synced=float(raw.get("last_broker_sl_synced", 0.0)),
+                    last_broker_tp_synced=float(raw.get("last_broker_tp_synced", 0.0)),
+                    last_mt5_modify_mono=float(raw.get("last_mt5_modify_mono", 0.0)),
                 )
                 # Restore mutable trailing-stop state that __post_init__ would overwrite
                 pos.peak_price = float(raw.get("peak_price", pos.entry_price))
@@ -832,6 +851,19 @@ class PaperExecutor:
         )
         return True
 
+    async def _sync_exchange_stops(
+        self,
+        sym: str,
+        pos: OpenPosition,
+        current_price: float,
+        current_atr: float | None,
+    ) -> None:
+        """Push ratcheted SL / dynamic TP to a live exchange (MT5 override).
+
+        Default paper implementation is a no-op.
+        """
+        return
+
     async def check_and_close(
         self,
         current_price: float,
@@ -910,6 +942,8 @@ class PaperExecutor:
                 pos.current_stop_loss,
                 current_price - pos.current_stop_loss,
             )
+
+            await self._sync_exchange_stops(sym, pos, current_price, current_atr)
 
             if current_price > pos.current_stop_loss:
                 return None

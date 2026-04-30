@@ -68,6 +68,7 @@ class MT5MarketDataClient:
                     last = (bid + ask) / 2.0
                 if last <= 0.0:
                     continue
+                mid = (bid + ask) / 2.0 if bid > 0.0 and ask > 0.0 else last
                 ts = tick.get("time")
                 ts_ms = (
                     int(ts.timestamp() * 1000)
@@ -81,6 +82,9 @@ class MT5MarketDataClient:
                         "symbol": sym,
                         "id": f"mt5-{sym}-{ts_ms}",
                         "price": last,
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": mid,
                         "amount": 0.0,
                         "side": None,
                         "timestamp": ts_ms,

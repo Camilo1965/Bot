@@ -8,13 +8,13 @@ ccxt[pro]
 
 # Data manipulation
 pandas
-polars
+# polars  # Comentado: No se usa actualmente
 numpy
 
 # Machine learning
 xgboost
-scikit-learn
-transformers
+# scikit-learn  # Comentado: No se usa directamente (xgboost usa su propia API)
+# transformers  # Comentado: Muy pesado, no se usa actualmente en el código
 
 # Sentiment analysis
 vaderSentiment
@@ -24,11 +24,11 @@ google-genai
 feedparser
 
 # Storage / caching
-redis
+# redis  # Comentado: Opcional, no usado por el bucle principal
 asyncpg
 
 # Backtesting / portfolio analytics
-vectorbt
+# vectorbt  # Comentado: No se usa en los scripts de backtest actuales
 
 # Configuration
 python-dotenv

@@ -27,6 +27,11 @@ toward +1.0 to open the sentiment gate and observe more BUY signals.
 Run
 ---
     python backtest.py
+
+See also ``backtest/run_backtest.py``: that script trains/evaluates against the
+**saved** ``models/xgb_live.json`` over a configurable window (often shorter than
+the ~6-month exploration loop here). Use ``backtest.py`` for exploratory full
+historical runs; use ``run_backtest.py`` to validate the deployed artefact.
 """
 
 from __future__ import annotations

@@ -179,6 +179,12 @@ class FeatureEngineer:
     ) -> tuple[pd.DataFrame, pd.Series] | tuple[None, None]:
         """Build a labelled feature matrix for training.
 
+        **Legacy / offline research.**  Live inference paths use
+        :meth:`~strategy.ml_predictor.MLPredictor._compute_features`, which
+        produces the eight-element vector expected by the deployed XGBoost model.
+        This method builds an alternate indicator set for exploratory notebooks
+        or older training scripts—not the production inference pipeline.
+
         Each row is one time step; the label is ``1`` if the price
         *horizon* steps ahead is higher than the current price, else ``0``.
 
