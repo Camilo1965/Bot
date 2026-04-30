@@ -478,9 +478,18 @@ class DatabaseManager:
             await conn.execute(_CREATE_COMMANDS)
             await conn.execute(_CREATE_HTF_TREND_STATUS)
             await conn.execute(_CREATE_HEALTH_EVENTS)
-            await conn.execute(_CREATE_HYPERTABLE_MARKET)
-            await conn.execute(_CREATE_HYPERTABLE_SENTIMENT)
-        logger.info("TimescaleDB schema initialised.")
+            
+            # Intentar crear hypertables (TimescaleDB), pero no fallar si no existe
+            try:
+                await conn.execute(_CREATE_HYPERTABLE_MARKET)
+                await conn.execute(_CREATE_HYPERTABLE_SENTIMENT)
+                logger.info("TimescaleDB hypertables created/verified.")
+            except Exception as exc:
+                if "does not exist" in str(exc):
+                    logger.warning("TimescaleDB not detected – falling back to standard PostgreSQL tables.")
+                else:
+                    logger.error("Unexpected error during hypertable creation: %s", exc)
+        logger.info("Database schema initialised.")
 
     @staticmethod
     def _build_dsn() -> str:
