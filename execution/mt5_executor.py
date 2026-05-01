@@ -1671,6 +1671,115 @@ class MT5Executor(PaperExecutor):
             telegram_after=True,
         )
 
+    async def _try_adopt_mt5_position(self, sym: str) -> bool:
+        """Pull broker-side LONG position into ``open_positions`` + DB + journal.
+
+        Called when MT5 shows our *magic* position but local state has no entry.
+        """
+        if not _MT5_AVAILABLE:
+            return False
+        mt5_sym = self._resolve_symbol(sym)
+        if mt5_sym is None:
+            return False
+        raw = mt5.positions_get(symbol=mt5_sym)
+        if not raw:
+            return False
+        p = None
+        for cand in raw:
+            if cand.magic != self._magic:
+                continue
+            if cand.type != mt5.POSITION_TYPE_BUY:
+                logger.warning(
+                    "[MT5 SYNC] Cannot adopt %s — broker position is not BUY.", sym
+                )
+                return False
+            p = cand
+            break
+        if p is None:
+            return False
+
+        info = mt5.symbol_info(mt5_sym)
+        digits: int = info.digits if info else 5
+        contract_size = float(info.trade_contract_size) if info else 1.0
+
+        entry = float(p.price_open)
+        volume = float(p.volume)
+        position_size = volume * contract_size * entry
+
+        sl_raw = float(p.sl or 0.0)
+        thresholds = get_dynamic_thresholds(0.0)
+        if sl_raw > 0.0:
+            stop_loss_price = self._normalize_price(sl_raw, digits)
+        else:
+            stop_loss_price = self._normalize_price(
+                entry * (1.0 - thresholds.sl_pct), digits
+            )
+
+        try:
+            ts = datetime.fromtimestamp(int(p.time), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            ts = datetime.now(tz=timezone.utc)
+
+        try:
+            trade_id = await self._db.insert_open_trade(
+                symbol=sym,
+                entry_price=entry,
+                position_size=position_size,
+                entry_time=ts,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[MT5 SYNC] adopt insert_open_trade failed sym=%s — %s", sym, exc
+            )
+            return False
+
+        op = OpenPosition(
+            symbol=sym,
+            entry_price=entry,
+            position_size=position_size,
+            entry_time=ts,
+            trade_id=trade_id,
+            sl_pct=thresholds.sl_pct,
+            activation_pct=thresholds.activation_pct,
+            trailing_distance_pct=thresholds.trailing_distance_pct,
+            stop_loss_price=stop_loss_price,
+            atr_trailing_distance=0.0,
+            ml_confidence=0.0,
+            sentiment_score=0.0,
+            mt5_position_ticket=int(p.ticket),
+        )
+        peak = max(entry, float(p.price_current))
+        op.peak_price = peak
+        op.current_stop_loss = stop_loss_price
+        if sl_raw > 0.0:
+            op.last_broker_sl_synced = stop_loss_price
+        tp_raw = float(p.tp or 0.0)
+        if tp_raw > 0.0:
+            op.last_broker_tp_synced = self._normalize_price(tp_raw, digits)
+
+        self.open_positions[sym] = op
+        self._risk.register_open()
+
+        record_trade(
+            timestamp=ts,
+            symbol=sym,
+            action="BUY",
+            execution_price=entry,
+            quantity=position_size / entry if entry > 0 else 0.0,
+            ml_confidence_at_entry=0.0,
+            sentiment_score_at_entry=0.0,
+        )
+        self._save_state()
+
+        logger.info(
+            "[MT5 SYNC] ✅ Adopted orphan MT5 position sym=%s ticket=%s entry=%.5f sl=%.5f",
+            sym,
+            p.ticket,
+            entry,
+            stop_loss_price,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # _close_position override
     # ------------------------------------------------------------------
@@ -1859,8 +1968,11 @@ class MT5Executor(PaperExecutor):
         """Re-sync local state against live MT5 positions.
 
         Detects *ghost* positions (in local memory but not on MT5) and removes
-        them.  In pure paper mode (``live=False``) returns the local position
-        count unchanged.
+        them.  Positions open on MT5 with our *magic* but missing locally are
+        **adopted** (LONG only) into ``open_positions`` + DB.
+
+        In pure paper mode (``live=False``) returns the local position count
+        unchanged.
         """
         if not self._live:
             return len(self.open_positions)
@@ -1887,14 +1999,16 @@ class MT5Executor(PaperExecutor):
         for sym in ghost_symbols:
             await self._reconcile_ghost_position(sym)
 
-        # Discrepancy detection
+        # Broker-only positions → import into local book (LONG + our magic)
         untracked = [sym for sym in live_symbols if sym not in self.open_positions]
         for sym in untracked:
-            logger.warning(
-                "[MT5 SYNC] ⚠️ Position for %s is open on MT5 but not tracked locally. "
-                "Consider restarting the bot or manually reconciling.",
-                sym,
-            )
+            adopted = await self._try_adopt_mt5_position(sym)
+            if not adopted:
+                logger.warning(
+                    "[MT5 SYNC] ⚠️ Position for %s is open on MT5 but not tracked locally "
+                    "(adoption failed — check logs).",
+                    sym,
+                )
 
         return len(live_symbols)
 
