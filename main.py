@@ -64,6 +64,7 @@ from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor
 from strategy.sentiment_llm import get_gemini_sentiment
+from utils.runtime_snapshot import runtime_metrics_loop, write_startup_snapshot
 from utils.telegram_notifier import (
     install_asyncio_critical_telegram_alerts,
     install_telegram_log_alerts,
@@ -739,6 +740,18 @@ async def main() -> None:
         risk_manager.is_trading_halted(),
     )
 
+    try:
+        snap_path = write_startup_snapshot(
+            execution_mode=execution_mode,
+            session_id=_LOG_SESSION_ID,
+            watchlist=WATCHLIST,
+            risk_manager=risk_manager,
+            paper_executor=paper_executor,
+        )
+        logger.info("📄 Startup snapshot: %s", snap_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Startup runtime snapshot failed: %s", exc)
+
     # ── Start Rich Live dashboard ─────────────────────────────────────────────
     # The Live context renders a fixed TUI table that refreshes every second.
     # Important log events (WARNING+) are forwarded via RichHandler and appear
@@ -796,6 +809,22 @@ async def main() -> None:
         monthly_report_loop(),
         start_web_dashboard(shared_state, paper_executor, risk_manager, WATCHLIST, port=8080),
     ]
+    _rmi = float(os.environ.get("RUNTIME_METRICS_INTERVAL_S", "0").strip() or "0")
+    if _rmi >= 10.0:
+        run_tasks.append(
+            runtime_metrics_loop(
+                _LOG_SESSION_ID,
+                execution_mode,
+                risk_manager,
+                paper_executor,
+                WATCHLIST,
+                _rmi,
+            )
+        )
+        logger.info(
+            "📊 Runtime metrics JSONL every %.0fs → logs/runtime_metrics.jsonl",
+            _rmi,
+        )
     if _GEMINI_ENABLED:
         run_tasks.append(gemini_sentiment_refresher(shared_state))
     else:

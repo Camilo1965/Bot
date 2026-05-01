@@ -406,15 +406,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             </div>
                             <div class="grid grid-cols-2 gap-3 mt-3 pt-3 border-t border-white/5 text-xs">
                                 <div>
-                                    <div class="text-slate-500 mb-0.5">SL (bot)</div>
+                                    <div class="text-slate-500 mb-0.5">SL activo (bot)</div>
                                     <div class="font-mono text-slate-100">${slVal}</div>
                                 </div>
                                 <div>
-                                    <div class="text-slate-500 mb-0.5">TP dinámico</div>
+                                    <div class="text-slate-500 mb-0.5">TP objetivo (hint)</div>
                                     <div class="font-mono text-emerald-400/90">${tpVal}</div>
                                 </div>
+                                <div>
+                                    <div class="text-slate-500 mb-0.5">Pico máximo</div>
+                                    <div class="font-mono text-sky-200/90">${item.peak_price || '—'}</div>
+                                </div>
+                                <div class="col-span-2">
+                                    <div class="text-slate-500 mb-0.5">Estado trailing</div>
+                                    <div class="text-slate-300 leading-snug">${item.trail_progress || '—'}</div>
+                                </div>
+                                <div>
+                                    <div class="text-slate-500 mb-0.5">SL en MT5</div>
+                                    <div class="font-mono text-amber-200/90">${item.broker_stop_loss || '—'}</div>
+                                </div>
+                                <div>
+                                    <div class="text-slate-500 mb-0.5">TP en MT5</div>
+                                    <div class="font-mono text-amber-200/90">${item.broker_take_profit || '—'}</div>
+                                </div>
                             </div>
-                            <div class="text-[10px] text-slate-600 mt-2">MT5 puede mostrar otros niveles hasta que sincronice.</div>
+                            <div class="text-[10px] text-slate-600 mt-2">El bot sube el SL con el pico (tras umbral). TP hint sube con el pico; MT5 puede ir un tick atrás hasta el próximo sync.</div>
                         </div>
                     `;
                 }
@@ -583,6 +599,7 @@ async def start_web_dashboard(
         ml_probs = state.get("ml_probs", {})
         htf_trend = state.get("htf_trend", {})
         mt5_profit_by_ticket: dict[int, float] = {}
+        mt5_by_ticket: dict[int, dict[str, Any]] = {}
 
         # MT5 live mode: prefer broker-reported unrealized PnL so dashboard matches terminal.
         get_positions = getattr(paper_executor, "get_open_positions", None)
@@ -590,13 +607,16 @@ async def start_web_dashboard(
             try:
                 mt5_positions = get_positions()
                 if isinstance(mt5_positions, list):
-                    mt5_profit_by_ticket = {
-                        int(p.get("ticket")): float(p.get("profit", 0.0))
-                        for p in mt5_positions
-                        if p.get("ticket") is not None
-                    }
+                    for p in mt5_positions:
+                        t = p.get("ticket")
+                        if t is None:
+                            continue
+                        tid = int(t)
+                        mt5_profit_by_ticket[tid] = float(p.get("profit", 0.0))
+                        mt5_by_ticket[tid] = p
             except Exception:
                 mt5_profit_by_ticket = {}
+                mt5_by_ticket = {}
         
         for sym in watchlist:
             prices = list(state["prices"].get(sym, []))
@@ -626,6 +646,10 @@ async def start_web_dashboard(
             trailing_active = False
             sl_num: float | None = None
             tp_num: float | None = None
+            peak_display = "—"
+            trail_progress = "—"
+            broker_sl_display = "—"
+            broker_tp_display = "—"
 
             if has_pos and pos is not None:
                 mt5_ticket = getattr(pos, "mt5_position_ticket", None)
@@ -640,12 +664,27 @@ async def start_web_dashboard(
                 trailing_active = bool(getattr(pos, "trailing_stop_active", False))
                 sl_num = float(pos.current_stop_loss)
                 sl_display = f"{sl_num:,.2f}"
+                peak_display = f"{pos.peak_price:,.2f}"
+                if pos.entry_price and pos.entry_price > 0:
+                    pcp = (float(price) - pos.entry_price) / pos.entry_price
+                    if trailing_active:
+                        trail_progress = f"Trailing ON (pico {peak_display})"
+                    else:
+                        trail_progress = (
+                            f"Beneficio {pcp * 100:.2f}% → activar ≥ {pos.activation_pct * 100:.2f}%"
+                        )
                 tp_raw = compute_dynamic_tp_hint(pos)
                 if tp_raw is not None and tp_raw > 0:
                     tp_num = float(tp_raw)
                     tp_display = f"{tp_num:,.2f}"
                 else:
                     tp_display = "—"
+                if isinstance(mt5_ticket, int) and mt5_ticket in mt5_by_ticket:
+                    br = mt5_by_ticket[mt5_ticket]
+                    slb = float(br.get("sl") or 0.0)
+                    tpb = float(br.get("tp") or 0.0)
+                    broker_sl_display = f"{slb:,.2f}" if slb > 0.0 else "—"
+                    broker_tp_display = f"{tpb:,.2f}" if tpb > 0.0 else "—"
             else:
                 action = "Comprar" if prob >= BUY_PROB_THRESHOLD else "Esperar"
 
@@ -669,6 +708,10 @@ async def start_web_dashboard(
                 "stop_loss_num": sl_num,
                 "take_profit_num": tp_num,
                 "trailing_active": trailing_active,
+                "peak_price": peak_display,
+                "trail_progress": trail_progress,
+                "broker_stop_loss": broker_sl_display,
+                "broker_take_profit": broker_tp_display,
                 "unrealized_pnl": f"{'+' if unrl >=0 else ''}{unrl:.2f} USDT",
                 "unrealized_pnl_label": "Ganancia flotante" if unrl >= 0 else "Pérdida flotante",
                 "unrealized_pnl_num": unrl
