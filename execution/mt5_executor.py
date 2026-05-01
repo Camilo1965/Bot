@@ -76,6 +76,7 @@ from execution.paper_executor import (
     OpenPosition,
     PaperExecutor,
     _TAKER_FEE_RATE,
+    compute_dynamic_tp_hint,
     record_trade,
 )
 from risk.risk_manager import (
@@ -815,7 +816,7 @@ class MT5Executor(PaperExecutor):
         sl_adj = self._normalize_price(sl_adj, digits)
 
         for _ in range(64):
-            if self._validate_stops(mt5_sym, ask_f, sl_adj, 0.0, is_buy=True):
+            if self._validate_stops(mt5_sym, ask_f, sl_adj, 0.0, is_buy=True, tick=tick):
                 adjusted = abs(sl_adj - self._normalize_price(original, digits)) > point * 0.01
                 if adjusted:
                     logger.warning(
@@ -848,6 +849,8 @@ class MT5Executor(PaperExecutor):
         sl: float,
         tp: float = 0.0,
         is_buy: bool = True,
+        *,
+        tick: Any | None = None,
     ) -> bool:
         """Check that SL/TP distances satisfy the broker's minimum stops_level.
 
@@ -857,19 +860,23 @@ class MT5Executor(PaperExecutor):
         CRITICAL: For a BUY order, the SL is triggered by the BID price.
         For a SELL order, it is triggered by the ASK price. This method uses the
         appropriate reference price to ensure compliance.
+
+        Pass *tick* when validating in the same cycle as a clamp or quote read;
+        otherwise a fresh ``symbol_info_tick`` can differ by a few points and
+        spuriously fail while price moves.
         """
         if not _MT5_AVAILABLE:
             return True
 
         info = mt5.symbol_info(symbol)
-        tick = mt5.symbol_info_tick(symbol)
-        if not info or not tick:
+        tick_use = tick if tick is not None else mt5.symbol_info_tick(symbol)
+        if not info or not tick_use:
             logger.error("[MT5] Cannot fetch symbol_info/tick for stops validation on %s.", symbol)
             return False
 
         # Reference price for SL triggering:
         # BUY positions exit at BID; SELL positions exit at ASK.
-        ref_price = tick.bid if is_buy else tick.ask
+        ref_price = tick_use.bid if is_buy else tick_use.ask
         min_distance_price = info.trade_stops_level * info.point
 
         # 1. Check distance from execution price (the price in the order request)
@@ -1867,13 +1874,8 @@ class MT5Executor(PaperExecutor):
         return int(max(ours, key=lambda p: p.ticket).ticket)
 
     def _dynamic_tp_for_long(self, pos: OpenPosition) -> float | None:
-        """Optional profit target above the peak once the trailing stop is active."""
-        if not pos.trailing_stop_active:
-            return None
-        gap_pct = max(float(pos.trailing_distance_pct), 0.004)
-        gap_abs = float(pos.atr_trailing_distance) * 1.25 if pos.atr_trailing_distance > 0.0 else 0.0
-        gap = max(pos.peak_price * gap_pct, gap_abs, pos.peak_price * 0.006)
-        return float(pos.peak_price + gap)
+        """Broker TP target; shared formula in :func:`~execution.paper_executor.compute_dynamic_tp_hint`."""
+        return compute_dynamic_tp_hint(pos)
 
     async def _sync_exchange_stops(
         self,
@@ -1931,10 +1933,12 @@ class MT5Executor(PaperExecutor):
         send_tp = cur_tp_br
         if cand_tp is not None:
             cn = self._normalize_price(cand_tp, digits)
-            if cn > ask + min_step and self._validate_stops(mt5_sym, ask, send_sl, cn):
+            if cn > ask + min_step and self._validate_stops(
+                mt5_sym, ask, send_sl, cn, is_buy=True, tick=tick
+            ):
                 send_tp = max(cur_tp_br, cn)
 
-        if not self._validate_stops(mt5_sym, ask, send_sl):
+        if not self._validate_stops(mt5_sym, ask, send_sl, 0.0, is_buy=True, tick=tick):
             return
 
         sl_delta = abs(send_sl - cur_sl_br)

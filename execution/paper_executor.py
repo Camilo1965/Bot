@@ -378,6 +378,20 @@ class OpenPosition:
         return self.peak_price
 
 
+def compute_dynamic_tp_hint(pos: OpenPosition) -> float | None:
+    """Peak + gap take-profit price for longs (dashboard + MT5 TP sync).
+
+    Does not require ``trailing_stop_active`` so a TP level can be pushed to
+    the broker before the full trailing-stop activation threshold (~e.g. 2.5%).
+    """
+    if pos.peak_price <= pos.entry_price:
+        return None
+    gap_pct = max(float(pos.trailing_distance_pct), 0.004)
+    gap_abs = float(pos.atr_trailing_distance) * 1.25 if pos.atr_trailing_distance > 0.0 else 0.0
+    gap = max(pos.peak_price * gap_pct, gap_abs, pos.peak_price * 0.006)
+    return float(pos.peak_price + gap)
+
+
 class PaperExecutor:
     """Simulate (and optionally live-execute) order execution for multiple symbols.
 

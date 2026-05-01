@@ -11,7 +11,7 @@ from aiohttp import web
 from bot.dashboard_helpers import compute_rsi, mt5_dashboard_mark
 from bot import state as dash_state
 from database.db_manager import db
-from execution.paper_executor import PaperExecutor
+from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD
 
@@ -391,9 +391,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 if (item.has_position) {
                     let pnlColor = item.unrealized_pnl_num >= 0 ? 'text-glow-green' : 'text-glow-red';
+                    const slVal = item.stop_loss || '—';
+                    const tpVal = item.take_profit || '—';
+                    const trailBadge = item.trailing_active ? '<span class="text-[10px] text-amber-400/90 ml-2">Trailing ON</span>' : '';
                     cardsHtml += `
                         <div class="mt-5 bg-black/40 rounded-2xl p-4 border border-sky-500/20">
-                            <div class="text-[10px] uppercase tracking-widest text-sky-400/80 mb-2 font-semibold">Trade Activo</div>
+                            <div class="text-[10px] uppercase tracking-widest text-sky-400/80 mb-2 font-semibold">Trade Activo${trailBadge}</div>
                             <div class="flex flex-col sm:flex-row sm:justify-between sm:items-end gap-1 sm:gap-0">
                                 <div>
                                     <div class="text-xs text-slate-400 mb-0.5">${item.position_str}</div>
@@ -401,6 +404,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                                 </div>
                                 <div class="${pnlColor} font-bold text-lg font-mono tracking-tight">${item.unrealized_pnl}</div>
                             </div>
+                            <div class="grid grid-cols-2 gap-3 mt-3 pt-3 border-t border-white/5 text-xs">
+                                <div>
+                                    <div class="text-slate-500 mb-0.5">SL (bot)</div>
+                                    <div class="font-mono text-slate-100">${slVal}</div>
+                                </div>
+                                <div>
+                                    <div class="text-slate-500 mb-0.5">TP dinámico</div>
+                                    <div class="font-mono text-emerald-400/90">${tpVal}</div>
+                                </div>
+                            </div>
+                            <div class="text-[10px] text-slate-600 mt-2">MT5 puede mostrar otros niveles hasta que sincronice.</div>
                         </div>
                     `;
                 }
@@ -607,8 +621,13 @@ async def start_web_dashboard(
             has_pos = bool(pos)
             unrl = 0.0
             pos_str = ""
-            
-            if has_pos:
+            sl_display = ""
+            tp_display = ""
+            trailing_active = False
+            sl_num: float | None = None
+            tp_num: float | None = None
+
+            if has_pos and pos is not None:
                 mt5_ticket = getattr(pos, "mt5_position_ticket", None)
                 if isinstance(mt5_ticket, int) and mt5_ticket in mt5_profit_by_ticket:
                     unrl = mt5_profit_by_ticket[mt5_ticket]
@@ -618,9 +637,18 @@ async def start_web_dashboard(
                     unrl = (price - pos.entry_price) * qty
                 pos_str = f"Comprado en {pos.entry_price:,.2f}"
                 action = "Gestionando posición"
+                trailing_active = bool(getattr(pos, "trailing_stop_active", False))
+                sl_num = float(pos.current_stop_loss)
+                sl_display = f"{sl_num:,.2f}"
+                tp_raw = compute_dynamic_tp_hint(pos)
+                if tp_raw is not None and tp_raw > 0:
+                    tp_num = float(tp_raw)
+                    tp_display = f"{tp_num:,.2f}"
+                else:
+                    tp_display = "—"
             else:
                 action = "Comprar" if prob >= BUY_PROB_THRESHOLD else "Esperar"
-                
+
             market_data.append({
                 "symbol": sym.split("/")[0],
                 "price": f"{price:,.2f}",
@@ -636,6 +664,11 @@ async def start_web_dashboard(
                 "action": action,
                 "has_position": has_pos,
                 "position_str": pos_str,
+                "stop_loss": sl_display,
+                "take_profit": tp_display,
+                "stop_loss_num": sl_num,
+                "take_profit_num": tp_num,
+                "trailing_active": trailing_active,
                 "unrealized_pnl": f"{'+' if unrl >=0 else ''}{unrl:.2f} USDT",
                 "unrealized_pnl_label": "Ganancia flotante" if unrl >= 0 else "Pérdida flotante",
                 "unrealized_pnl_num": unrl
