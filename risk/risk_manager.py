@@ -95,10 +95,10 @@ MAX_PORTFOLIO_DD_PCT: float = 0.15  # 15 % max peak-to-trough loss from initial 
 # Used by :func:`get_sector` and :meth:`RiskManager.is_sector_exposed` to
 # prevent opening more than one position within the same correlated group.
 SECTOR_MAP: dict[str, str] = {
-    "BTCUSDT": "L1_MAJOR",
-    "ETHUSDT": "L1_MAJOR",
-    "SOLUSDT": "L1_MAJOR",
-    "BNBUSDT": "L1_MAJOR",
+    "BTCUSDT": "BTC",
+    "ETHUSDT": "ETH",
+    "SOLUSDT": "SOL",
+    "BNBUSDT": "BNB",
     "LINKUSDT": "DEFI",
     "INJUSDT": "DEFI",
     "FETUSDT": "AI",
