@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
@@ -752,6 +753,94 @@ class MT5Executor(PaperExecutor):
     # Pre-trade validation helpers (Issues 1, 2, 4)
     # ------------------------------------------------------------------
 
+    def _clamp_stop_loss_buy(
+        self,
+        mt5_sym: str,
+        sl: float,
+        ask: float,
+        tick: Any,
+        digits: int,
+    ) -> tuple[float | None, bool]:
+        """If SL is closer than broker ``trade_stops_level`` (+ buffer), widen it.
+
+        For a LONG, SL must sit at least ``stops_level`` points from both the
+        order price (ask) and the trigger price (bid). Optional extra buffer
+        points via ``MT5_STOPS_BUFFER_POINTS`` (default ``2``) avoids edge
+        rejections from rounding/spread.
+
+        Returns
+        -------
+        (sl_clamped, adjusted)
+            ``sl_clamped`` is ``None`` if no valid level exists.
+        """
+        if not _MT5_AVAILABLE:
+            return sl, False
+
+        info = mt5.symbol_info(mt5_sym)
+        if info is None or tick is None:
+            return None, False
+
+        point = float(info.point or 0.0)
+        if point <= 0:
+            return None, False
+
+        stops_level = int(getattr(info, "trade_stops_level", 0) or 0)
+        try:
+            buffer_pts = float(os.environ.get("MT5_STOPS_BUFFER_POINTS", "2").strip() or "2")
+        except ValueError:
+            buffer_pts = 2.0
+
+        min_total_pts = float(stops_level) + buffer_pts
+        min_total_price = min_total_pts * point
+
+        bid = float(tick.bid)
+        ask_f = float(ask)
+        if bid <= 0 or ask_f <= 0:
+            return None, False
+
+        # Tightest SL price still allowed (far enough below bid and ask).
+        sl_ceiling = min(ask_f - min_total_price, bid - min_total_price)
+        if sl_ceiling <= 0:
+            logger.error(
+                "[MT5] Invalid SL ceiling for %s (bid=%.5f ask=%.5f min_pts=%.1f).",
+                mt5_sym,
+                bid,
+                ask_f,
+                min_total_pts,
+            )
+            return None, False
+
+        original = float(sl)
+        sl_adj = min(original, sl_ceiling)
+        sl_adj = self._normalize_price(sl_adj, digits)
+
+        for _ in range(64):
+            if self._validate_stops(mt5_sym, ask_f, sl_adj, 0.0, is_buy=True):
+                adjusted = abs(sl_adj - self._normalize_price(original, digits)) > point * 0.01
+                if adjusted:
+                    logger.warning(
+                        "[MT5] SL widened to broker minimum for %s: %.5f → %.5f "
+                        "(stops_level=%d + buffer=%.1f pts)",
+                        mt5_sym,
+                        original,
+                        sl_adj,
+                        stops_level,
+                        buffer_pts,
+                    )
+                return sl_adj, adjusted
+            sl_adj = self._normalize_price(sl_adj - point, digits)
+            if sl_adj <= 0 or sl_adj >= bid:
+                break
+
+        logger.error(
+            "[MT5] Could not clamp SL for %s – bid=%.5f ask=%.5f last_sl=%.5f",
+            mt5_sym,
+            bid,
+            ask_f,
+            sl_adj,
+        )
+        return None, False
+
     def _validate_stops(
         self,
         symbol: str,
@@ -1296,11 +1385,18 @@ class MT5Executor(PaperExecutor):
 
             stop_loss_price = self._normalize_price(stop_loss_price, digits)
 
-            # Issue 1 – validate SL distance against broker stops_level using real-time tick.
-            if not self._validate_stops(mt5_sym, ask_price, stop_loss_price, is_buy=True):
-                logger.error("[MT5] Stop validation failed (distance or side) – aborting trade for %s.", sym)
+            # Issue 1 – widen SL if tighter than broker ``trade_stops_level`` (+ buffer).
+            sl_clamped, _ = self._clamp_stop_loss_buy(
+                mt5_sym, stop_loss_price, ask_price, tick, digits
+            )
+            if sl_clamped is None:
+                logger.error(
+                    "[MT5] Stop clamp failed (broker rules) – aborting trade for %s.",
+                    sym,
+                )
                 self._risk.register_close()
                 return False
+            stop_loss_price = sl_clamped
 
             # Fetch account equity from MT5 for lot-size calculation.
             acct = mt5.account_info()
@@ -1824,6 +1920,12 @@ class MT5Executor(PaperExecutor):
         min_step = max(point * 4.0, 10.0 ** (-max(digits - 1, 1)))
 
         send_sl = self._normalize_price(pos.current_stop_loss, digits)
+        sl_clamped, sl_adjusted = self._clamp_stop_loss_buy(mt5_sym, send_sl, ask, tick, digits)
+        if sl_clamped is None:
+            return
+        send_sl = sl_clamped
+        if sl_adjusted:
+            pos.current_stop_loss = send_sl
 
         cand_tp = self._dynamic_tp_for_long(pos)
         send_tp = cur_tp_br
