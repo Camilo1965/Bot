@@ -809,7 +809,8 @@ async def main() -> None:
         monthly_report_loop(),
         start_web_dashboard(shared_state, paper_executor, risk_manager, WATCHLIST, port=8080),
     ]
-    _rmi = float(os.environ.get("RUNTIME_METRICS_INTERVAL_S", "0").strip() or "0")
+    # Default 120s recurring snapshot → logs/runtime_metrics.jsonl (set to 0 to disable).
+    _rmi = float(os.environ.get("RUNTIME_METRICS_INTERVAL_S", "120").strip() or "0")
     if _rmi >= 10.0:
         run_tasks.append(
             runtime_metrics_loop(
@@ -824,6 +825,16 @@ async def main() -> None:
         logger.info(
             "📊 Runtime metrics JSONL every %.0fs → logs/runtime_metrics.jsonl",
             _rmi,
+        )
+    elif _rmi > 0:
+        logger.warning(
+            "RUNTIME_METRICS_INTERVAL_S=%.1f < 10s — metrics JSONL disabled (use ≥10 or 0).",
+            _rmi,
+        )
+    else:
+        logger.info(
+            "📊 Runtime metrics JSONL disabled (RUNTIME_METRICS_INTERVAL_S=0). "
+            "Startup snapshot still written once → logs/bot_startup_snapshot.json",
         )
     if _GEMINI_ENABLED:
         run_tasks.append(gemini_sentiment_refresher(shared_state))
