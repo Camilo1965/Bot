@@ -31,8 +31,9 @@ from typing import Any
 
 import aiohttp
 
-from bot.dashboard_helpers import mt5_dashboard_mark
+from bot.dashboard_helpers import compute_rsi, mt5_dashboard_mark
 from database.db_manager import db
+from strategy.ml_predictor import BUY_PROB_THRESHOLD
 
 try:
     import certifi
@@ -245,6 +246,65 @@ async def telegram_command_poller(
                                     "────────────────────────"
                                 )
                                 await send_telegram_alert(report)
+                            elif text.startswith("/market"):
+                                report_lines = ["📊 *MARKET DATA*", "──────────────"]
+                                ml_probs = state.get("ml_probs", {})
+                                htf_trend = state.get("htf_trend", {})
+                                prices_dict = state.get("prices", {})
+                                
+                                for sym in prices_dict.keys():
+                                    prices = list(prices_dict.get(sym, []))
+                                    candle_m = float(prices[-1]) if prices else None
+                                    price = mt5_dashboard_mark(state, sym, candle_m)
+                                    
+                                    if price is None:
+                                        continue
+                                        
+                                    # 24h Change
+                                    change_str = ""
+                                    if len(prices) >= 96:
+                                        p24 = prices[-96]
+                                        if p24 > 0:
+                                            pct = (price - p24) / p24 * 100
+                                            c_sign = "+" if pct >= 0 else ""
+                                            change_str = f" ({c_sign}{pct:.2f}%)"
+                                            
+                                    # ML & RSI
+                                    prob = ml_probs.get(sym, 0.0)
+                                    prob_pct = prob * 100
+                                    rsi = compute_rsi(prices)
+                                    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
+                                    
+                                    # Trend
+                                    sym_trend = htf_trend.get(sym, {})
+                                    t4h = sym_trend.get("4h", "neutral")
+                                    t_emoji = "↗ Bull" if t4h == "bullish" else "↘ Bear" if t4h == "bearish" else "➡ Neut"
+                                    
+                                    # Position
+                                    pos = paper_executor.open_positions.get(sym)
+                                    if pos:
+                                        pos_str = f"LONG @{pos.entry_price:,.2f}"
+                                        qty = pos.position_size / pos.entry_price
+                                        unrl = (price - pos.entry_price) * qty
+                                        p_sign = "+" if unrl >= 0 else ""
+                                        pnl_str = f"{p_sign}{unrl:.2f}"
+                                        action = "🔵 TRADING"
+                                    else:
+                                        pos_str = "—"
+                                        pnl_str = "—"
+                                        action = "🟢 BUY!" if prob >= BUY_PROB_THRESHOLD else "🟡 HOLD"
+                                        
+                                    sym_clean = sym.split("/")[0]
+                                    block = (
+                                        f"💎 *{sym_clean}* | {action}\n"
+                                        f"Precio: {price:,.2f}{change_str}\n"
+                                        f"ML Conf: {prob_pct:.1f}% | RSI: {rsi_str}\n"
+                                        f"Tendencia (4h): {t_emoji}\n"
+                                        f"Pos: {pos_str} | PnL: {pnl_str}\n"
+                                    )
+                                    report_lines.append(block)
+                                    
+                                await send_telegram_alert("\n".join(report_lines))
                 except asyncio.TimeoutError:
                     pass  # Normal long-polling timeout
                 except Exception as exc:

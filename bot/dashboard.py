@@ -74,7 +74,7 @@ def generate_dashboard(
     header_text.append("   │   🌐 Latencia API: ", style="dim")
     header_text.append(lat_str, style=f"bold {lat_color}")
     header_text.append("   │   🧠 Modelo: ", style="dim")
-    header_text.append("XGBoost_v3 + Gemini-2.5-Flash", style="bold magenta")
+    header_text.append("XGBoost_v3 + Gemini-2.5-Flash-Lite", style="bold magenta")
     header_text.append("   │   🔮 Sentimiento IA: ", style="dim")
     header_text.append(sentiment_val_str, style=f"bold {s_color}")
     header_text.append("   │   Noticias: ", style="dim")
