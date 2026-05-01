@@ -100,25 +100,26 @@ def get_gemini_sentiment(headlines: list[str]) -> float:
 
     prompt = "\n".join(f"- {h}" for h in headlines)
     import time
-    for attempt in range(3):
-        try:
-            client = _get_client()
-            response = client.models.generate_content(
-                model=_MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=_SYSTEM_INSTRUCTION,
-                    response_mime_type="application/json",
-                ),
-            )
-            break
-        except Exception as exc:
-            if attempt < 2 and "503" in str(exc):
-                logger.warning("Gemini 503 error on attempt %d, retrying in 2 seconds...", attempt + 1)
-                time.sleep(2)
-                continue
-            raise  # Re-raise to be handled by the outer try-except
-        
+    try:
+        for attempt in range(3):
+            try:
+                client = _get_client()
+                response = client.models.generate_content(
+                    model=_MODEL_NAME,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=_SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                    ),
+                )
+                break
+            except Exception as exc:
+                if attempt < 2 and "503" in str(exc):
+                    logger.warning("Gemini 503 error on attempt %d, retrying in 2 seconds...", attempt + 1)
+                    time.sleep(2)
+                    continue
+                raise  # Re-raise to be handled by the outer try-except
+            
         # Parseo robusto del contenido
         raw_text = response.text.strip()
         try:
