@@ -242,6 +242,21 @@ async def start_web_dashboard(
         market_data = []
         ml_probs = state.get("ml_probs", {})
         htf_trend = state.get("htf_trend", {})
+        mt5_profit_by_ticket: dict[int, float] = {}
+
+        # MT5 live mode: prefer broker-reported unrealized PnL so dashboard matches terminal.
+        get_positions = getattr(paper_executor, "get_open_positions", None)
+        if callable(get_positions):
+            try:
+                mt5_positions = get_positions()
+                if isinstance(mt5_positions, list):
+                    mt5_profit_by_ticket = {
+                        int(p.get("ticket")): float(p.get("profit", 0.0))
+                        for p in mt5_positions
+                        if p.get("ticket") is not None
+                    }
+            except Exception:
+                mt5_profit_by_ticket = {}
         
         for sym in watchlist:
             prices = list(state["prices"].get(sym, []))
@@ -268,8 +283,13 @@ async def start_web_dashboard(
             pos_str = ""
             
             if has_pos:
-                qty = pos.position_size / pos.entry_price
-                unrl = (price - pos.entry_price) * qty
+                mt5_ticket = getattr(pos, "mt5_position_ticket", None)
+                if isinstance(mt5_ticket, int) and mt5_ticket in mt5_profit_by_ticket:
+                    unrl = mt5_profit_by_ticket[mt5_ticket]
+                else:
+                    # Fallback for paper mode or when ticket/profit is unavailable.
+                    qty = pos.position_size / pos.entry_price
+                    unrl = (price - pos.entry_price) * qty
                 pos_str = f"Comprado en {pos.entry_price:,.2f}"
                 action = "Gestionando posición"
             else:
