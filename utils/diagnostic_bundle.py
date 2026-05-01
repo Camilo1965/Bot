@@ -49,6 +49,25 @@ def _tail_text(path: Path, max_lines: int, max_bytes: int = 400_000) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _resolve_bot_debug_path(repo_root: Path) -> tuple[Path, str]:
+    """Primer ``bot_debug.log`` que exista; si ninguno, path canónico en raíz (para mensaje)."""
+    cands: list[tuple[Path, str]] = [
+        (repo_root / "bot_debug.log", "`bot_debug.log` (raíz del repo)"),
+        (repo_root / "logs" / "bot_debug.log", "`logs/bot_debug.log`"),
+    ]
+    for p, label in cands:
+        if p.is_file():
+            return p, label
+    return cands[0][0], cands[0][1]
+
+
+def _resolve_bot_debug_rot(repo_root: Path) -> Path | None:
+    for p in (repo_root / "bot_debug.log.1", repo_root / "logs" / "bot_debug.log.1"):
+        if p.is_file():
+            return p
+    return None
+
+
 def _read_full_or_tail(
     path: Path,
     *,
@@ -348,7 +367,7 @@ def write_diagnostic_bundle(
     if mode == "full_day":
         metrics_day, n_day, n_tot = _jsonl_for_local_date(jsonl_path, target_d, tz)
         metrics_day, truncated = _truncate_notice(metrics_day, _MAX_EMBED_CHARS)
-        bd_path = repo_root / "bot_debug.log"
+        bd_path, bd_source_label = _resolve_bot_debug_path(repo_root)
         bd_body, bd_counts, bd_n = _collect_bot_debug_for_day(
             bd_path, target_d, tz, errors_only=full_day_bot_debug_errors_only
         )
@@ -375,10 +394,23 @@ def write_diagnostic_bundle(
             parts.append("- **Texto JSONL truncado** en este .md — ver archivo fuente.\n")
         lvl_parts = ", ".join(f"{k}: **{v}**" for k, v in sorted(bd_counts.items()))
         parts.append(
-            f"- `bot_debug.log` (JSON con `timestamp` ese día): **{bd_n}** líneas"
+            f"- JSON `bot_debug` — fuente {bd_source_label} — líneas con `timestamp` ese día: **{bd_n}**"
             + (f" — niveles: {lvl_parts}" if lvl_parts else "")
             + ".\n"
         )
+        ls_path = logs_dir / "last_session.log"
+        if bd_n == 0 and ls_path.is_file() and ls_path.stat().st_size > 200:
+            if not bd_path.is_file():
+                parts.append(
+                    "- **Aviso:** no hay `bot_debug.log` en raíz ni `logs/bot_debug.log`. "
+                    "`main.py` crea el JSON junto a sí mismo; si la sección 7 tiene logs, "
+                    "ejecutá el export **en esa misma carpeta** del servidor o copiá ese archivo.\n"
+                )
+            else:
+                parts.append(
+                    "- **Aviso:** `bot_debug` existe pero **0 líneas JSON** con `timestamp` ese día. "
+                    "Revisá `--date`, `REPORT_TIMEZONE`, o si ya rotó a `.log.1` (sección 11).\n"
+                )
         if bd_trunc:
             parts.append(
                 "- **Texto embebido de `bot_debug` truncado** — abrí `bot_debug.log` local si necesitás el día completo.\n"
@@ -399,7 +431,9 @@ def write_diagnostic_bundle(
         parts.append(_sl_tp_timeline_from_jsonl_date(jsonl_path, target_d, tz))
         parts.append(f"\n## 5) `runtime_metrics.jsonl` **completo del día** ({target_d})\n")
         parts.append("```text\n" + metrics_day + "```\n")
-        parts.append(f"\n## 6) `bot_debug.log` — día {target_d} ({bd_mode_lbl})\n")
+        parts.append(
+            f"\n## 6) `bot_debug` — día {target_d} ({bd_mode_lbl}) — {bd_source_label}\n"
+        )
         parts.append("```text\n" + bd_body + "```\n")
 
         ls_text, ls_note = _read_full_or_tail(
@@ -441,9 +475,9 @@ def write_diagnostic_bundle(
             parts.append(f"\n## 10) `state.json` ({st_note or 'contenido'})\n")
             parts.append("```text\n" + st_text + "```\n")
 
-        rot = repo_root / "bot_debug.log.1"
-        if rot.is_file():
-            parts.append("\n## 11) `bot_debug.log.1` (rotación; últimas 300 líneas)\n")
+        rot = _resolve_bot_debug_rot(repo_root)
+        if rot is not None:
+            parts.append(f"\n## 11) Rotación `bot_debug` (`{rot.name}`; últimas 300 líneas)\n")
             parts.append("```text\n" + _tail_text(rot, 300, max_bytes=600_000) + "```\n")
     else:
         metrics_tail, mstats = _parse_runtime_jsonl(jsonl_path, max_lines=250)
@@ -479,8 +513,9 @@ def write_diagnostic_bundle(
         parts.append("\n## 6) `logs/last_session.log` (últimas 200 líneas)\n")
         parts.append("```text\n" + _tail_text(logs_dir / "last_session.log", 200) + "```\n")
 
-        parts.append("\n## 7) ERROR / WARNING en `bot_debug.log` (filtrado)\n")
-        parts.append("```text\n" + _filter_bot_debug_warnings(repo_root / "bot_debug.log") + "```\n")
+        _bd_snap, _bd_lbl = _resolve_bot_debug_path(repo_root)
+        parts.append(f"\n## 7) ERROR / WARNING en `bot_debug` — {_bd_lbl} (filtrado)\n")
+        parts.append("```text\n" + _filter_bot_debug_warnings(_bd_snap) + "```\n")
 
         parts.append("\n## 8) `audit.log` (últimas 120 líneas)\n")
         parts.append("```text\n" + _tail_text(repo_root / "audit.log", 120) + "```\n")
