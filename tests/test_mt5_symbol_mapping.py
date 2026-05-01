@@ -70,6 +70,8 @@ class _FakeRiskManager:
         self.max_positions = 3
 
 
+from unittest.mock import patch
+
 class _FakeDB:
     async def insert_open_trade(self, **kwargs) -> int:  # noqa: ARG002
         return 1
@@ -80,7 +82,9 @@ class MT5MappingTests(unittest.TestCase):
         self.assertEqual(MT5Executor._local_symbol_from_broker("BTCUSD-T"), "BTC/USDT")
         self.assertEqual(MT5Executor._local_symbol_from_broker("UNKNOWN"), "UNKNOWN")
 
-    def test_resolve_accepts_direct_broker_symbol(self) -> None:
+    @patch("execution.mt5_executor.mt5")
+    def test_resolve_accepts_direct_broker_symbol(self, mock_mt5) -> None:
+        mock_mt5.symbol_info.return_value.visible = True
         executor = MT5Executor(
             db=_FakeDB(),
             risk_manager=_FakeRiskManager(),

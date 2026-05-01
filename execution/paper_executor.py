@@ -128,7 +128,7 @@ _ML_EXIT_CONFIDENCE_FACTOR: float = 0.8
 
 # ── ATR-based dynamic stop-loss / trailing-stop multipliers ───────────────────
 # Stop Loss distance  = current_atr * ATR_SL_MULTIPLIER
-ATR_SL_MULTIPLIER: float = 1.5
+ATR_SL_MULTIPLIER: float = 2.5
 # Trailing Stop distance = current_atr * ATR_TRAILING_MULTIPLIER
 ATR_TRAILING_MULTIPLIER: float = 1.0
 
@@ -699,7 +699,7 @@ class PaperExecutor:
                 return False
 
             ts = timestamp or datetime.now(tz=timezone.utc)
-            self._risk.deduct(position_size)
+            # self._risk.deduct(position_size)  <-- Removed to avoid Circuit Breaker false positives
             self._risk.register_open()
 
         # ── Compute dynamic risk thresholds from sentiment ─────────────────
@@ -1225,8 +1225,9 @@ class PaperExecutor:
                 pnl=pnl,
             )
 
-        # Credit back the original stake plus any PnL (positive or negative)
-        self._risk.credit(pos.position_size + pnl)
+        # Credit back any PnL (positive or negative)
+        # Note: We no longer deduct position_size on entry, so we only credit the PnL here.
+        self._risk.credit(pnl)
         self._risk.register_close()
         # Record realised losses so the safety break can trigger if needed
         if pnl < 0.0:

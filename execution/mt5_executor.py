@@ -755,79 +755,73 @@ class MT5Executor(PaperExecutor):
     def _validate_stops(
         self,
         symbol: str,
-        entry_price: float,
+        execution_price: float,
         sl: float,
         tp: float = 0.0,
+        is_buy: bool = True,
     ) -> bool:
         """Check that SL/TP distances satisfy the broker's minimum stops_level.
 
         MT5 rejects orders with INVALID_STOPS (10016) when the SL or TP is
-        closer to the entry price than ``symbol_info.trade_stops_level`` points.
-        This guard prevents that rejection before the order is ever sent.
+        closer to the current price than ``symbol_info.trade_stops_level`` points.
 
-        Parameters
-        ----------
-        symbol:
-            Resolved MT5 broker symbol (e.g. ``"BTCUSD-T"``).
-        entry_price:
-            Expected entry price for the order.
-        sl:
-            Absolute stop-loss price.
-        tp:
-            Absolute take-profit price (``0.0`` = no TP check).
-
-        Returns
-        -------
-        bool
-            ``True`` when both SL (and TP if given) are far enough from the
-            entry price, ``False`` otherwise.
+        CRITICAL: For a BUY order, the SL is triggered by the BID price.
+        For a SELL order, it is triggered by the ASK price. This method uses the
+        appropriate reference price to ensure compliance.
         """
         if not _MT5_AVAILABLE:
             return True
 
         info = mt5.symbol_info(symbol)
-        if not info:
-            logger.error("[MT5] Cannot fetch symbol_info for stops validation on %s.", symbol)
+        tick = mt5.symbol_info_tick(symbol)
+        if not info or not tick:
+            logger.error("[MT5] Cannot fetch symbol_info/tick for stops validation on %s.", symbol)
             return False
 
+        # Reference price for SL triggering:
+        # BUY positions exit at BID; SELL positions exit at ASK.
+        ref_price = tick.bid if is_buy else tick.ask
         min_distance_price = info.trade_stops_level * info.point
 
-        sl_distance = abs(entry_price - sl)
-        if sl_distance < min_distance_price:
+        # 1. Check distance from execution price (the price in the order request)
+        sl_from_exec = abs(execution_price - sl)
+        if sl_from_exec < min_distance_price:
             logger.error(
-                "[MT5 VALIDATION] SL too close to entry for %s: "
-                "%.2f points required, current distance %.2f points. "
-                "Entry: %.5f | SL: %.5f",
-                symbol,
-                info.trade_stops_level,
-                sl_distance / info.point if info.point > 0 else 0,
-                entry_price,
-                sl,
+                "[MT5 VALIDATION] SL too close to ORDER PRICE for %s: "
+                "min %.2f pts, current %.2f pts. Order: %.5f | SL: %.5f",
+                symbol, info.trade_stops_level, sl_from_exec / info.point if info.point > 0 else 0,
+                execution_price, sl
             )
             return False
 
+        # 2. Check distance from trigger price (Bid/Ask) - This is usually what causes 10016
+        sl_from_ref = abs(ref_price - sl)
+        if sl_from_ref < min_distance_price:
+            logger.error(
+                "[MT5 VALIDATION] SL too close to TRIGGER PRICE (%s) for %s: "
+                "min %.2f pts, current %.2f pts. Trigger: %.5f | SL: %.5f. (SPREAD TOO WIDE?)",
+                "BID" if is_buy else "ASK", symbol, info.trade_stops_level,
+                sl_from_ref / info.point if info.point > 0 else 0, ref_price, sl
+            )
+            return False
+
+        # 3. Ensure SL is on the correct side
+        if is_buy and sl >= ref_price:
+            logger.error("[MT5 VALIDATION] SL for BUY must be BELOW price. SL: %.5f | Bid: %.5f", sl, ref_price)
+            return False
+        if not is_buy and sl <= ref_price:
+            logger.error("[MT5 VALIDATION] SL for SELL must be ABOVE price. SL: %.5f | Ask: %.5f", sl, ref_price)
+            return False
+
         if tp > 0.0:
-            tp_distance = abs(entry_price - tp)
-            if tp_distance < min_distance_price:
+            tp_from_ref = abs(ref_price - tp)
+            if tp_from_ref < min_distance_price:
                 logger.error(
-                    "[MT5 VALIDATION] TP too close to entry for %s: "
-                    "%.2f points required, current distance %.2f points. "
-                    "Entry: %.5f | TP: %.5f",
-                    symbol,
-                    info.trade_stops_level,
-                    tp_distance / info.point if info.point > 0 else 0,
-                    entry_price,
-                    tp,
+                    "[MT5 VALIDATION] TP too close to trigger for %s: min %.2f pts, current %.2f pts.",
+                    symbol, info.trade_stops_level, tp_from_ref / info.point if info.point > 0 else 0
                 )
                 return False
 
-        logger.debug(
-            "[MT5 VALIDATION] SL/TP OK – min_distance=%.2f pts, "
-            "sl_distance=%.2f pts, tp_distance=%.2f pts",
-            info.trade_stops_level,
-            sl_distance / info.point if info.point > 0 else 0,
-            (abs(entry_price - tp) / info.point if tp > 0 and info.point > 0 else 0),
-        )
         return True
 
     def _check_margin_available(self, symbol: str, lots: float, entry_price: float) -> bool:
@@ -1232,7 +1226,7 @@ class MT5Executor(PaperExecutor):
                 return False
 
         ts = timestamp or datetime.now(tz=timezone.utc)
-        self._risk.deduct(position_size)
+        # self._risk.deduct(position_size)  <-- Removed to avoid false drawdown triggers
         self._risk.register_open()
 
         # ── Dynamic risk thresholds from sentiment ─────────────────────────
@@ -1271,7 +1265,6 @@ class MT5Executor(PaperExecutor):
                     "MT5 live mode requested but MetaTrader5 library is not "
                     "installed.  Rolling back and aborting."
                 )
-                self._risk.credit(position_size)
                 self._risk.register_close()
                 return False
 
@@ -1283,10 +1276,29 @@ class MT5Executor(PaperExecutor):
             digits: int = sym_info.digits if sym_info else 5
             stop_loss_price = self._normalize_price(stop_loss_price, digits)
 
-            # Issue 1 – validate SL distance against broker stops_level.
-            if not self._validate_stops(mt5_sym, entry_price, stop_loss_price):
-                logger.error("[MT5] Stop validation failed – aborting trade for %s.", sym)
-                self._risk.credit(position_size)
+            # Issue 4 – reject stale tick prices before entering.
+            tick = mt5.symbol_info_tick(mt5_sym)
+            if not self._validate_tick_freshness(tick, mt5_sym, max_age_seconds=5.0):
+                logger.error("[MT5] Tick freshness check failed – aborting trade for %s.", sym)
+                self._risk.register_close()
+                return False
+
+            ask_price = self._normalize_price(tick.ask, digits)
+
+            # Issue 1 – Calculate SL relative to the BID price (the price that triggers it).
+            # This ensures SL is always below current market and accounts for spread.
+            if current_atr is not None and current_atr > 0.0:
+                sl_distance = current_atr * ATR_SL_MULTIPLIER
+                stop_loss_price = tick.bid - sl_distance
+            else:
+                # Fallback: percentage based on Bid
+                stop_loss_price = tick.bid * (1.0 - thresholds.sl_pct)
+
+            stop_loss_price = self._normalize_price(stop_loss_price, digits)
+
+            # Issue 1 – validate SL distance against broker stops_level using real-time tick.
+            if not self._validate_stops(mt5_sym, ask_price, stop_loss_price, is_buy=True):
+                logger.error("[MT5] Stop validation failed (distance or side) – aborting trade for %s.", sym)
                 self._risk.register_close()
                 return False
 
@@ -1294,29 +1306,19 @@ class MT5Executor(PaperExecutor):
             acct = mt5.account_info()
             account_equity: float = acct.equity if acct else self._risk.balance
 
+            # RISK CALCULATION: distance between entry (Ask) and stop (Bid - distance)
             lots = calculate_lot_size(
                 symbol=mt5_sym,
                 account_balance=account_equity,
-                sl_distance_price=max(entry_price - stop_loss_price, 1e-8),
+                sl_distance_price=max(ask_price - stop_loss_price, 1e-8),
                 risk_pct=self._risk_pct,
             )
 
             # Issue 2 – verify sufficient margin before sending the order.
-            if not self._check_margin_available(mt5_sym, lots, entry_price):
+            if not self._check_margin_available(mt5_sym, lots, ask_price):
                 logger.error("[MT5] Margin check failed – aborting trade for %s.", sym)
-                self._risk.credit(position_size)
                 self._risk.register_close()
                 return False
-
-            # Issue 4 – reject stale tick prices before entering.
-            tick = mt5.symbol_info_tick(mt5_sym)
-            if not self._validate_tick_freshness(tick, mt5_sym, max_age_seconds=5.0):
-                logger.error("[MT5] Tick freshness check failed – aborting trade for %s.", sym)
-                self._risk.credit(position_size)
-                self._risk.register_close()
-                return False
-
-            ask_price = self._normalize_price(tick.ask, digits)
 
             request = self._build_buy_request(
                 symbol=mt5_sym,
@@ -1326,8 +1328,7 @@ class MT5Executor(PaperExecutor):
             )
             result = await self._send_order_with_retry(request)
             if result is None:
-                # Order rejected – roll back.
-                self._risk.credit(position_size)
+                # Order rejected – roll back counter (balance wasn't deducted)
                 self._risk.register_close()
                 return False
             mt5_ticket = await self._resolve_position_ticket_after_buy(mt5_sym, result)
@@ -1516,7 +1517,9 @@ class MT5Executor(PaperExecutor):
                 pnl=pnl,
             )
 
-        self._risk.credit(pos.position_size + pnl)
+        # Credit back any PnL (positive or negative)
+        # Note: We no longer deduct position_size on entry, so we only credit the PnL here.
+        self._risk.credit(pnl)
         self._risk.register_close()
         if pnl < 0.0:
             self._risk.record_daily_loss(-pnl)
