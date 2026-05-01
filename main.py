@@ -38,6 +38,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -580,9 +581,11 @@ async def main() -> None:
         )
         asyncio.create_task(
             send_telegram_alert(
-                f"✅ *ClawdBot [MT5 LIVE]* conectado\n"
-                f"Servidor: `{mt5_server}` | Login: `{mt5_login}`\n"
-                f"Balance: *{initial_balance:,.2f} USDT*"
+                "✅ <b>ClawdBot [MT5 LIVE]</b> conectado\n"
+                f"Servidor: <code>{escape(mt5_server)}</code> | "
+                f"Login: <code>{escape(str(mt5_login))}</code>\n"
+                f"Balance: <b>{initial_balance:,.2f} USDT</b>",
+                parse_mode="HTML",
             )
         )
     else:

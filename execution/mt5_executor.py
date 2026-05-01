@@ -213,6 +213,11 @@ _RETRYABLE_RETCODES: frozenset[int] = frozenset({
     10031,  # CONNECTION
 })
 
+# Expected pauses (weekend / session) — must not trip the circuit breaker.
+_MT5_SOFT_SESSION_RETCODES: frozenset[int] = frozenset({
+    10018,  # MARKET_CLOSED
+})
+
 
 def _log_mt5_retcode(retcode: int, context: str = "") -> None:
     """Log a human-readable description for an MT5 trade return code.
@@ -225,6 +230,8 @@ def _log_mt5_retcode(retcode: int, context: str = "") -> None:
     ctx = f" ({context})" if context else ""
     if retcode == 10009:
         logger.info("%s %s%s", prefix, description, ctx)
+    elif retcode in _MT5_SOFT_SESSION_RETCODES:
+        logger.warning("%s %s%s", prefix, description, ctx)
     elif retcode in _RETRYABLE_RETCODES:
         logger.warning("%s %s%s", prefix, description, ctx)
     else:
@@ -538,6 +545,7 @@ class MT5Executor(PaperExecutor):
         self._mt5_last_failure_time: float = 0.0
         self._mt5_max_consecutive_failures: int = 10
         self._mt5_cooldown_seconds: float = 300.0  # 5 minutes
+        self._mt5_last_circuit_log_mono: float = 0.0
 
     # ------------------------------------------------------------------
     # Spread helper
@@ -1133,13 +1141,16 @@ class MT5Executor(PaperExecutor):
             elapsed = time.time() - self._mt5_last_failure_time
             if elapsed < self._mt5_cooldown_seconds:
                 remaining = self._mt5_cooldown_seconds - elapsed
-                logger.error(
-                    "[MT5 CIRCUIT BREAKER] Too many consecutive failures (%d). "
-                    "System paused for %.0f s. Retry in %.0f s.",
-                    self._mt5_failure_count,
-                    self._mt5_cooldown_seconds,
-                    remaining,
-                )
+                now_mono = time.monotonic()
+                if now_mono - self._mt5_last_circuit_log_mono >= 30.0:
+                    self._mt5_last_circuit_log_mono = now_mono
+                    logger.error(
+                        "[MT5 CIRCUIT BREAKER] Too many consecutive failures (%d). "
+                        "System paused for %.0f s. Retry in %.0f s.",
+                        self._mt5_failure_count,
+                        self._mt5_cooldown_seconds,
+                        remaining,
+                    )
                 return None
             else:
                 # Cooldown expired – reset and allow a new attempt.
@@ -1179,6 +1190,9 @@ class MT5Executor(PaperExecutor):
                     f"failure_count={self._mt5_failure_count}"
                 ),
             )
+
+            if result.retcode in _MT5_SOFT_SESSION_RETCODES:
+                return None
 
             if result.retcode == mt5.TRADE_RETCODE_DONE:
                 # Success – reset circuit breaker counter.

@@ -69,7 +69,10 @@ def _telegram_ssl_context() -> ssl.SSLContext | bool | None:
     return None
 
 
-async def send_telegram_alert(message: str) -> bool:
+async def send_telegram_alert(
+    message: str,
+    parse_mode: str | None = "Markdown",
+) -> bool:
     """Send *message* to the configured Telegram chat asynchronously.
 
     The function is designed for fire-and-forget usage via
@@ -85,8 +88,12 @@ async def send_telegram_alert(message: str) -> bool:
     Parameters
     ----------
     message:
-        Telegram message text.  Markdown formatting (``parse_mode="Markdown"``)
-        is enabled so callers may use ``*bold*``, ``_italic_``, etc.
+        Message body.  With default ``parse_mode="Markdown"``, use legacy
+        ``*bold*`` / ``_italic_``; avoid unescaped ``_`` in dynamic text
+        (e.g. server names) — use ``parse_mode="HTML"`` and ``<code>`` with
+        ``html.escape`` for untrusted strings, or ``parse_mode=None`` for plain.
+    parse_mode:
+        ``"Markdown"``, ``"HTML"``, or ``None`` (no formatting).
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -111,18 +118,21 @@ async def send_telegram_alert(message: str) -> bool:
             aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx is not None else aiohttp.TCPConnector()
         )
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            payload = {**base_payload, "parse_mode": "Markdown"}
+            payload: dict[str, str | int] = dict(base_payload)
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
             async with session.post(url, json=payload) as resp:
                 if resp.ok:
                     logger.info("Telegram alert sent successfully.")
                     return True
                 body = await resp.text()
-                # Bad entities / broken Markdown — retry as plain text
+                # Bad entities / broken Markdown or HTML — retry as plain text
                 if resp.status == 400 and (
-                    "parse" in body.lower() or "markdown" in body.lower()
+                    "parse" in body.lower() or "markdown" in body.lower() or "entities" in body.lower()
                 ):
                     logger.warning(
-                        "Telegram rejected Markdown; retrying as plain text. Body: %s",
+                        "Telegram rejected parse_mode=%s; retrying as plain text. Body: %s",
+                        parse_mode,
                         body[:200],
                     )
                     async with session.post(url, json=base_payload) as resp2:
