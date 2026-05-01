@@ -31,6 +31,7 @@ from typing import Any
 
 import aiohttp
 
+from bot.dashboard_helpers import mt5_dashboard_mark
 from database.db_manager import db
 
 try:
@@ -203,7 +204,8 @@ async def telegram_command_poller(
                                     for sym, pos in paper_executor.open_positions.items():
                                         # Intentar obtener el precio actual del estado compartido
                                         prices_buf = state.get("prices", {}).get(sym, [])
-                                        current_price = float(prices_buf[-1]) if prices_buf else pos.entry_price
+                                        candle_m = float(prices_buf[-1]) if prices_buf else pos.entry_price
+                                        current_price = mt5_dashboard_mark(state, sym, candle_m) or pos.entry_price
                                         
                                         # Calcular PnL irrealizado
                                         qty = pos.position_size / pos.entry_price
