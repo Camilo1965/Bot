@@ -137,7 +137,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             <span class="text-xs font-semibold px-2 py-1 rounded bg-slate-900/50 ${actionColor}">${item.action}</span>
                         </div>
                         <div class="text-3xl font-mono tracking-tight mb-1">${item.price}</div>
-                        <div class="text-sm ${item.change_num >= 0 ? 'neon-green' : 'neon-red'} mb-4">${item.change} en 24h</div>
+                        <div class="text-sm ${item.change_num >= 0 ? 'neon-green' : 'neon-red'} mb-4">Cambio 24h: ${item.change}</div>
                         
                         <div class="grid grid-cols-2 gap-y-3 gap-x-2 text-sm border-t border-slate-700/50 pt-4">
                             <div class="text-slate-400">Confianza IA: <span class="text-slate-200 font-semibold float-right">${item.ml_conf}</span></div>
@@ -150,9 +150,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     let pnlColor = item.unrealized_pnl_num >= 0 ? 'neon-green' : 'neon-red';
                     html += `
                         <div class="mt-4 bg-slate-900/50 rounded-lg p-3 border border-slate-700">
+                            <div class="text-xs text-slate-400 mb-1">Operación activa</div>
                             <div class="flex justify-between text-sm mb-1">
                                 <span class="text-sky-400 font-semibold">${item.position_str}</span>
-                                <span class="${pnlColor} font-bold font-mono">${item.unrealized_pnl}</span>
+                                <span class="${pnlColor} font-bold font-mono">${item.unrealized_pnl_label}: ${item.unrealized_pnl}</span>
                             </div>
                         </div>
                     `;
@@ -269,7 +270,7 @@ async def start_web_dashboard(
             if has_pos:
                 qty = pos.position_size / pos.entry_price
                 unrl = (price - pos.entry_price) * qty
-                pos_str = f"Entrada {pos.entry_price:,.2f}"
+                pos_str = f"Comprado en {pos.entry_price:,.2f}"
                 action = "Gestionando posición"
             else:
                 action = "Comprar" if prob >= BUY_PROB_THRESHOLD else "Esperar"
@@ -290,6 +291,7 @@ async def start_web_dashboard(
                 "has_position": has_pos,
                 "position_str": pos_str,
                 "unrealized_pnl": f"{'+' if unrl >=0 else ''}{unrl:.2f} USDT",
+                "unrealized_pnl_label": "Ganancia flotante" if unrl >= 0 else "Pérdida flotante",
                 "unrealized_pnl_num": unrl
             })
 
