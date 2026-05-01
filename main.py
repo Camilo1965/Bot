@@ -64,6 +64,7 @@ from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor
 from strategy.sentiment_llm import get_gemini_sentiment
+from utils.diagnostic_bundle import write_diagnostic_bundle
 from utils.runtime_snapshot import runtime_metrics_loop, write_startup_snapshot
 from utils.telegram_notifier import (
     install_asyncio_critical_telegram_alerts,
@@ -155,6 +156,7 @@ WATCHLIST: list[str] = [
 # News filter constants: :mod:`bot.constants` (imported as _NEWS_FILTER_* for audit logs).
 
 _MODEL_PATH = Path(__file__).parent / "models" / "xgb_live.json"
+_REPO_ROOT = Path(__file__).resolve().parent
 
 # Set once per process in :func:`setup_logging` — also embedded in JSON lines.
 _LOG_SESSION_ID: str = ""
@@ -400,6 +402,19 @@ async def gemini_sentiment_refresher(
                 interval,
             )
         await asyncio.sleep(interval)
+
+
+async def diagnostic_bundle_refresh_loop(repo_root: Path, interval_s: float) -> None:
+    """Escribe ``DIAGNOSTIC_FOR_REVIEW.md`` en la raíz del repo de forma periódica."""
+    log = logging.getLogger("clawdbot")
+    await asyncio.sleep(45.0)
+    while True:
+        try:
+            path = write_diagnostic_bundle(repo_root=repo_root)
+            log.info("Diagnostic bundle actualizado: %s", path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Diagnostic bundle falló: %s", exc)
+        await asyncio.sleep(interval_s)
 
 
 async def main() -> None:
@@ -752,6 +767,12 @@ async def main() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Startup runtime snapshot failed: %s", exc)
 
+    try:
+        _diag_path = write_diagnostic_bundle(repo_root=_REPO_ROOT)
+        logger.info("📎 Primer DIAGNOSTIC_FOR_REVIEW.md → %s", _diag_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Diagnostic bundle inicial falló: %s", exc)
+
     # ── Start Rich Live dashboard ─────────────────────────────────────────────
     # The Live context renders a fixed TUI table that refreshes every second.
     # Important log events (WARNING+) are forwarded via RichHandler and appear
@@ -835,6 +856,19 @@ async def main() -> None:
         logger.info(
             "📊 Runtime metrics JSONL disabled (RUNTIME_METRICS_INTERVAL_S=0). "
             "Startup snapshot still written once → logs/bot_startup_snapshot.json",
+        )
+    _bundle_iv = float(os.environ.get("DIAGNOSTIC_BUNDLE_INTERVAL_S", "1800").strip() or "0")
+    if _bundle_iv >= 60.0:
+        run_tasks.append(diagnostic_bundle_refresh_loop(_REPO_ROOT, _bundle_iv))
+        logger.info(
+            "📎 Cada %.0fs → %s (un solo archivo para pegar al asistente)",
+            _bundle_iv,
+            _REPO_ROOT / "DIAGNOSTIC_FOR_REVIEW.md",
+        )
+    elif _bundle_iv > 0:
+        logger.warning(
+            "DIAGNOSTIC_BUNDLE_INTERVAL_S=%.1f < 60s — bundle automático desactivado.",
+            _bundle_iv,
         )
     if _GEMINI_ENABLED:
         run_tasks.append(gemini_sentiment_refresher(shared_state))
