@@ -401,6 +401,25 @@ async def telegram_command_poller(
                                     dedup_key="manual:ceo",
                                     force=True,
                                 )
+                            elif text.startswith("/help") or text.startswith("/ayuda"):
+                                help_report = (
+                                    "🤖 *COMANDOS DISPONIBLES*\n"
+                                    "────────────────────────\n"
+                                    "/status -> Estado actual del bot y posiciones abiertas\n"
+                                    "/daily o /stats -> Resumen de hoy\n"
+                                    "/weekly -> Resumen semanal (America/Bogota)\n"
+                                    "/monthly -> Resumen mensual (America/Bogota)\n"
+                                    "/history 7 -> Historial diario últimos 7 días\n"
+                                    "/history 30 -> Historial diario últimos 30 días\n"
+                                    "/ceo -> Snapshot ejecutivo (7D/30D)\n"
+                                    "────────────────────────"
+                                )
+                                await send_priority_telegram_alert(
+                                    help_report,
+                                    priority="info",
+                                    dedup_key="manual:help",
+                                    force=True,
+                                )
                 except asyncio.TimeoutError:
                     pass  # Normal long-polling timeout
                 except Exception as exc:

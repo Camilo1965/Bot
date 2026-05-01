@@ -350,8 +350,14 @@ async def weekly_report_loop(interval_floor: int = 30) -> None:
     from utils.telegram_notifier import _build_period_report  # local import to avoid circular load
 
     weekly_hour = int(os.environ.get("REPORT_WEEKLY_HOUR_LOCAL", "21"))
+    weekly_minute = int(os.environ.get("REPORT_WEEKLY_MINUTE_LOCAL", "0"))
+    weekly_weekday = int(os.environ.get("REPORT_WEEKLY_DAY_LOCAL", "6"))  # 0=Mon ... 6=Sun
     while True:
-        next_run_utc = _next_run_local(target_weekday=6, target_hour=weekly_hour, target_minute=0)
+        next_run_utc = _next_run_local(
+            target_weekday=weekly_weekday,
+            target_hour=weekly_hour,
+            target_minute=weekly_minute,
+        )
         sleep_s = max(interval_floor, int((next_run_utc - datetime.now(tz=timezone.utc)).total_seconds()))
         logger.info("Weekly report scheduled for %s UTC (%ds).", next_run_utc.isoformat(), sleep_s)
         await asyncio.sleep(sleep_s)
@@ -375,8 +381,13 @@ async def monthly_report_loop(interval_floor: int = 30) -> None:
     from utils.telegram_notifier import _build_period_report  # local import to avoid circular load
 
     monthly_hour = int(os.environ.get("REPORT_MONTHLY_HOUR_LOCAL", "21"))
+    monthly_minute = int(os.environ.get("REPORT_MONTHLY_MINUTE_LOCAL", "0"))
     while True:
-        next_run_utc = _next_run_local(target_weekday=None, target_hour=monthly_hour, target_minute=0)
+        next_run_utc = _next_run_local(
+            target_weekday=None,
+            target_hour=monthly_hour,
+            target_minute=monthly_minute,
+        )
         sleep_s = max(interval_floor, int((next_run_utc - datetime.now(tz=timezone.utc)).total_seconds()))
         logger.info("Monthly report scheduled for %s UTC (%ds).", next_run_utc.isoformat(), sleep_s)
         await asyncio.sleep(sleep_s)
