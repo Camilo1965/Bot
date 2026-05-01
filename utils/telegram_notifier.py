@@ -186,6 +186,19 @@ def _fmt_pct(value: float) -> str:
     return f"{value:.1f}%"
 
 
+def _fmt_profit_factor(summary: dict[str, Any]) -> str:
+    losses = int(summary.get("losses", 0) or 0)
+    wins = int(summary.get("wins", 0) or 0)
+    total = int(summary.get("total_trades", 0) or 0)
+    if total == 0:
+        return "N/A (sin trades cerrados)"
+    if losses == 0:
+        if wins == 0:
+            return "N/A"
+        return "N/A (sin pérdidas cerradas)"
+    return f"{float(summary.get('profit_factor', 0.0)):.2f}"
+
+
 async def _build_period_report(period: str, tz_name: str) -> str:
     summary = await db.fetch_period_summary(period, tz_name=tz_name)
     icon = "🟢" if summary["pnl_total"] >= 0 else "🔴"
@@ -198,15 +211,22 @@ async def _build_period_report(period: str, tz_name: str) -> str:
     if isinstance(worst_trade, dict):
         worst_line = f"{worst_trade.get('symbol', '-')} {_fmt_money(float(worst_trade.get('pnl', 0.0)))}"
     label = "SEMANA" if period == "week" else "MES" if period == "month" else "DÍA"
+    pf_label = _fmt_profit_factor(summary)
+    sample_note = (
+        "Muestra baja: interpreta con cautela."
+        if int(summary["total_trades"]) < 5
+        else "Muestra estable."
+    )
     return (
         f"📈 *RESUMEN {label}* ({tz_name})\n"
         f"────────────────────────\n"
         f"💰 *PnL:* {_fmt_money(summary['pnl_total'])} {icon}\n"
         f"📊 *Trades:* {summary['total_trades']} | Ganados: {summary['wins']} | Perdidos: {summary['losses']}\n"
         f"🎯 *Winrate:* {_fmt_pct(summary['winrate'])}\n"
-        f"⚖️ *Profit Factor:* {summary['profit_factor']:.2f}\n"
+        f"⚖️ *Profit Factor:* {pf_label}\n"
         f"🏆 *Mejor Trade:* {best_line}\n"
         f"📉 *Peor Trade:* {worst_line}\n"
+        f"🧪 *Calidad muestra:* {sample_note}\n"
         f"────────────────────────"
     )
 
@@ -282,12 +302,13 @@ async def telegram_command_poller(
                                 num_open = len(paper_executor.open_positions)
                                 max_pos = risk_manager.max_positions
                                 balance = risk_manager.balance
-                                pnl = paper_executor.total_pnl
+                                realized_pnl = paper_executor.total_pnl
+                                floating_total = 0.0
                                 
                                 report = (
                                     "📊 *ESTADO ACTUAL DEL BOT*\n"
                                     f"💰 *Balance Real:* {balance:.2f} USDT\n"
-                                    f"📈 *PnL Histórico:* {pnl:+.4f} USDT\n"
+                                    f"📈 *PnL Realizado:* {realized_pnl:+.4f} USDT\n"
                                     f"🛒 *Posiciones Abiertas:* {num_open}/{max_pos}\n\n"
                                 )
                                 
@@ -301,6 +322,7 @@ async def telegram_command_poller(
                                         # Calcular PnL irrealizado
                                         qty = pos.position_size / pos.entry_price
                                         unrealized_pnl = (current_price - pos.entry_price) * qty
+                                        floating_total += unrealized_pnl
                                         pnl_sign = "+" if unrealized_pnl >= 0 else ""
                                         
                                         report += (
@@ -311,8 +333,19 @@ async def telegram_command_poller(
                                         )
                                 else:
                                     report += "💤 _No hay posiciones abiertas._"
+                                total_estimated = realized_pnl + floating_total
+                                report += (
+                                    "\n"
+                                    f"🫧 *PnL Flotante:* {floating_total:+.4f} USDT\n"
+                                    f"🧮 *PnL Total Estimado:* {total_estimated:+.4f} USDT"
+                                )
                                 
-                                await send_telegram_alert(report)
+                                await send_priority_telegram_alert(
+                                    report,
+                                    priority="info",
+                                    dedup_key="manual:status",
+                                    force=True,
+                                )
                             elif text.startswith("/stats") or text.startswith("/daily"):
                                 stats = await db.fetch_daily_stats()
                                 max_dd = state.get("max_drawdown", 0.0)
@@ -322,6 +355,13 @@ async def telegram_command_poller(
                                 losses = stats["losses"]
                                 daily_pnl = stats["daily_pnl"]
                                 total_trades = stats["total_trades"]
+                                floating_total = 0.0
+                                for sym, pos in paper_executor.open_positions.items():
+                                    prices_buf = state.get("prices", {}).get(sym, [])
+                                    candle_m = float(prices_buf[-1]) if prices_buf else pos.entry_price
+                                    current_price = mt5_dashboard_mark(state, sym, candle_m) or pos.entry_price
+                                    qty = pos.position_size / pos.entry_price
+                                    floating_total += (current_price - pos.entry_price) * qty
                                 
                                 pnl_sign = "+" if daily_pnl >= 0 else ""
                                 pnl_emoji = "🟢" if daily_pnl >= 0 else "🔴"
@@ -332,6 +372,7 @@ async def telegram_command_poller(
                                     f"📊 *Trades Cerrados:* {total_trades}\n"
                                     f"🏆 *Ganados / Perdidos:* {wins} / {losses}\n"
                                     f"💰 *PnL del Día:* {pnl_sign}{daily_pnl:.4f} USDT {pnl_emoji}\n"
+                                    f"🫧 *PnL Flotante Actual:* {floating_total:+.4f} USDT\n"
                                     f"📉 *Máximo Drawdown:* {dd_sign}{abs(max_dd):.4f} USDT\n"
                                     "────────────────────────"
                                 )
@@ -387,12 +428,14 @@ async def telegram_command_poller(
                                 tz_name = str(_report_timezone())
                                 week = await db.fetch_period_summary("week", tz_name=tz_name)
                                 month = await db.fetch_period_summary("month", tz_name=tz_name)
+                                week_pf = _fmt_profit_factor(week)
+                                month_pf = _fmt_profit_factor(month)
                                 ceo_report = (
                                     f"🧭 *CEO SNAPSHOT* ({tz_name})\n"
                                     "────────────────────────\n"
-                                    f"📅 Semana: {_fmt_money(week['pnl_total'])} | Winrate {_fmt_pct(week['winrate'])}\n"
-                                    f"🗓️ Mes: {_fmt_money(month['pnl_total'])} | Winrate {_fmt_pct(month['winrate'])}\n"
-                                    f"⚖️ PF Semana/Mes: {week['profit_factor']:.2f} / {month['profit_factor']:.2f}\n"
+                                    f"📅 Semana: {_fmt_money(week['pnl_total'])} | Winrate {_fmt_pct(week['winrate'])} | Trades {week['total_trades']}\n"
+                                    f"🗓️ Mes: {_fmt_money(month['pnl_total'])} | Winrate {_fmt_pct(month['winrate'])} | Trades {month['total_trades']}\n"
+                                    f"⚖️ PF Semana/Mes: {week_pf} / {month_pf}\n"
                                     "────────────────────────"
                                 )
                                 await send_priority_telegram_alert(

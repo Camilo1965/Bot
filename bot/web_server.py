@@ -491,9 +491,16 @@ async def start_web_dashboard(
             "pnl_7d": f"{float(week['pnl_total']):+,.2f} USDT",
             "pnl_7d_num": float(week["pnl_total"]),
             "winrate_7d": f"{float(week['winrate']):.1f}%",
+            "trades_7d": int(week["total_trades"]),
             "pnl_30d": f"{float(month['pnl_total']):+,.2f} USDT",
             "pnl_30d_num": float(month["pnl_total"]),
-            "profit_factor_30d": f"{float(month['profit_factor']):.2f}",
+            "profit_factor_30d": (
+                "N/A (sin pérdidas)"
+                if int(month["total_trades"]) > 0 and int(month["losses"]) == 0 and int(month["wins"]) > 0
+                else "N/A"
+                if int(month["total_trades"]) == 0
+                else f"{float(month['profit_factor']):.2f}"
+            ),
             "symbols_month": [
                 {
                     "symbol": s["symbol"],
