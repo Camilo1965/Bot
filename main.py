@@ -214,8 +214,19 @@ class _DashboardEventHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
             msg = record.getMessage()
+            
+            # Excluir actualizaciones periódicas que generan ruido visual en el dashboard
+            # según lo solicitado: "solo elimina la actualziacion que hace cuando esta mostrando el servidor web"
+            if any(k in msg for k in ("Sincronizando posiciones", "Sincronización completa", "[MT5 FEED]", "[LLM]")):
+                if record.levelno < logging.WARNING:
+                    return
+            
+            # Excluir logs de acceso al servidor web (cada fetch de la API)
+            if record.name == "aiohttp.access" or "GET /api/state" in msg:
+                return
+
+            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
             if len(msg) > 78:
                 msg = msg[:75] + "..."
             level_markup = {
