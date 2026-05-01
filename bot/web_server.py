@@ -159,6 +159,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </div>
                 <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
                     <div class="text-xs text-slate-400 mb-2">Últimos trades cerrados</div>
+                    <div class="flex flex-wrap gap-2 mb-3" id="ceo-trades-filters">
+                        <button type="button" data-filter="today" class="px-2 py-1 text-xs rounded border border-white/10 text-slate-300 hover:border-sky-400/50">Hoy</button>
+                        <button type="button" data-filter="7d" class="px-2 py-1 text-xs rounded border border-white/10 text-slate-300 hover:border-sky-400/50">7D</button>
+                        <button type="button" data-filter="30d" class="px-2 py-1 text-xs rounded border border-white/10 text-slate-300 hover:border-sky-400/50">30D</button>
+                        <button type="button" data-filter="all" class="px-2 py-1 text-xs rounded border border-sky-400/50 text-sky-300">Todo</button>
+                    </div>
                     <div class="space-y-2 text-sm" id="ceo-trades"></div>
                     <button id="ceo-trades-more" class="mt-3 text-xs text-sky-400 hover:text-sky-300 hidden" type="button">Cargar más</button>
                 </div>
@@ -187,6 +193,38 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const stateCache = {};
         let ceoTradeVisibleCount = 10;
         let ceoTradeRows = [];
+        let ceoTradeFilter = 'all';
+
+        function filterCeoTrades(rows) {
+            if (ceoTradeFilter === 'all') return rows;
+            const now = new Date();
+            const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            const dayMs = 24 * 60 * 60 * 1000;
+            return rows.filter((t) => {
+                if (!t.exit_time_iso) return false;
+                const d = new Date(t.exit_time_iso);
+                if (Number.isNaN(d.getTime())) return false;
+                if (ceoTradeFilter === 'today') {
+                    return d >= startToday;
+                }
+                if (ceoTradeFilter === '7d') {
+                    return (now - d) <= (7 * dayMs);
+                }
+                if (ceoTradeFilter === '30d') {
+                    return (now - d) <= (30 * dayMs);
+                }
+                return true;
+            });
+        }
+
+        function updateCeoFilterButtons() {
+            document.querySelectorAll('#ceo-trades-filters button[data-filter]').forEach((btn) => {
+                const active = btn.dataset.filter === ceoTradeFilter;
+                btn.className = active
+                    ? 'px-2 py-1 text-xs rounded border border-sky-400/50 text-sky-300'
+                    : 'px-2 py-1 text-xs rounded border border-white/10 text-slate-300 hover:border-sky-400/50';
+            });
+        }
 
         function updateValue(id, newValue, className = '') {
             const el = document.getElementById(id);
@@ -266,21 +304,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const tradesEl = document.getElementById('ceo-trades');
             const trades = ceo.recent_trades || [];
             ceoTradeRows = trades;
-            const renderCount = Math.min(ceoTradeVisibleCount, ceoTradeRows.length);
-            if (ceoTradeRows.length === 0) {
+            const filteredTrades = filterCeoTrades(ceoTradeRows);
+            const renderCount = Math.min(ceoTradeVisibleCount, filteredTrades.length);
+            if (filteredTrades.length === 0) {
                 tradesEl.innerHTML = '<div class="text-slate-500">Sin trades cerrados</div>';
             } else {
-                tradesEl.innerHTML = ceoTradeRows.slice(0, renderCount).map(t => `
+                tradesEl.innerHTML = filteredTrades.slice(0, renderCount).map(t => `
                     <div class="flex justify-between">
                         <span class="text-slate-300">${t.symbol} <span class="text-slate-500">(${t.exit_time_local})</span></span>
                         <span class="${Number(t.pnl_num) >= 0 ? 'text-emerald-400' : 'text-red-400'}">${t.pnl}</span>
                     </div>
                 `).join('');
             }
+            updateCeoFilterButtons();
             const moreBtn = document.getElementById('ceo-trades-more');
-            if (ceoTradeRows.length > renderCount) {
+            if (filteredTrades.length > renderCount) {
                 moreBtn.classList.remove('hidden');
-                moreBtn.innerText = `Cargar más (${ceoTradeRows.length - renderCount})`;
+                moreBtn.innerText = `Cargar más (${filteredTrades.length - renderCount})`;
             } else {
                 moreBtn.classList.add('hidden');
             }
@@ -397,6 +437,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             ceoTradeVisibleCount += 20;
             render({ ...window.__lastData, ceo: { ...(window.__lastData?.ceo || {}), recent_trades: ceoTradeRows } });
         });
+        document.querySelectorAll('#ceo-trades-filters button[data-filter]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                ceoTradeFilter = btn.dataset.filter || 'all';
+                ceoTradeVisibleCount = 10;
+                render({ ...window.__lastData, ceo: { ...(window.__lastData?.ceo || {}), recent_trades: ceoTradeRows } });
+            });
+        });
     </script>
 </body>
 </html>
@@ -437,6 +484,7 @@ async def start_web_dashboard(
                     "pnl": f"{pnl_num:+.2f} USDT",
                     "pnl_num": pnl_num,
                     "exit_time_local": exit_local,
+                    "exit_time_iso": exit_time.isoformat() if isinstance(exit_time, datetime) else "",
                 }
             )
         ceo_payload = {
