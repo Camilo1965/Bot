@@ -269,7 +269,7 @@ async def start_web_dashboard(
             if has_pos:
                 qty = pos.position_size / pos.entry_price
                 unrl = (price - pos.entry_price) * qty
-                pos_str = f"Posición LONG @{pos.entry_price:,.2f}"
+                pos_str = f"Entrada {pos.entry_price:,.2f}"
                 action = "Gestionando posición"
             else:
                 action = "Comprar" if prob >= BUY_PROB_THRESHOLD else "Esperar"
@@ -281,7 +281,11 @@ async def start_web_dashboard(
                 "change_num": pct,
                 "rsi": f"{rsi:.1f}" if rsi is not None else "--",
                 "ml_conf": f"{prob*100:.0f}%",
-                "trend": t1h[:4].upper(),
+                "trend": (
+                    "Alcista" if t1h == "bullish"
+                    else "Bajista" if t1h == "bearish"
+                    else "Neutral"
+                ),
                 "action": action,
                 "has_position": has_pos,
                 "position_str": pos_str,
