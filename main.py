@@ -66,6 +66,7 @@ from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, M
 from strategy.sentiment_llm import get_gemini_sentiment
 from utils.telegram_notifier import (
     install_asyncio_critical_telegram_alerts,
+    install_telegram_log_alerts,
     send_priority_telegram_alert,
     send_telegram_alert,
     telegram_command_poller,
@@ -428,6 +429,7 @@ async def main() -> None:
     root_logger.addHandler(_rich_handler)
 
     install_asyncio_critical_telegram_alerts()
+    install_telegram_log_alerts()
 
     logger.info("🚀 ClawdBot starting up...")
 

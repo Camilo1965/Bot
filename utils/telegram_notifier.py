@@ -28,6 +28,7 @@ import logging
 import os
 import ssl
 import time
+from html import escape
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -55,8 +56,15 @@ _PRIORITY_COOLDOWN_S = {
     "critical": 60.0,
     "summary": 300.0,
     "info": 120.0,
+    "warning_log": 180.0,
 }
 _LAST_ALERT_SENT_AT: dict[str, float] = {}
+
+# Loggers that must never forward to Telegram (recursion / noise).
+_TELEGRAM_LOG_HANDLER_SKIP_PREFIXES: tuple[str, ...] = (
+    "utils.telegram_notifier",
+    "aiohttp.access",
+)
 
 
 def _telegram_ssl_context() -> ssl.SSLContext | bool | None:
@@ -163,6 +171,7 @@ async def send_priority_telegram_alert(
     priority: str = "info",
     dedup_key: str | None = None,
     force: bool = False,
+    parse_mode: str | None = "Markdown",
 ) -> bool:
     """Send Telegram alert with priority-based cooldown and dedup."""
     key = dedup_key or f"{priority}:{hash(message)}"
@@ -173,10 +182,86 @@ async def send_priority_telegram_alert(
         if now_mono - last_sent < cooldown:
             logger.debug("Telegram alert skipped by cooldown (priority=%s key=%s).", priority, key)
             return False
-    ok = await send_telegram_alert(message)
+    ok = await send_telegram_alert(message, parse_mode=parse_mode)
     if ok:
         _LAST_ALERT_SENT_AT[key] = now_mono
     return ok
+
+
+def _format_record_body(record: logging.LogRecord) -> str:
+    msg = record.getMessage()
+    if record.exc_info:
+        fmt = logging.Formatter()
+        try:
+            msg += "\n" + fmt.formatException(record.exc_info)
+        except Exception:  # noqa: BLE001
+            msg += "\n<exception format failed>"
+    return msg
+
+
+class TelegramForwardingHandler(logging.Handler):
+    """Forward WARNING+ (configurable) log records to Telegram; cooldown + dedup.
+
+    Set ``TELEGRAM_LOG_ALERTS=0`` to disable. ``TELEGRAM_LOG_MIN_LEVEL`` =
+    ``WARNING``, ``ERROR``, or ``CRITICAL`` (default ``ERROR``).
+    ``TELEGRAM_LOG_IGNORE`` = comma-separated logger name prefixes to skip.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if not os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
+                return
+            name = record.name
+            for prefix in _TELEGRAM_LOG_HANDLER_SKIP_PREFIXES:
+                if name == prefix or name.startswith(prefix + "."):
+                    return
+            extra_ignore = os.environ.get("TELEGRAM_LOG_IGNORE", "").strip()
+            if extra_ignore:
+                for part in extra_ignore.split(","):
+                    p = part.strip()
+                    if p and (name == p or name.startswith(p)):
+                        return
+            body = _format_record_body(record)
+            esc_body = escape(body)
+            esc_logger = escape(record.name)
+            esc_level = escape(record.levelname)
+            text = (
+                f"📋 <b>LOG {esc_level}</b> <code>{esc_logger}</code>\n"
+                f"<pre>{esc_body}</pre>"
+            )
+            if len(text) > 4090:
+                text = text[:4070] + escape("\n…")
+
+            dedup_key = f"logline:{record.name}:{hash(body[:400]) % 10_000_000}"
+            priority = "critical" if record.levelno >= logging.ERROR else "warning_log"
+
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                send_priority_telegram_alert(
+                    text,
+                    priority=priority,
+                    dedup_key=dedup_key,
+                    parse_mode="HTML",
+                )
+            )
+        except RuntimeError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def install_telegram_log_alerts() -> None:
+    """Attach :class:`TelegramForwardingHandler` to the root logger (once)."""
+    env = os.environ.get("TELEGRAM_LOG_ALERTS", "1").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return
+    raw = os.environ.get("TELEGRAM_LOG_MIN_LEVEL", "ERROR").strip().upper()
+    min_level = getattr(logging, raw, logging.ERROR)
+    root = logging.getLogger()
+    for h in root.handlers:
+        if isinstance(h, TelegramForwardingHandler):
+            return
+    root.addHandler(TelegramForwardingHandler(level=min_level))
 
 
 def install_asyncio_critical_telegram_alerts() -> None:
