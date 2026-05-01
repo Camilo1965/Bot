@@ -308,10 +308,12 @@ def _build_trade_report(
     return (
         f"🏁 *TRADE COMPLETED* | #{sym} {status_emoji}\n"
         f"────────────────────────\n"
-        f"📈 *PnL:* {pnl_sign}{net_pnl:.4f} USDT ({pct_sign}{pnl_pct:.2f}%)\n"
+        f"📈 *PnL Neto:* {pnl_sign}{net_pnl:.4f} USDT ({pct_sign}{pnl_pct:.2f}%)\n"
+        f"💳 *Margen:* {margin_used:.2f} USDT ({LEVERAGE}x)\n"
         f"🚪 *Causa:* {exit_label}\n"
         f"⏱️ *Duración:* {duration_str}\n"
-        f"📊 *Entrada:* {pos.entry_price:.2f} | *Salida:* {exit_price:.2f}\n"
+        f"📊 *Precios:* In: {pos.entry_price:.2f} | Pico Máx: {pos.peak_price:.2f} | Out: {exit_price:.2f}\n"
+        f"🤖 *IA en Entrada:* XGB: {pos.ml_confidence * 100:.1f}% | Sentimiento: {pos.sentiment_score:.2f}\n"
         f"💰 *Wallet Final:* {current_balance:.2f} USDT\n"
         f"────────────────────────"
     )
@@ -459,7 +461,11 @@ class PaperExecutor:
                 })
             tmp = _STATE_FILE.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            tmp.replace(_STATE_FILE)
+            try:
+                tmp.replace(_STATE_FILE)
+            except OSError as e:
+                logger.warning("_save_state: atomic replace failed: %s. Trying direct write.", e)
+                _STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logger.warning("_save_state: could not write state.json: %s", exc)
 
@@ -943,9 +949,8 @@ class PaperExecutor:
                 current_price - pos.current_stop_loss,
             )
 
-            await self._sync_exchange_stops(sym, pos, current_price, current_atr)
-
             if current_price > pos.current_stop_loss:
+                await self._sync_exchange_stops(sym, pos, current_price, current_atr)
                 return None
 
             pnl = price_change_pct * pos.position_size

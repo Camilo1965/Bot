@@ -54,7 +54,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_MODEL_NAME = "gemini-2.5-flash"
+_MODEL_NAME = "gemini-2.5-flash-lite"
 
 # Safe fallback returned whenever the Gemini API is unavailable.
 _FALLBACK_SENTIMENT: float = -0.1
@@ -99,16 +99,25 @@ def get_gemini_sentiment(headlines: list[str]) -> float:
         return _FALLBACK_SENTIMENT
 
     prompt = "\n".join(f"- {h}" for h in headlines)
-    try:
-        client = _get_client()
-        response = client.models.generate_content(
-            model=_MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=_SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-            ),
-        )
+    import time
+    for attempt in range(3):
+        try:
+            client = _get_client()
+            response = client.models.generate_content(
+                model=_MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_INSTRUCTION,
+                    response_mime_type="application/json",
+                ),
+            )
+            break
+        except Exception as exc:
+            if attempt < 2 and "503" in str(exc):
+                logger.warning("Gemini 503 error on attempt %d, retrying in 2 seconds...", attempt + 1)
+                time.sleep(2)
+                continue
+            raise  # Re-raise to be handled by the outer try-except
         
         # Parseo robusto del contenido
         raw_text = response.text.strip()

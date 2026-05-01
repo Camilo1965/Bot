@@ -257,8 +257,14 @@ async def health_monitor_loop(
                     pass
                 asyncio.create_task(
                     send_telegram_alert(
-                        "🚨 *RECONCILER ALERT* Cierres pendientes persistentes: "
-                        f"{pending_count}\n" + "\n".join(details[:5])
+                        "🚨 *ALERTA DEL SISTEMA: ÓRDENES DE CIERRE RECHAZADAS*\n\n"
+                        f"El bot ha intentado cerrar *{pending_count} posición(es)* repetidamente, pero el bróker (MT5) está rechazando las órdenes.\n\n"
+                        "🛑 *¿Qué significa esto?*\n"
+                        "El bot ya decidió que la operación debe cerrarse (por toma de ganancias o stop loss), pero MT5 no procesa la solicitud.\n\n"
+                        "⚠️ *Acción recomendada:*\n"
+                        "Revisa la terminal de MT5 manualmente para confirmar si la orden sigue abierta o si ya se cerró. Si sigue abierta, es posible que debas cerrarla a mano.\n\n"
+                        "*Detalles técnicos (Símbolo : Error):*\n"
+                        + "\n".join(f"• `{d}`" for d in details[:5])
                     )
                 )
         else:

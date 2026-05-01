@@ -1463,6 +1463,19 @@ class MT5Executor(PaperExecutor):
                                 position_id=mt5_pos.ticket,
                             )
                             result = await self._send_order_with_retry(request)
+                            
+                            if result is None:
+                                logger.warning("[MT5] Close order failed. Attempting to clear stops and retry...")
+                                clear_request = {
+                                    "action": mt5.TRADE_ACTION_SLTP,
+                                    "symbol": mt5_sym,
+                                    "position": mt5_pos.ticket,
+                                    "sl": 0.0,
+                                    "tp": 0.0,
+                                }
+                                await self._send_order_with_retry(clear_request)
+                                result = await self._send_order_with_retry(request)
+
                             if result is not None:
                                 closed_count += 1
                                 logger.info(
@@ -1766,6 +1779,9 @@ class MT5Executor(PaperExecutor):
             cn = self._normalize_price(cand_tp, digits)
             if cn > ask + min_step and self._validate_stops(mt5_sym, ask, send_sl, cn):
                 send_tp = max(cur_tp_br, cn)
+
+        if not self._validate_stops(mt5_sym, ask, send_sl):
+            return
 
         sl_delta = abs(send_sl - cur_sl_br)
         tp_delta = abs(send_tp - cur_tp_br) if send_tp > 0.0 or cur_tp_br > 0.0 else 0.0

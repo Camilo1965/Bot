@@ -62,7 +62,7 @@ from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor
 from strategy.sentiment_llm import get_gemini_sentiment
-from utils.telegram_notifier import send_telegram_alert
+from utils.telegram_notifier import send_telegram_alert, telegram_command_poller
 
 from bot import state as dash_state
 from bot.constants import (
@@ -752,6 +752,7 @@ async def main() -> None:
         ),
         health_monitor_loop(shared_state, market_queue, paper_executor, interval=30),
         close_pending_reconciler_loop(shared_state, paper_executor, interval=20),
+        telegram_command_poller(shared_state, paper_executor, risk_manager, interval=5),
     ]
     if _GEMINI_ENABLED:
         run_tasks.append(gemini_sentiment_refresher(shared_state))

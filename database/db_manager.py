@@ -144,6 +144,16 @@ FROM trades_history
 WHERE status = 'closed';
 """
 
+_FETCH_DAILY_STATS = """
+SELECT 
+    COUNT(*) as total_trades,
+    COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) as wins,
+    COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) as losses,
+    COALESCE(SUM(pnl), 0.0) as daily_pnl
+FROM trades_history
+WHERE status = 'closed' AND exit_time >= CURRENT_DATE;
+"""
+
 _CREATE_HTF_TREND_STATUS = """
 CREATE TABLE IF NOT EXISTS htf_trend_status (
     symbol      TEXT         NOT NULL,
@@ -399,6 +409,21 @@ class DatabaseManager:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(_FETCH_TOTAL_PNL)
         return float(row["total_pnl"])  # type: ignore[index]
+
+    async def fetch_daily_stats(self) -> dict[str, Any]:
+        """Return today's trading statistics (UTC date)."""
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_FETCH_DAILY_STATS)
+        if row is None:
+            return {"total_trades": 0, "wins": 0, "losses": 0, "daily_pnl": 0.0}
+        return {
+            "total_trades": int(row["total_trades"]),
+            "wins": int(row["wins"]),
+            "losses": int(row["losses"]),
+            "daily_pnl": float(row["daily_pnl"]),
+        }
 
     async def insert_health_event(
         self,
