@@ -160,6 +160,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
                     <div class="text-xs text-slate-400 mb-2">Últimos trades cerrados</div>
                     <div class="space-y-2 text-sm" id="ceo-trades"></div>
+                    <button id="ceo-trades-more" class="mt-3 text-xs text-sky-400 hover:text-sky-300 hidden" type="button">Cargar más</button>
                 </div>
             </div>
         </div>
@@ -184,6 +185,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <script>
         const stateCache = {};
+        let ceoTradeVisibleCount = 10;
+        let ceoTradeRows = [];
 
         function updateValue(id, newValue, className = '') {
             const el = document.getElementById(id);
@@ -212,6 +215,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             try {
                 const res = await fetch('/api/state');
                 const data = await res.json();
+                window.__lastData = data;
                 render(data);
             } catch (err) {
                 console.error("Error fetching state", err);
@@ -261,15 +265,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
             const tradesEl = document.getElementById('ceo-trades');
             const trades = ceo.recent_trades || [];
-            if (trades.length === 0) {
+            ceoTradeRows = trades;
+            const renderCount = Math.min(ceoTradeVisibleCount, ceoTradeRows.length);
+            if (ceoTradeRows.length === 0) {
                 tradesEl.innerHTML = '<div class="text-slate-500">Sin trades cerrados</div>';
             } else {
-                tradesEl.innerHTML = trades.slice(0, 6).map(t => `
+                tradesEl.innerHTML = ceoTradeRows.slice(0, renderCount).map(t => `
                     <div class="flex justify-between">
                         <span class="text-slate-300">${t.symbol} <span class="text-slate-500">(${t.exit_time_local})</span></span>
                         <span class="${Number(t.pnl_num) >= 0 ? 'text-emerald-400' : 'text-red-400'}">${t.pnl}</span>
                     </div>
                 `).join('');
+            }
+            const moreBtn = document.getElementById('ceo-trades-more');
+            if (ceoTradeRows.length > renderCount) {
+                moreBtn.classList.remove('hidden');
+                moreBtn.innerText = `Cargar más (${ceoTradeRows.length - renderCount})`;
+            } else {
+                moreBtn.classList.add('hidden');
             }
 
             // Render Market Cards
@@ -380,6 +393,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         fetchState();
         setInterval(fetchState, 1000);
+        document.getElementById('ceo-trades-more').addEventListener('click', () => {
+            ceoTradeVisibleCount += 20;
+            render({ ...window.__lastData, ceo: { ...(window.__lastData?.ceo || {}), recent_trades: ceoTradeRows } });
+        });
     </script>
 </body>
 </html>
@@ -404,7 +421,7 @@ async def start_web_dashboard(
         week = await db.fetch_period_summary("week", tz_name=report_tz)
         month = await db.fetch_period_summary("month", tz_name=report_tz)
         symbols = await db.fetch_symbol_performance("month", tz_name=report_tz)
-        recent = await db.fetch_recent_closed_trades(limit=8)
+        recent = await db.fetch_recent_closed_trades(limit=250)
         tz_obj = ZoneInfo(report_tz)
         recent_rows: list[dict[str, Any]] = []
         for row in recent:
@@ -413,7 +430,7 @@ async def start_web_dashboard(
                 exit_local = exit_time.astimezone(tz_obj).strftime("%m-%d %H:%M")
             else:
                 exit_local = "--"
-            pnl_num = float(row.get("pnl") or 0.0)
+            pnl_num = float(row.get("pnl_net") if row.get("pnl_net") is not None else (row.get("pnl") or 0.0))
             recent_rows.append(
                 {
                     "symbol": str(row.get("symbol", "-")),

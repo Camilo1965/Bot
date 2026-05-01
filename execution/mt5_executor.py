@@ -57,7 +57,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -1522,12 +1522,30 @@ class MT5Executor(PaperExecutor):
             return False
 
         # ── Paper book-keeping (identical to PaperExecutor) ────────────────
+        fee_total = pos.position_size * _TAKER_FEE_RATE * 2
+        pnl_net = pnl - fee_total
+        commission = 0.0
+        swap = 0.0
+        fee = fee_total
+        mt5_ticket = getattr(pos, "mt5_position_ticket", None)
+        if self._live and isinstance(mt5_ticket, int):
+            economics = self._resolve_mt5_close_economics(mt5_ticket)
+            if economics is not None:
+                pnl_net = economics["pnl_net"]
+                commission = economics["commission"]
+                swap = economics["swap"]
+                fee = economics["fee"]
+
         if pos.trade_id is not None:
             await self._db.close_trade(
                 trade_id=pos.trade_id,
                 exit_price=exit_price,
                 exit_time=exit_time,
                 pnl=pnl,
+                pnl_net=pnl_net,
+                commission=commission,
+                swap=swap,
+                fee=fee,
             )
 
         # Credit back any PnL (positive or negative)
@@ -1539,10 +1557,8 @@ class MT5Executor(PaperExecutor):
         self.total_pnl += pnl
         del self.open_positions[symbol]
 
-        total_fees = pos.position_size * _TAKER_FEE_RATE * 2
-        net_pnl = pnl - total_fees
         margin_used = pos.position_size / LEVERAGE
-        pnl_pct = (net_pnl / margin_used * 100) if margin_used > 0 else 0.0
+        pnl_pct = (pnl_net / margin_used * 100) if margin_used > 0 else 0.0
         record_trade(
             timestamp=exit_time,
             symbol=symbol,
@@ -1552,11 +1568,47 @@ class MT5Executor(PaperExecutor):
             ml_confidence_at_entry=pos.ml_confidence,
             sentiment_score_at_entry=pos.sentiment_score,
             exit_reason=exit_reason_code,
-            pnl_usdt=net_pnl,
+            pnl_usdt=pnl_net,
             pnl_percent=pnl_pct,
         )
         self._save_state()
         return True
+
+    def _resolve_mt5_close_economics(self, position_ticket: int) -> dict[str, float] | None:
+        """Fetch broker-realized close economics from MT5 deals history."""
+        if not _MT5_AVAILABLE:
+            return None
+        date_to = datetime.now(tz=timezone.utc)
+        date_from = date_to.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=3)
+        try:
+            deals = mt5.history_deals_get(date_from, date_to, position=position_ticket)
+        except Exception:  # noqa: BLE001
+            return None
+        if not deals:
+            return None
+        close_deals = []
+        for d in deals:
+            entry = getattr(d, "entry", None)
+            if entry == mt5.DEAL_ENTRY_OUT:
+                close_deals.append(d)
+        if not close_deals:
+            close_deals = list(deals)
+        pnl_total = 0.0
+        commission_total = 0.0
+        swap_total = 0.0
+        fee_total = 0.0
+        for d in close_deals:
+            pnl_total += float(getattr(d, "profit", 0.0) or 0.0)
+            commission_total += float(getattr(d, "commission", 0.0) or 0.0)
+            swap_total += float(getattr(d, "swap", 0.0) or 0.0)
+            fee_total += float(getattr(d, "fee", 0.0) or 0.0)
+        pnl_net = pnl_total + commission_total + swap_total + fee_total
+        return {
+            "pnl_net": pnl_net,
+            "commission": commission_total,
+            "swap": swap_total,
+            "fee": fee_total,
+        }
 
     # ------------------------------------------------------------------
     # sync_positions_with_exchange override

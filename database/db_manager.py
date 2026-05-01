@@ -105,6 +105,14 @@ CREATE TABLE IF NOT EXISTS trades_history (
 );
 """
 
+_ALTER_TRADES_HISTORY_METRICS = """
+ALTER TABLE trades_history
+ADD COLUMN IF NOT EXISTS pnl_net DOUBLE PRECISION,
+ADD COLUMN IF NOT EXISTS commission DOUBLE PRECISION,
+ADD COLUMN IF NOT EXISTS swap DOUBLE PRECISION,
+ADD COLUMN IF NOT EXISTS fee DOUBLE PRECISION;
+"""
+
 _CREATE_COMMANDS = """
 CREATE TABLE IF NOT EXISTS commands (
     id         SERIAL       PRIMARY KEY,
@@ -136,6 +144,10 @@ UPDATE trades_history
 SET exit_price = $2,
     exit_time  = $3,
     pnl        = $4,
+    pnl_net    = $5,
+    commission = $6,
+    swap       = $7,
+    fee        = $8,
     status     = 'closed'
 WHERE id = $1;
 """
@@ -159,11 +171,11 @@ WHERE status = 'closed' AND exit_time >= CURRENT_DATE;
 _FETCH_PERIOD_SUMMARY = """
 SELECT
     COUNT(*) AS total_trades,
-    COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
-    COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses,
-    COALESCE(SUM(pnl), 0.0) AS pnl_total,
-    COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0.0) AS gross_profit,
-    COALESCE(SUM(CASE WHEN pnl < 0 THEN ABS(pnl) ELSE 0 END), 0.0) AS gross_loss
+    COALESCE(SUM(CASE WHEN COALESCE(pnl_net, pnl, 0.0) > 0 THEN 1 ELSE 0 END), 0) AS wins,
+    COALESCE(SUM(CASE WHEN COALESCE(pnl_net, pnl, 0.0) <= 0 THEN 1 ELSE 0 END), 0) AS losses,
+    COALESCE(SUM(COALESCE(pnl_net, pnl, 0.0)), 0.0) AS pnl_total,
+    COALESCE(SUM(CASE WHEN COALESCE(pnl_net, pnl, 0.0) > 0 THEN COALESCE(pnl_net, pnl, 0.0) ELSE 0 END), 0.0) AS gross_profit,
+    COALESCE(SUM(CASE WHEN COALESCE(pnl_net, pnl, 0.0) < 0 THEN ABS(COALESCE(pnl_net, pnl, 0.0)) ELSE 0 END), 0.0) AS gross_loss
 FROM trades_history
 WHERE status = 'closed'
   AND exit_time >= $1
@@ -171,7 +183,7 @@ WHERE status = 'closed'
 """
 
 _FETCH_BEST_WORST_TRADE = """
-SELECT id, symbol, pnl, exit_time
+SELECT id, symbol, COALESCE(pnl_net, pnl, 0.0) AS pnl, exit_time
 FROM trades_history
 WHERE status = 'closed'
   AND exit_time >= $1
@@ -181,7 +193,7 @@ LIMIT 1;
 """
 
 _FETCH_WORST_TRADE = """
-SELECT id, symbol, pnl, exit_time
+SELECT id, symbol, COALESCE(pnl_net, pnl, 0.0) AS pnl, exit_time
 FROM trades_history
 WHERE status = 'closed'
   AND exit_time >= $1
@@ -194,8 +206,8 @@ _FETCH_SYMBOL_PERFORMANCE = """
 SELECT
     symbol,
     COUNT(*) AS total_trades,
-    COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
-    COALESCE(SUM(pnl), 0.0) AS pnl_total
+    COALESCE(SUM(CASE WHEN COALESCE(pnl_net, pnl, 0.0) > 0 THEN 1 ELSE 0 END), 0) AS wins,
+    COALESCE(SUM(COALESCE(pnl_net, pnl, 0.0)), 0.0) AS pnl_total
 FROM trades_history
 WHERE status = 'closed'
   AND exit_time >= $1
@@ -207,7 +219,7 @@ ORDER BY pnl_total DESC;
 _FETCH_DAILY_PNL_SERIES = """
 SELECT
     DATE_TRUNC('day', exit_time) AS day_utc,
-    COALESCE(SUM(pnl), 0.0) AS pnl_total
+    COALESCE(SUM(COALESCE(pnl_net, pnl, 0.0)), 0.0) AS pnl_total
 FROM trades_history
 WHERE status = 'closed'
   AND exit_time >= $1
@@ -223,6 +235,10 @@ SELECT
     entry_price,
     exit_price,
     pnl,
+    pnl_net,
+    commission,
+    swap,
+    fee,
     exit_time
 FROM trades_history
 WHERE status = 'closed'
@@ -423,6 +439,10 @@ class DatabaseManager:
         exit_price: float,
         exit_time: datetime | None = None,
         pnl: float = 0.0,
+        pnl_net: float | None = None,
+        commission: float = 0.0,
+        swap: float = 0.0,
+        fee: float = 0.0,
     ) -> None:
         """Update a trade record in *trades_history* to mark it as closed.
 
@@ -437,7 +457,17 @@ class DatabaseManager:
             raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
         ts = exit_time or datetime.now(tz=timezone.utc)
         async with self._pool.acquire() as conn:
-            await conn.execute(_CLOSE_TRADE, trade_id, exit_price, ts, pnl)
+            await conn.execute(
+                _CLOSE_TRADE,
+                trade_id,
+                exit_price,
+                ts,
+                pnl,
+                pnl if pnl_net is None else pnl_net,
+                commission,
+                swap,
+                fee,
+            )
 
     async def upsert_htf_trend(
         self,
@@ -702,6 +732,7 @@ class DatabaseManager:
             await conn.execute(_CREATE_MARKET_DATA)
             await conn.execute(_CREATE_NEWS_SENTIMENT)
             await conn.execute(_CREATE_TRADES_HISTORY)
+            await conn.execute(_ALTER_TRADES_HISTORY_METRICS)
             await conn.execute(_CREATE_COMMANDS)
             await conn.execute(_CREATE_HTF_TREND_STATUS)
             await conn.execute(_CREATE_HEALTH_EVENTS)

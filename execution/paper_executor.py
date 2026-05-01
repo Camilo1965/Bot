@@ -1223,11 +1223,15 @@ class PaperExecutor:
             return False
 
         if pos.trade_id is not None:
+            total_fees = pos.position_size * _TAKER_FEE_RATE * 2
+            net_pnl = pnl - total_fees
             await self._db.close_trade(
                 trade_id=pos.trade_id,
                 exit_price=exit_price,
                 exit_time=exit_time,
                 pnl=pnl,
+                pnl_net=net_pnl,
+                fee=total_fees,
             )
 
         # Credit back any PnL (positive or negative)
