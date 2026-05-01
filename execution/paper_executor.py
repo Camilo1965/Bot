@@ -144,6 +144,8 @@ _EXIT_REASON_LABELS: dict[str, str] = {
     "SMART_EXIT_ML":         "SMART_EXIT_ML: El modelo XGBoost detectó agotamiento de tendencia.",
     "SMART_EXIT_SENTIMENT":  "SMART_EXIT_SENTIMENT: Gemini detectó un cambio brusco a sentimiento negativo.",
     "TTL_TIMEOUT":           "TTL_TIMEOUT: Tiempo máximo de exposición alcanzado.",
+    "BROKER_CLOSED":         "BROKER_CLOSED: El broker cerró la posición (p. ej. SL/TP) antes del sell del bot.",
+    "GHOST_SYNC":            "GHOST_SYNC: Sincronización MT5 — posición ya cerrada; libro local reconciliado.",
 }
 
 
@@ -1239,14 +1241,21 @@ class PaperExecutor:
         if pos.trade_id is not None:
             total_fees = pos.position_size * _TAKER_FEE_RATE * 2
             net_pnl = pnl - total_fees
-            await self._db.close_trade(
-                trade_id=pos.trade_id,
-                exit_price=exit_price,
-                exit_time=exit_time,
-                pnl=pnl,
-                pnl_net=net_pnl,
-                fee=total_fees,
-            )
+            try:
+                await self._db.close_trade(
+                    trade_id=pos.trade_id,
+                    exit_price=exit_price,
+                    exit_time=exit_time,
+                    pnl=pnl,
+                    pnl_net=net_pnl,
+                    fee=total_fees,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "[DB] close_trade failed trade_id=%s — revisar Postgres. Error: %s",
+                    pos.trade_id,
+                    exc,
+                )
 
         # Credit back any PnL (positive or negative)
         # Note: We no longer deduct position_size on entry, so we only credit the PnL here.

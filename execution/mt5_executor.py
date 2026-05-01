@@ -76,6 +76,7 @@ from execution.paper_executor import (
     OpenPosition,
     PaperExecutor,
     _TAKER_FEE_RATE,
+    _build_trade_report,
     compute_dynamic_tp_hint,
     record_trade,
 )
@@ -1498,6 +1499,165 @@ class MT5Executor(PaperExecutor):
         return True
 
     # ------------------------------------------------------------------
+    # Broker-close bookkeeping (SL/TP filled on server before our sell)
+    # ------------------------------------------------------------------
+
+    async def _apply_mt5_closed_bookkeeping(
+        self,
+        symbol: str,
+        pos: OpenPosition,
+        exit_price: float,
+        exit_time: datetime,
+        gross_pnl: float,
+        exit_reason_code: str,
+        *,
+        telegram_after: bool = False,
+    ) -> None:
+        """Persist close, risk, journal — shared by normal exit and ghost sync."""
+        fee_total = pos.position_size * _TAKER_FEE_RATE * 2
+        pnl_net = gross_pnl - fee_total
+        commission = 0.0
+        swap = 0.0
+        fee = fee_total
+        mt5_ticket = getattr(pos, "mt5_position_ticket", None)
+        if self._live and isinstance(mt5_ticket, int):
+            economics = self._resolve_mt5_close_economics(mt5_ticket)
+            if economics is not None:
+                pnl_net = economics["pnl_net"]
+                commission = economics["commission"]
+                swap = economics["swap"]
+                fee = economics["fee"]
+
+        if pos.trade_id is not None:
+            try:
+                await self._db.close_trade(
+                    trade_id=pos.trade_id,
+                    exit_price=exit_price,
+                    exit_time=exit_time,
+                    pnl=gross_pnl,
+                    pnl_net=pnl_net,
+                    commission=commission,
+                    swap=swap,
+                    fee=fee,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "[MT5][DB] close_trade failed trade_id=%s — %s",
+                    pos.trade_id,
+                    exc,
+                )
+
+        self._risk.credit(gross_pnl)
+        self._risk.register_close()
+        if gross_pnl < 0.0:
+            self._risk.record_daily_loss(-gross_pnl)
+        self.total_pnl += gross_pnl
+        sym_ref = pos.symbol
+        del self.open_positions[symbol]
+
+        margin_used = pos.position_size / LEVERAGE
+        pnl_pct = (pnl_net / margin_used * 100) if margin_used > 0 else 0.0
+        record_trade(
+            timestamp=exit_time,
+            symbol=sym_ref,
+            action="SELL",
+            execution_price=exit_price,
+            quantity=pos.position_size / exit_price,
+            ml_confidence_at_entry=pos.ml_confidence,
+            sentiment_score_at_entry=pos.sentiment_score,
+            exit_reason=exit_reason_code,
+            pnl_usdt=pnl_net,
+            pnl_percent=pnl_pct,
+        )
+        self._save_state()
+
+        if telegram_after:
+            asyncio.create_task(
+                send_telegram_alert(
+                    _build_trade_report(
+                        sym=sym_ref,
+                        pos=pos,
+                        exit_price=exit_price,
+                        exit_time=exit_time,
+                        gross_pnl=gross_pnl,
+                        exit_reason_code=exit_reason_code,
+                        current_balance=self._risk.balance,
+                    )
+                )
+            )
+
+    async def _finalize_if_broker_already_closed(
+        self,
+        symbol: str,
+        pos: OpenPosition,
+        exit_price: float,
+        exit_time: datetime,
+        exit_reason_code: str,
+    ) -> bool:
+        """If MT5 has no position but deals show our ticket closed, sync books."""
+        if not _MT5_AVAILABLE:
+            return False
+        mt5_ticket = getattr(pos, "mt5_position_ticket", None)
+        if not isinstance(mt5_ticket, int):
+            return False
+        economics = self._resolve_mt5_close_economics(mt5_ticket)
+        if economics is None:
+            return False
+        mt5_sym = self._resolve_symbol(symbol)
+        if mt5_sym is None:
+            return False
+        tick = mt5.symbol_info_tick(mt5_sym)
+        exit_px = float(tick.bid) if tick and tick.bid else exit_price
+        price_change_pct = (exit_px - pos.entry_price) / pos.entry_price
+        gross_pnl = price_change_pct * pos.position_size
+        code = exit_reason_code if exit_reason_code else "BROKER_CLOSED"
+        await self._apply_mt5_closed_bookkeeping(
+            symbol,
+            pos,
+            exit_px,
+            exit_time,
+            gross_pnl,
+            code,
+            telegram_after=False,
+        )
+        logger.info(
+            "[MT5] Posición ya cerrada en broker — libro sincronizado sym=%s ticket=%s",
+            symbol,
+            mt5_ticket,
+        )
+        return True
+
+    async def _reconcile_ghost_position(self, sym: str) -> None:
+        """Ghost = local open but MT5 has no position; close DB + notify."""
+        pos = self.open_positions.get(sym)
+        if pos is None:
+            return
+        mt5_sym = self._resolve_symbol(sym)
+        exit_px = float(pos.entry_price)
+        if mt5_sym and _MT5_AVAILABLE:
+            tick = mt5.symbol_info_tick(mt5_sym)
+            if tick and tick.bid:
+                exit_px = float(tick.bid)
+        ts = datetime.now(tz=timezone.utc)
+        gross = (exit_px - pos.entry_price) / pos.entry_price * pos.position_size
+        ticket = getattr(pos, "mt5_position_ticket", None)
+        logger.info(
+            "[MT5 SYNC] 👻 Reconciliando ghost sym=%s ticket=%s gross≈%.4f",
+            sym,
+            ticket,
+            gross,
+        )
+        await self._apply_mt5_closed_bookkeeping(
+            sym,
+            pos,
+            exit_px,
+            ts,
+            gross,
+            "GHOST_SYNC",
+            telegram_after=True,
+        )
+
+    # ------------------------------------------------------------------
     # _close_position override
     # ------------------------------------------------------------------
 
@@ -1610,6 +1770,12 @@ class MT5Executor(PaperExecutor):
                                 symbol,
                             )
                     else:
+                        # Broker may have closed first (SL/TP server-side).
+                        synced = await self._finalize_if_broker_already_closed(
+                            symbol, pos, exit_price, exit_time, exit_reason_code
+                        )
+                        if synced:
+                            return True
                         logger.warning(
                             "[MT5] No open position found for %s with magic=%d – "
                             "keeping local position for retry.",
@@ -1624,57 +1790,15 @@ class MT5Executor(PaperExecutor):
             self._save_state()
             return False
 
-        # ── Paper book-keeping (identical to PaperExecutor) ────────────────
-        fee_total = pos.position_size * _TAKER_FEE_RATE * 2
-        pnl_net = pnl - fee_total
-        commission = 0.0
-        swap = 0.0
-        fee = fee_total
-        mt5_ticket = getattr(pos, "mt5_position_ticket", None)
-        if self._live and isinstance(mt5_ticket, int):
-            economics = self._resolve_mt5_close_economics(mt5_ticket)
-            if economics is not None:
-                pnl_net = economics["pnl_net"]
-                commission = economics["commission"]
-                swap = economics["swap"]
-                fee = economics["fee"]
-
-        if pos.trade_id is not None:
-            await self._db.close_trade(
-                trade_id=pos.trade_id,
-                exit_price=exit_price,
-                exit_time=exit_time,
-                pnl=pnl,
-                pnl_net=pnl_net,
-                commission=commission,
-                swap=swap,
-                fee=fee,
-            )
-
-        # Credit back any PnL (positive or negative)
-        # Note: We no longer deduct position_size on entry, so we only credit the PnL here.
-        self._risk.credit(pnl)
-        self._risk.register_close()
-        if pnl < 0.0:
-            self._risk.record_daily_loss(-pnl)
-        self.total_pnl += pnl
-        del self.open_positions[symbol]
-
-        margin_used = pos.position_size / LEVERAGE
-        pnl_pct = (pnl_net / margin_used * 100) if margin_used > 0 else 0.0
-        record_trade(
-            timestamp=exit_time,
-            symbol=symbol,
-            action="SELL",
-            execution_price=exit_price,
-            quantity=pos.position_size / exit_price,
-            ml_confidence_at_entry=pos.ml_confidence,
-            sentiment_score_at_entry=pos.sentiment_score,
-            exit_reason=exit_reason_code,
-            pnl_usdt=pnl_net,
-            pnl_percent=pnl_pct,
+        await self._apply_mt5_closed_bookkeeping(
+            symbol,
+            pos,
+            exit_price,
+            exit_time,
+            pnl,
+            exit_reason_code,
+            telegram_after=False,
         )
-        self._save_state()
         return True
 
     def _resolve_mt5_close_economics(self, position_ticket: int) -> dict[str, float] | None:
@@ -1682,7 +1806,7 @@ class MT5Executor(PaperExecutor):
         if not _MT5_AVAILABLE:
             return None
         date_to = datetime.now(tz=timezone.utc)
-        date_from = date_to.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=3)
+        date_from = date_to - timedelta(days=14)
         try:
             deals = mt5.history_deals_get(date_from, date_to, position=position_ticket)
         except Exception:  # noqa: BLE001
@@ -1744,15 +1868,10 @@ class MT5Executor(PaperExecutor):
             if p.magic == self._magic
         }
 
-        # Ghost detection
+        # Ghost detection — broker closed without bot bookkeeping (SL/TP / manual)
         ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
         for sym in ghost_symbols:
-            logger.info(
-                "[MT5 SYNC] 👻 Ghost position: %s in bot memory but not on MT5. Removing.",
-                sym,
-            )
-            self.open_positions.pop(sym, None)
-            self._risk.register_close()
+            await self._reconcile_ghost_position(sym)
 
         # Discrepancy detection
         untracked = [sym for sym in live_symbols if sym not in self.open_positions]
