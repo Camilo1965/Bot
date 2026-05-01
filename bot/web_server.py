@@ -44,12 +44,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div class="mt-4 md:mt-0 flex gap-4 text-center">
                 <div class="bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
-                    <div class="text-xs text-slate-400 uppercase">IA Sentimiento</div>
+                    <div class="text-xs text-slate-400 uppercase">Lectura IA</div>
                     <div class="text-xl font-bold" id="sentiment">--</div>
+                    <div class="text-[11px] text-slate-400 mt-1" id="sentiment-detail">--</div>
                 </div>
                 <div class="bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
-                    <div class="text-xs text-slate-400 uppercase">Estado</div>
-                    <div class="text-xl font-bold" id="news-status">--</div>
+                    <div class="text-xs text-slate-400 uppercase">Estado Bot</div>
+                    <div class="text-xl font-bold" id="bot-status">--</div>
                 </div>
             </div>
         </header>
@@ -57,19 +58,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <!-- Riesgo y Billetera -->
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div class="glass rounded-xl p-4">
-                <div class="text-xs text-slate-400">Balance (USD)</div>
+                <div class="text-xs text-slate-400">Balance</div>
                 <div class="text-xl font-bold mt-1" id="balance">--</div>
             </div>
             <div class="glass rounded-xl p-4">
-                <div class="text-xs text-slate-400">Margen Libre</div>
+                <div class="text-xs text-slate-400">Dinero Disponible</div>
                 <div class="text-xl font-bold mt-1" id="margin">--</div>
             </div>
             <div class="glass rounded-xl p-4">
-                <div class="text-xs text-slate-400">PnL Sesión</div>
+                <div class="text-xs text-slate-400">Ganancia Sesión</div>
                 <div class="text-xl font-bold mt-1" id="session-pnl">--</div>
             </div>
             <div class="glass rounded-xl p-4">
-                <div class="text-xs text-slate-400">Max Drawdown</div>
+                <div class="text-xs text-slate-400">Peor Caída Sesión</div>
                 <div class="text-xl font-bold mt-1" id="drawdown">--</div>
             </div>
         </div>
@@ -103,12 +104,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('uptime').innerText = data.uptime;
             
             const sentEl = document.getElementById('sentiment');
-            sentEl.innerText = data.sentiment;
-            sentEl.className = `text-xl font-bold ${data.sentiment_num >= 0.55 ? 'neon-green' : data.sentiment_num >= 0 ? 'text-yellow-400' : 'neon-red'}`;
+            sentEl.innerText = data.sentiment_label;
+            sentEl.className = `text-xl font-bold ${data.sentiment_num >= 0.60 ? 'neon-green' : data.sentiment_num >= 0.45 ? 'text-yellow-400' : 'neon-red'}`;
+            document.getElementById('sentiment-detail').innerText = data.sentiment_detail;
 
-            const newsEl = document.getElementById('news-status');
-            newsEl.innerHTML = data.global_hold ? '⛔ HOLD' : '✅ OK';
-            newsEl.className = `text-xl font-bold ${data.global_hold ? 'neon-red' : 'neon-green'}`;
+            const botStatusEl = document.getElementById('bot-status');
+            botStatusEl.innerHTML = data.global_hold ? '⛔ En pausa' : '✅ Operando';
+            botStatusEl.className = `text-xl font-bold ${data.global_hold ? 'neon-red' : 'neon-green'}`;
 
             document.getElementById('balance').innerText = data.balance;
             document.getElementById('margin').innerText = data.available_margin;
@@ -119,13 +121,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
             const ddEl = document.getElementById('drawdown');
             ddEl.innerText = data.max_drawdown;
-            ddEl.className = `text-xl font-bold mt-1 ${data.max_drawdown_num < -100 ? 'neon-red' : 'text-slate-200'}`;
+            ddEl.className = `text-xl font-bold mt-1 ${data.max_drawdown_num < 0 ? 'neon-red' : 'text-slate-200'}`;
 
             // Render Market Cards
             const marketContainer = document.getElementById('market-cards');
             marketContainer.innerHTML = '';
             data.market.forEach(item => {
-                let actionColor = item.action.includes('TRADING') ? 'text-sky-400' : item.action.includes('BUY') ? 'neon-green' : 'text-yellow-400';
+                let actionColor = item.action.includes('Gestionando') ? 'text-sky-400' : item.action.includes('Comprar') ? 'neon-green' : 'text-yellow-400';
                 let bgStyle = item.has_position ? 'border-sky-500/50 bg-sky-900/20' : 'border-slate-700/50 bg-slate-800/30';
                 
                 let html = `
@@ -138,9 +140,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <div class="text-sm ${item.change_num >= 0 ? 'neon-green' : 'neon-red'} mb-4">${item.change} en 24h</div>
                         
                         <div class="grid grid-cols-2 gap-y-3 gap-x-2 text-sm border-t border-slate-700/50 pt-4">
-                            <div class="text-slate-400">ML Conf: <span class="text-slate-200 font-semibold float-right">${item.ml_conf}</span></div>
+                            <div class="text-slate-400">Confianza IA: <span class="text-slate-200 font-semibold float-right">${item.ml_conf}</span></div>
                             <div class="text-slate-400">RSI: <span class="text-slate-200 font-semibold float-right">${item.rsi}</span></div>
-                            <div class="text-slate-400 col-span-2">Tendencia: <span class="text-slate-200 font-semibold float-right">${item.trend}</span></div>
+                            <div class="text-slate-400 col-span-2">Estado Mercado: <span class="text-slate-200 font-semibold float-right">${item.trend}</span></div>
                         </div>
                 `;
 
@@ -211,6 +213,20 @@ async def start_web_dashboard(
             or (news_hold_until is not None and now_utc < news_hold_until)
         )
         
+        # Sentiment label
+        if sentiment is None:
+            sentiment_label = "Sin datos"
+            sentiment_detail = "Esperando lectura IA"
+        elif sentiment >= 0.60:
+            sentiment_label = "🟢 Favorable compra"
+            sentiment_detail = "Mercado con sesgo positivo"
+        elif sentiment >= 0.45:
+            sentiment_label = "🟡 Neutral / esperar"
+            sentiment_detail = "Señal mixta, mejor esperar confirmación"
+        else:
+            sentiment_label = "🔴 Riesgo alto"
+            sentiment_detail = "Evitar compras por ahora"
+
         # Wallet
         mt5_wallet = state.get("mt5_wallet")
         use_mt5_wallet = isinstance(mt5_wallet, dict) and "balance" in mt5_wallet
@@ -253,18 +269,18 @@ async def start_web_dashboard(
             if has_pos:
                 qty = pos.position_size / pos.entry_price
                 unrl = (price - pos.entry_price) * qty
-                pos_str = f"LONG @{pos.entry_price:,.2f}"
-                action = "TRADING 🔵"
+                pos_str = f"Posición LONG @{pos.entry_price:,.2f}"
+                action = "Gestionando posición"
             else:
-                action = "BUY! 🟢" if prob >= BUY_PROB_THRESHOLD else "HOLD 🟡"
+                action = "Comprar" if prob >= BUY_PROB_THRESHOLD else "Esperar"
                 
             market_data.append({
                 "symbol": sym.split("/")[0],
                 "price": f"{price:,.2f}",
-                "change": f"{'+' if pct >=0 else ''}{pct:.2f}%",
+                "change": f"{'+' if pct >=0 else ''}{pct:.1f}%",
                 "change_num": pct,
                 "rsi": f"{rsi:.1f}" if rsi is not None else "--",
-                "ml_conf": f"{prob*100:.1f}%",
+                "ml_conf": f"{prob*100:.0f}%",
                 "trend": t1h[:4].upper(),
                 "action": action,
                 "has_position": has_pos,
@@ -274,7 +290,7 @@ async def start_web_dashboard(
             })
 
         # Events
-        events = list(dash_state.dashboard_events)[-5:]
+        events = list(dash_state.dashboard_events)[-3:]
         # Strip rich tags like [dim], [red], etc for HTML
         import re
         clean_events = [re.sub(r'\[.*?\]', '', e) for e in events]
@@ -282,13 +298,15 @@ async def start_web_dashboard(
         resp = {
             "uptime": uptime_str,
             "sentiment": f"{sentiment:.4f}" if sentiment is not None else "--",
+            "sentiment_label": sentiment_label,
+            "sentiment_detail": sentiment_detail,
             "sentiment_num": sentiment if sentiment is not None else 0,
             "global_hold": global_hold,
             "balance": f"{balance:,.2f}",
             "available_margin": f"{avail:,.2f}",
-            "session_pnl": f"{paper_executor.total_pnl:+.4f}",
+            "session_pnl": f"{paper_executor.total_pnl:+.2f}",
             "session_pnl_num": paper_executor.total_pnl,
-            "max_drawdown": f"{state.get('max_drawdown', 0.0):+.4f}",
+            "max_drawdown": f"{state.get('max_drawdown', 0.0):+.2f}",
             "max_drawdown_num": state.get("max_drawdown", 0.0),
             "market": market_data,
             "events": clean_events
