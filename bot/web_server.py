@@ -105,20 +105,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             <div class="text-[11px] text-slate-400 uppercase tracking-widest font-semibold mb-6">Resumen Financiero</div>
             
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-8">
-                <div>
+            <div class="flex flex-col md:flex-row divide-y md:divide-y-0 md:divide-x divide-white/5">
+                <div class="flex-1 pb-6 md:pb-0 md:pr-8">
                     <div class="text-sm text-slate-400 mb-1">Balance Total</div>
                     <div class="text-4xl font-light tracking-tight"><span class="text-slate-500">$</span><span id="balance" class="font-medium text-white">--</span></div>
                 </div>
-                <div class="border-l border-white/5 pl-8">
+                <div class="flex-1 py-6 md:py-0 md:px-8">
                     <div class="text-sm text-slate-400 mb-1">Dinero Disponible</div>
                     <div class="text-2xl font-light mt-2"><span class="text-slate-500">$</span><span id="margin" class="font-medium text-white">--</span></div>
                 </div>
-                <div class="border-l border-white/5 pl-8">
+                <div class="flex-1 py-6 md:py-0 md:px-8">
                     <div class="text-sm text-slate-400 mb-1">Ganancia Sesión</div>
                     <div class="text-2xl font-medium mt-2" id="session-pnl">--</div>
                 </div>
-                <div class="border-l border-white/5 pl-8">
+                <div class="flex-1 pt-6 md:pt-0 md:pl-8">
                     <div class="text-sm text-slate-400 mb-1">Peor Caída Sesión</div>
                     <div class="text-2xl font-medium mt-2" id="drawdown">--</div>
                 </div>
@@ -265,7 +265,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     cardsHtml += `
                         <div class="mt-5 bg-black/40 rounded-2xl p-4 border border-sky-500/20">
                             <div class="text-[10px] uppercase tracking-widest text-sky-400/80 mb-2 font-semibold">Trade Activo</div>
-                            <div class="flex justify-between items-end">
+                            <div class="flex flex-col sm:flex-row sm:justify-between sm:items-end gap-1 sm:gap-0">
                                 <div>
                                     <div class="text-xs text-slate-400 mb-0.5">${item.position_str}</div>
                                     <div class="text-xs text-slate-500">${item.unrealized_pnl_label}</div>
