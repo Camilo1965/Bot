@@ -314,9 +314,9 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
 
 async def gemini_sentiment_refresher(
     state: dict[str, Any],
-    interval: int = 1800,
+    interval: int = 900,
 ) -> None:
-    """[LLM] Background task – refreshes the sentiment score every 30 minutes.
+    """[LLM] Background task – refreshes the sentiment score every 15 minutes.
 
     Fetches the latest crypto headlines from CoinTelegraph and CoinDesk via RSS
     (using :func:`~data_ingestion.news_scraper.fetch_crypto_headlines`) and
