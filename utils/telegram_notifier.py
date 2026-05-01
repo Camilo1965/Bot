@@ -45,6 +45,55 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _simple_md_to_html(text: str) -> str:
+    """Turn legacy *bold* and `` `code` `` into Telegram-safe HTML (escape inner text).
+
+    Avoids Telegram's Markdown entity errors from paths, underscores, decimals, etc.
+    Does not parse Markdown links — bare URLs stay literal after escaping.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "`":
+            j = text.find("`", i + 1)
+            if j == -1:
+                out.append(escape(text[i]))
+                i += 1
+                continue
+            out.append("<code>" + escape(text[i + 1 : j]) + "</code>")
+            i = j + 1
+        elif ch == "*":
+            j = text.find("*", i + 1)
+            if j == -1:
+                out.append(escape(text[i]))
+                i += 1
+                continue
+            out.append("<b>" + escape(text[i + 1 : j]) + "</b>")
+            i = j + 1
+        else:
+            nxt = n
+            for marker in ("`", "*"):
+                k = text.find(marker, i)
+                if k != -1 and k < nxt:
+                    nxt = k
+            out.append(escape(text[i:nxt]))
+            i = nxt
+    return "".join(out)
+
+
+def _payload_for_send(message: str, parse_mode: str | None) -> tuple[str, str | None]:
+    """Return (text, telegram_parse_mode). ``Markdown`` → converted HTML."""
+    if parse_mode == "HTML":
+        return message, "HTML"
+    if parse_mode is None:
+        return message, None
+    # Legacy callers use parse_mode="Markdown" with *bold* / `code` — never send Markdown.
+    return _simple_md_to_html(message), "HTML"
+
+
 # Telegram Bot API base URL (token is interpolated at call time)
 _TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -96,12 +145,13 @@ async def send_telegram_alert(
     Parameters
     ----------
     message:
-        Message body.  With default ``parse_mode="Markdown"``, use legacy
-        ``*bold*`` / ``_italic_``; avoid unescaped ``_`` in dynamic text
-        (e.g. server names) — use ``parse_mode="HTML"`` and ``<code>`` with
-        ``html.escape`` for untrusted strings, or ``parse_mode=None`` for plain.
+        Body text. Default ``parse_mode="Markdown"`` only means *call-site style*
+        ``*bold*`` / `` `code` `` — it is converted to HTML and sent as
+        ``parse_mode=HTML`` (Telegram legacy Markdown is not used; avoids
+        entity parse errors). Use ``parse_mode="HTML"`` when the message is
+        already valid HTML (e.g. from ``html.escape``). Use ``None`` for plain.
     parse_mode:
-        ``"Markdown"``, ``"HTML"``, or ``None`` (no formatting).
+        ``"Markdown"`` (converted to HTML), ``"HTML"`` (verbatim), or ``None``.
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -114,9 +164,10 @@ async def send_telegram_alert(
         return False
 
     url = _TELEGRAM_API_URL.format(token=token)
+    text_out, tg_mode = _payload_for_send(message, parse_mode)
     base_payload: dict[str, str | int] = {
         "chat_id": chat_id,
-        "text": message,
+        "text": text_out,
     }
 
     try:
@@ -127,8 +178,8 @@ async def send_telegram_alert(
         )
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             payload: dict[str, str | int] = dict(base_payload)
-            if parse_mode:
-                payload["parse_mode"] = parse_mode
+            if tg_mode:
+                payload["parse_mode"] = tg_mode
             async with session.post(url, json=payload) as resp:
                 if resp.ok:
                     logger.info("Telegram alert sent successfully.")
@@ -140,10 +191,11 @@ async def send_telegram_alert(
                 ):
                     logger.warning(
                         "Telegram rejected parse_mode=%s; retrying as plain text. Body: %s",
-                        parse_mode,
+                        tg_mode,
                         body[:200],
                     )
-                    async with session.post(url, json=base_payload) as resp2:
+                    plain_payload = {"chat_id": chat_id, "text": text_out}
+                    async with session.post(url, json=plain_payload) as resp2:
                         if resp2.ok:
                             logger.info("Telegram alert sent successfully (plain text).")
                             return True

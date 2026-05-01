@@ -1534,8 +1534,28 @@ class MT5Executor(PaperExecutor):
         swap = 0.0
         fee = fee_total
         mt5_ticket = getattr(pos, "mt5_position_ticket", None)
+        book_net = gross_pnl - fee_total
+        economics: dict[str, float] | None = None
         if self._live and isinstance(mt5_ticket, int):
-            economics = self._resolve_mt5_close_economics(mt5_ticket)
+            raw = self._resolve_mt5_close_economics(mt5_ticket)
+            if raw is not None:
+                mt5_net = float(raw["pnl_net"])
+                diff = abs(mt5_net - book_net)
+                # Reject deal-history aggregate that disagrees wildly with the book
+                # (bad filter / cross-deal sum still produced huge phantom PnL in CEO).
+                cap = max(150.0, 4.0 * max(abs(book_net), 25.0))
+                if diff <= cap:
+                    economics = raw
+                else:
+                    logger.warning(
+                        "[MT5] Deal-history PnL dropped for ticket=%s "
+                        "(book_net≈%.2f mt5_net=%.2f diff=%.2f > cap=%.2f).",
+                        mt5_ticket,
+                        book_net,
+                        mt5_net,
+                        diff,
+                        cap,
+                    )
             if economics is not None:
                 pnl_net = economics["pnl_net"]
                 commission = economics["commission"]
@@ -1938,11 +1958,17 @@ class MT5Executor(PaperExecutor):
             return None
         close_deals = []
         for d in deals:
+            pid = getattr(d, "position_id", None)
+            if pid is not None and int(pid) != int(position_ticket):
+                continue
             entry = getattr(d, "entry", None)
             if entry == mt5.DEAL_ENTRY_OUT:
                 close_deals.append(d)
+        # Never sum the whole deal list as fallback: without OUT filtering MT5 can
+        # return IN+OUT rows or broader history — summing everything inflated PnL
+        # (e.g. journal +358 USDT ghosts). Fall back to book formula via None.
         if not close_deals:
-            close_deals = list(deals)
+            return None
         pnl_total = 0.0
         commission_total = 0.0
         swap_total = 0.0

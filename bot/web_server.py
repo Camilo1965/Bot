@@ -565,24 +565,32 @@ async def start_web_dashboard(
         # Sentiment
         sentiment = state.get("sentiment")
         news_hold_until = state.get("news_hold_until")
+        news_hold_active = news_hold_until is not None and now_utc < news_hold_until
         global_hold = (
             (sentiment is not None and sentiment < BUY_SENTIMENT_THRESHOLD)
-            or (news_hold_until is not None and now_utc < news_hold_until)
+            or news_hold_active
         )
         
-        # Sentiment label
+        # Sentiment label — mismo criterio que el Mega Dashboard (umbral de estrategia),
+        # no bandas fijas 0.45/0.60 (0.40 quedaba "riesgo alto" siendo válido para BUY).
         if sentiment is None:
             sentiment_label = "Sin datos"
             sentiment_detail = "Esperando lectura IA"
-        elif sentiment >= 0.60:
-            sentiment_label = "🟢 Favorable compra"
-            sentiment_detail = "Mercado con sesgo positivo"
-        elif sentiment >= 0.45:
-            sentiment_label = "🟡 Neutral / esperar"
-            sentiment_detail = "Señal mixta, mejor esperar confirmación"
+        elif news_hold_active:
+            sentiment_label = "⛔ Filtro noticias"
+            sentiment_detail = "Pausa por volatilidad de titulares / swing"
+        elif sentiment < BUY_SENTIMENT_THRESHOLD:
+            sentiment_label = "🔴 Bajo umbral de estrategia"
+            sentiment_detail = f"Mínimo sentimiento para señales: {BUY_SENTIMENT_THRESHOLD:.2f}"
+        elif sentiment >= 0.55:
+            sentiment_label = "🟢 Sesgo positivo"
+            sentiment_detail = "Alineado con umbral de compra"
+        elif sentiment >= 0.35:
+            sentiment_label = "🟡 Neutral"
+            sentiment_detail = "Operativo si ML y riesgo lo permiten"
         else:
-            sentiment_label = "🔴 Riesgo alto"
-            sentiment_detail = "Evitar compras por ahora"
+            sentiment_label = "🟠 Lectura débil"
+            sentiment_detail = "Por encima del mínimo; prudencia en nuevas entradas"
 
         # Wallet
         mt5_wallet = state.get("mt5_wallet")
