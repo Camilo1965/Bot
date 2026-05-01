@@ -75,7 +75,9 @@ from bot.loops import (
     close_pending_reconciler_loop,
     dashboard_logger,
     health_monitor_loop,
+    monthly_report_loop,
     position_sync_loop,
+    weekly_report_loop,
 )
 from bot.market_consumer import market_consumer
 from bot.mt5_preload import preload_historical_data_mt5
@@ -765,6 +767,8 @@ async def main() -> None:
         health_monitor_loop(shared_state, market_queue, paper_executor, interval=30),
         close_pending_reconciler_loop(shared_state, paper_executor, interval=20),
         telegram_command_poller(shared_state, paper_executor, risk_manager, interval=5),
+        weekly_report_loop(),
+        monthly_report_loop(),
         start_web_dashboard(shared_state, paper_executor, risk_manager, WATCHLIST, port=8080),
     ]
     if _GEMINI_ENABLED:

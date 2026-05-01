@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import Any
 
 import asyncpg
 
@@ -152,6 +154,80 @@ SELECT
     COALESCE(SUM(pnl), 0.0) as daily_pnl
 FROM trades_history
 WHERE status = 'closed' AND exit_time >= CURRENT_DATE;
+"""
+
+_FETCH_PERIOD_SUMMARY = """
+SELECT
+    COUNT(*) AS total_trades,
+    COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+    COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses,
+    COALESCE(SUM(pnl), 0.0) AS pnl_total,
+    COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0.0) AS gross_profit,
+    COALESCE(SUM(CASE WHEN pnl < 0 THEN ABS(pnl) ELSE 0 END), 0.0) AS gross_loss
+FROM trades_history
+WHERE status = 'closed'
+  AND exit_time >= $1
+  AND exit_time < $2;
+"""
+
+_FETCH_BEST_WORST_TRADE = """
+SELECT id, symbol, pnl, exit_time
+FROM trades_history
+WHERE status = 'closed'
+  AND exit_time >= $1
+  AND exit_time < $2
+ORDER BY pnl DESC
+LIMIT 1;
+"""
+
+_FETCH_WORST_TRADE = """
+SELECT id, symbol, pnl, exit_time
+FROM trades_history
+WHERE status = 'closed'
+  AND exit_time >= $1
+  AND exit_time < $2
+ORDER BY pnl ASC
+LIMIT 1;
+"""
+
+_FETCH_SYMBOL_PERFORMANCE = """
+SELECT
+    symbol,
+    COUNT(*) AS total_trades,
+    COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+    COALESCE(SUM(pnl), 0.0) AS pnl_total
+FROM trades_history
+WHERE status = 'closed'
+  AND exit_time >= $1
+  AND exit_time < $2
+GROUP BY symbol
+ORDER BY pnl_total DESC;
+"""
+
+_FETCH_DAILY_PNL_SERIES = """
+SELECT
+    DATE_TRUNC('day', exit_time) AS day_utc,
+    COALESCE(SUM(pnl), 0.0) AS pnl_total
+FROM trades_history
+WHERE status = 'closed'
+  AND exit_time >= $1
+  AND exit_time < $2
+GROUP BY 1
+ORDER BY 1 ASC;
+"""
+
+_FETCH_RECENT_CLOSED_TRADES = """
+SELECT
+    id,
+    symbol,
+    entry_price,
+    exit_price,
+    pnl,
+    exit_time
+FROM trades_history
+WHERE status = 'closed'
+ORDER BY exit_time DESC
+LIMIT $1;
 """
 
 _CREATE_HTF_TREND_STATUS = """
@@ -424,6 +500,132 @@ class DatabaseManager:
             "losses": int(row["losses"]),
             "daily_pnl": float(row["daily_pnl"]),
         }
+
+    @staticmethod
+    def _tz_now(tz_name: str) -> datetime:
+        """Return timezone-aware now() for the provided IANA timezone."""
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        return datetime.now(tz=tz)
+
+    @staticmethod
+    def _to_utc(dt: datetime) -> datetime:
+        """Normalize a timezone-aware datetime to UTC."""
+        return dt.astimezone(timezone.utc)
+
+    def _period_bounds(
+        self,
+        period: str,
+        tz_name: str,
+    ) -> tuple[datetime, datetime]:
+        """Compute [start, end) bounds for day/week/month in UTC."""
+        local_now = self._tz_now(tz_name)
+        if period == "day":
+            start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_local = start_local + timedelta(days=1)
+        elif period == "week":
+            start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_local = start_local - timedelta(days=start_local.weekday())
+            end_local = start_local + timedelta(days=7)
+        elif period == "month":
+            start_local = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if start_local.month == 12:
+                end_local = start_local.replace(year=start_local.year + 1, month=1, day=1)
+            else:
+                end_local = start_local.replace(month=start_local.month + 1, day=1)
+        else:
+            raise ValueError(f"Unsupported period: {period}")
+        return self._to_utc(start_local), self._to_utc(end_local)
+
+    async def fetch_period_summary(self, period: str, tz_name: str = "America/Bogota") -> dict[str, Any]:
+        """Return aggregate summary for the current day/week/month in timezone."""
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        start_utc, end_utc = self._period_bounds(period, tz_name)
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(_FETCH_PERIOD_SUMMARY, start_utc, end_utc)
+            best = await conn.fetchrow(_FETCH_BEST_WORST_TRADE, start_utc, end_utc)
+            worst = await conn.fetchrow(_FETCH_WORST_TRADE, start_utc, end_utc)
+        total_trades = int(row["total_trades"]) if row else 0
+        wins = int(row["wins"]) if row else 0
+        losses = int(row["losses"]) if row else 0
+        pnl_total = float(row["pnl_total"]) if row else 0.0
+        gross_profit = float(row["gross_profit"]) if row else 0.0
+        gross_loss = float(row["gross_loss"]) if row else 0.0
+        winrate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+        return {
+            "period": period,
+            "start_utc": start_utc.isoformat(),
+            "end_utc": end_utc.isoformat(),
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "pnl_total": pnl_total,
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "winrate": winrate,
+            "profit_factor": profit_factor,
+            "best_trade": dict(best) if best else None,
+            "worst_trade": dict(worst) if worst else None,
+        }
+
+    async def fetch_symbol_performance(
+        self,
+        period: str,
+        tz_name: str = "America/Bogota",
+    ) -> list[dict[str, Any]]:
+        """Return PnL and winrate breakdown by symbol for period."""
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        start_utc, end_utc = self._period_bounds(period, tz_name)
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_FETCH_SYMBOL_PERFORMANCE, start_utc, end_utc)
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            total_trades = int(row["total_trades"])
+            wins = int(row["wins"])
+            result.append(
+                {
+                    "symbol": str(row["symbol"]),
+                    "total_trades": total_trades,
+                    "wins": wins,
+                    "winrate": (wins / total_trades * 100.0) if total_trades > 0 else 0.0,
+                    "pnl_total": float(row["pnl_total"]),
+                }
+            )
+        return result
+
+    async def fetch_daily_pnl_series(
+        self,
+        days: int = 30,
+        tz_name: str = "America/Bogota",
+    ) -> list[dict[str, Any]]:
+        """Return daily aggregated PnL for the last N days."""
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        if days <= 0:
+            return []
+        local_now = self._tz_now(tz_name)
+        start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_local = start_local - timedelta(days=(days - 1))
+        end_local = start_local + timedelta(days=days)
+        start_utc = self._to_utc(start_local)
+        end_utc = self._to_utc(end_local)
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_FETCH_DAILY_PNL_SERIES, start_utc, end_utc)
+        return [{"day_utc": r["day_utc"].isoformat(), "pnl_total": float(r["pnl_total"])} for r in rows]
+
+    async def fetch_recent_closed_trades(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Return most recent closed trades for dashboard and Telegram history."""
+        if self._pool is None:
+            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        safe_limit = max(1, min(limit, 100))
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_FETCH_RECENT_CLOSED_TRADES, safe_limit)
+        return [dict(r) for r in rows]
 
     async def insert_health_event(
         self,

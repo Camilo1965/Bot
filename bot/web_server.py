@@ -1,13 +1,16 @@
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
 from bot.dashboard_helpers import compute_rsi, mt5_dashboard_mark
 from bot import state as dash_state
+from database.db_manager import db
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD
@@ -125,6 +128,42 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- CEO Snapshot -->
+        <div class="glass rounded-3xl p-6">
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-2 mb-4">
+                <h2 class="text-lg font-medium text-slate-300 tracking-wide">CEO SNAPSHOT</h2>
+                <div class="text-xs text-slate-500" id="ceo-updated">Actualizado: --</div>
+            </div>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
+                <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
+                    <div class="text-[10px] uppercase tracking-widest text-slate-500 mb-1">PnL 7D</div>
+                    <div class="text-lg font-semibold" id="ceo-pnl-7d">--</div>
+                </div>
+                <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
+                    <div class="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Winrate 7D</div>
+                    <div class="text-lg font-semibold" id="ceo-winrate-7d">--</div>
+                </div>
+                <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
+                    <div class="text-[10px] uppercase tracking-widest text-slate-500 mb-1">PnL 30D</div>
+                    <div class="text-lg font-semibold" id="ceo-pnl-30d">--</div>
+                </div>
+                <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
+                    <div class="text-[10px] uppercase tracking-widest text-slate-500 mb-1">PF 30D</div>
+                    <div class="text-lg font-semibold" id="ceo-pf-30d">--</div>
+                </div>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
+                    <div class="text-xs text-slate-400 mb-2">Rendimiento por símbolo (mes)</div>
+                    <div class="space-y-2 text-sm" id="ceo-symbols"></div>
+                </div>
+                <div class="bg-black/20 rounded-2xl p-4 border border-white/5">
+                    <div class="text-xs text-slate-400 mb-2">Últimos trades cerrados</div>
+                    <div class="space-y-2 text-sm" id="ceo-trades"></div>
+                </div>
+            </div>
+        </div>
+
         <!-- Market Cards -->
         <div class="flex justify-between items-end mt-10 mb-4 px-2">
             <h2 class="text-lg font-medium text-slate-300 tracking-wide">MERCADO EN VIVO</h2>
@@ -195,6 +234,43 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             updateValue('session-pnl', data.session_pnl, `text-2xl font-medium mt-2 ${data.session_pnl_num >= 0 ? 'text-glow-green' : 'text-glow-red'}`);
             updateValue('drawdown', data.max_drawdown, `text-2xl font-medium mt-2 ${data.max_drawdown_num < 0 ? 'text-glow-red' : 'text-slate-200'}`);
+
+            // CEO metrics
+            const ceo = data.ceo || {};
+            const asMoneyClass = (v) => v >= 0 ? 'text-glow-green' : 'text-glow-red';
+            const pnl7 = Number(ceo.pnl_7d_num || 0);
+            const pnl30 = Number(ceo.pnl_30d_num || 0);
+            updateValue('ceo-pnl-7d', ceo.pnl_7d || '--', `text-lg font-semibold ${asMoneyClass(pnl7)}`);
+            updateValue('ceo-winrate-7d', ceo.winrate_7d || '--', 'text-lg font-semibold text-slate-100');
+            updateValue('ceo-pnl-30d', ceo.pnl_30d || '--', `text-lg font-semibold ${asMoneyClass(pnl30)}`);
+            updateValue('ceo-pf-30d', ceo.profit_factor_30d || '--', 'text-lg font-semibold text-slate-100');
+            document.getElementById('ceo-updated').innerText = `Actualizado: ${ceo.last_updated_local || '--'}`;
+
+            const symbolsEl = document.getElementById('ceo-symbols');
+            const symbols = ceo.symbols_month || [];
+            if (symbols.length === 0) {
+                symbolsEl.innerHTML = '<div class="text-slate-500">Sin datos</div>';
+            } else {
+                symbolsEl.innerHTML = symbols.slice(0, 6).map(s => `
+                    <div class="flex justify-between">
+                        <span class="text-slate-300">${s.symbol}</span>
+                        <span class="${Number(s.pnl_total) >= 0 ? 'text-emerald-400' : 'text-red-400'}">${s.pnl_label}</span>
+                    </div>
+                `).join('');
+            }
+
+            const tradesEl = document.getElementById('ceo-trades');
+            const trades = ceo.recent_trades || [];
+            if (trades.length === 0) {
+                tradesEl.innerHTML = '<div class="text-slate-500">Sin trades cerrados</div>';
+            } else {
+                tradesEl.innerHTML = trades.slice(0, 6).map(t => `
+                    <div class="flex justify-between">
+                        <span class="text-slate-300">${t.symbol} <span class="text-slate-500">(${t.exit_time_local})</span></span>
+                        <span class="${Number(t.pnl_num) >= 0 ? 'text-emerald-400' : 'text-red-400'}">${t.pnl}</span>
+                    </div>
+                `).join('');
+            }
 
             // Render Market Cards
             const marketContainer = document.getElementById('market-cards');
@@ -318,6 +394,55 @@ async def start_web_dashboard(
     port: int = 8080,
 ):
     """Run an aiohttp web server providing a modern real-time mobile dashboard."""
+    report_tz = os.environ.get("REPORT_TIMEZONE", "America/Bogota")
+    ceo_cache: dict[str, Any] = {"expires_mono": 0.0, "data": None}
+
+    async def build_ceo_snapshot() -> dict[str, Any]:
+        now_mono = asyncio.get_event_loop().time()
+        if ceo_cache["data"] is not None and now_mono < float(ceo_cache["expires_mono"]):
+            return ceo_cache["data"]
+        week = await db.fetch_period_summary("week", tz_name=report_tz)
+        month = await db.fetch_period_summary("month", tz_name=report_tz)
+        symbols = await db.fetch_symbol_performance("month", tz_name=report_tz)
+        recent = await db.fetch_recent_closed_trades(limit=8)
+        tz_obj = ZoneInfo(report_tz)
+        recent_rows: list[dict[str, Any]] = []
+        for row in recent:
+            exit_time = row.get("exit_time")
+            if isinstance(exit_time, datetime):
+                exit_local = exit_time.astimezone(tz_obj).strftime("%m-%d %H:%M")
+            else:
+                exit_local = "--"
+            pnl_num = float(row.get("pnl") or 0.0)
+            recent_rows.append(
+                {
+                    "symbol": str(row.get("symbol", "-")),
+                    "pnl": f"{pnl_num:+.2f} USDT",
+                    "pnl_num": pnl_num,
+                    "exit_time_local": exit_local,
+                }
+            )
+        ceo_payload = {
+            "pnl_7d": f"{float(week['pnl_total']):+,.2f} USDT",
+            "pnl_7d_num": float(week["pnl_total"]),
+            "winrate_7d": f"{float(week['winrate']):.1f}%",
+            "pnl_30d": f"{float(month['pnl_total']):+,.2f} USDT",
+            "pnl_30d_num": float(month["pnl_total"]),
+            "profit_factor_30d": f"{float(month['profit_factor']):.2f}",
+            "symbols_month": [
+                {
+                    "symbol": s["symbol"],
+                    "pnl_total": float(s["pnl_total"]),
+                    "pnl_label": f"{float(s['pnl_total']):+,.2f} USDT",
+                }
+                for s in symbols
+            ],
+            "recent_trades": recent_rows,
+            "last_updated_local": datetime.now(tz=tz_obj).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        ceo_cache["data"] = ceo_payload
+        ceo_cache["expires_mono"] = now_mono + 45.0
+        return ceo_payload
     
     async def handle_html(request: web.Request) -> web.Response:
         return web.Response(text=HTML_TEMPLATE, content_type="text/html")
@@ -450,6 +575,7 @@ async def start_web_dashboard(
         import re
         clean_events = [re.sub(r'\[.*?\]', '', e) for e in events]
 
+        ceo = await build_ceo_snapshot()
         resp = {
             "uptime": uptime_str,
             "sentiment": f"{sentiment:.4f}" if sentiment is not None else "--",
@@ -464,7 +590,8 @@ async def start_web_dashboard(
             "max_drawdown": f"{state.get('max_drawdown', 0.0):+.2f}",
             "max_drawdown_num": state.get("max_drawdown", 0.0),
             "market": market_data,
-            "events": clean_events
+            "events": clean_events,
+            "ceo": ceo,
         }
         
         return web.json_response(resp)

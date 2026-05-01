@@ -27,7 +27,10 @@ import asyncio
 import logging
 import os
 import ssl
+import time
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -46,6 +49,14 @@ _TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 # Network timeout for the POST request (seconds).
 _REQUEST_TIMEOUT: float = 5.0
+_REPORT_TIMEZONE_ENV = "REPORT_TIMEZONE"
+_DEFAULT_REPORT_TIMEZONE = "America/Bogota"
+_PRIORITY_COOLDOWN_S = {
+    "critical": 60.0,
+    "summary": 300.0,
+    "info": 120.0,
+}
+_LAST_ALERT_SENT_AT: dict[str, float] = {}
 
 
 def _telegram_ssl_context() -> ssl.SSLContext | bool | None:
@@ -134,6 +145,86 @@ async def send_telegram_alert(message: str) -> bool:
     except (aiohttp.ClientError, asyncio.TimeoutError, ssl.SSLError) as exc:
         logger.error("Failed to send Telegram alert: %s", exc)
         return False
+
+
+async def send_priority_telegram_alert(
+    message: str,
+    *,
+    priority: str = "info",
+    dedup_key: str | None = None,
+    force: bool = False,
+) -> bool:
+    """Send Telegram alert with priority-based cooldown and dedup."""
+    key = dedup_key or f"{priority}:{hash(message)}"
+    now_mono = time.monotonic()
+    cooldown = _PRIORITY_COOLDOWN_S.get(priority, _PRIORITY_COOLDOWN_S["info"])
+    if not force:
+        last_sent = _LAST_ALERT_SENT_AT.get(key, 0.0)
+        if now_mono - last_sent < cooldown:
+            logger.debug("Telegram alert skipped by cooldown (priority=%s key=%s).", priority, key)
+            return False
+    ok = await send_telegram_alert(message)
+    if ok:
+        _LAST_ALERT_SENT_AT[key] = now_mono
+    return ok
+
+
+def _report_timezone() -> ZoneInfo:
+    tz_name = os.environ.get(_REPORT_TIMEZONE_ENV, _DEFAULT_REPORT_TIMEZONE).strip() or _DEFAULT_REPORT_TIMEZONE
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        logger.warning("Invalid REPORT_TIMEZONE='%s', using %s.", tz_name, _DEFAULT_REPORT_TIMEZONE)
+        return ZoneInfo(_DEFAULT_REPORT_TIMEZONE)
+
+
+def _fmt_money(value: float) -> str:
+    return f"{value:+,.2f} USDT"
+
+
+def _fmt_pct(value: float) -> str:
+    return f"{value:.1f}%"
+
+
+async def _build_period_report(period: str, tz_name: str) -> str:
+    summary = await db.fetch_period_summary(period, tz_name=tz_name)
+    icon = "🟢" if summary["pnl_total"] >= 0 else "🔴"
+    best_trade = summary.get("best_trade")
+    worst_trade = summary.get("worst_trade")
+    best_line = "N/A"
+    worst_line = "N/A"
+    if isinstance(best_trade, dict):
+        best_line = f"{best_trade.get('symbol', '-')} {_fmt_money(float(best_trade.get('pnl', 0.0)))}"
+    if isinstance(worst_trade, dict):
+        worst_line = f"{worst_trade.get('symbol', '-')} {_fmt_money(float(worst_trade.get('pnl', 0.0)))}"
+    label = "SEMANA" if period == "week" else "MES" if period == "month" else "DÍA"
+    return (
+        f"📈 *RESUMEN {label}* ({tz_name})\n"
+        f"────────────────────────\n"
+        f"💰 *PnL:* {_fmt_money(summary['pnl_total'])} {icon}\n"
+        f"📊 *Trades:* {summary['total_trades']} | Ganados: {summary['wins']} | Perdidos: {summary['losses']}\n"
+        f"🎯 *Winrate:* {_fmt_pct(summary['winrate'])}\n"
+        f"⚖️ *Profit Factor:* {summary['profit_factor']:.2f}\n"
+        f"🏆 *Mejor Trade:* {best_line}\n"
+        f"📉 *Peor Trade:* {worst_line}\n"
+        f"────────────────────────"
+    )
+
+
+async def _build_history_report(days: int, tz_name: str) -> str:
+    series = await db.fetch_daily_pnl_series(days=days, tz_name=tz_name)
+    if not series:
+        return f"📚 *HISTORIAL {days}D* ({tz_name})\nSin datos de trades cerrados."
+    tz = _report_timezone()
+    lines = [f"📚 *HISTORIAL {days}D* ({tz_name})", "────────────────────────"]
+    for item in series[-days:]:
+        day_utc = datetime.fromisoformat(str(item["day_utc"]))
+        day_local = day_utc.astimezone(tz).strftime("%Y-%m-%d")
+        pnl_total = float(item["pnl_total"])
+        icon = "🟢" if pnl_total >= 0 else "🔴"
+        lines.append(f"{day_local}: {_fmt_money(pnl_total)} {icon}")
+    lines.append("────────────────────────")
+    return "\n".join(lines)
 
 
 async def telegram_command_poller(
@@ -244,7 +335,72 @@ async def telegram_command_poller(
                                     f"📉 *Máximo Drawdown:* {dd_sign}{abs(max_dd):.4f} USDT\n"
                                     "────────────────────────"
                                 )
-                                await send_telegram_alert(report)
+                                await send_priority_telegram_alert(
+                                    report,
+                                    priority="summary",
+                                    dedup_key="manual:daily",
+                                    force=True,
+                                )
+                            elif text.startswith("/weekly"):
+                                tz_name = str(_report_timezone())
+                                report = await _build_period_report("week", tz_name)
+                                await send_priority_telegram_alert(
+                                    report,
+                                    priority="summary",
+                                    dedup_key="manual:weekly",
+                                    force=True,
+                                )
+                            elif text.startswith("/monthly"):
+                                tz_name = str(_report_timezone())
+                                report = await _build_period_report("month", tz_name)
+                                await send_priority_telegram_alert(
+                                    report,
+                                    priority="summary",
+                                    dedup_key="manual:monthly",
+                                    force=True,
+                                )
+                            elif text.startswith("/history"):
+                                tz_name = str(_report_timezone())
+                                days = 7
+                                try:
+                                    parts = text.split()
+                                    if len(parts) > 1:
+                                        days = int(parts[1])
+                                except Exception:
+                                    days = 7
+                                if days not in (7, 30):
+                                    await send_priority_telegram_alert(
+                                        "Uso: `/history 7` o `/history 30`",
+                                        priority="info",
+                                        dedup_key="manual:history:usage",
+                                        force=True,
+                                    )
+                                else:
+                                    report = await _build_history_report(days, tz_name)
+                                    await send_priority_telegram_alert(
+                                        report,
+                                        priority="summary",
+                                        dedup_key=f"manual:history:{days}",
+                                        force=True,
+                                    )
+                            elif text.startswith("/ceo"):
+                                tz_name = str(_report_timezone())
+                                week = await db.fetch_period_summary("week", tz_name=tz_name)
+                                month = await db.fetch_period_summary("month", tz_name=tz_name)
+                                ceo_report = (
+                                    f"🧭 *CEO SNAPSHOT* ({tz_name})\n"
+                                    "────────────────────────\n"
+                                    f"📅 Semana: {_fmt_money(week['pnl_total'])} | Winrate {_fmt_pct(week['winrate'])}\n"
+                                    f"🗓️ Mes: {_fmt_money(month['pnl_total'])} | Winrate {_fmt_pct(month['winrate'])}\n"
+                                    f"⚖️ PF Semana/Mes: {week['profit_factor']:.2f} / {month['profit_factor']:.2f}\n"
+                                    "────────────────────────"
+                                )
+                                await send_priority_telegram_alert(
+                                    ceo_report,
+                                    priority="summary",
+                                    dedup_key="manual:ceo",
+                                    force=True,
+                                )
                 except asyncio.TimeoutError:
                     pass  # Normal long-polling timeout
                 except Exception as exc:

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from collections import deque
+from zoneinfo import ZoneInfo
 
 from rich.live import Live
 
@@ -22,7 +24,9 @@ from execution.mt5_executor import MT5Executor, fetch_mt5_wallet_snapshot
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 
-from utils.telegram_notifier import send_telegram_alert
+from utils.telegram_notifier import (
+    send_priority_telegram_alert,
+)
 
 
 async def dashboard_logger(
@@ -227,9 +231,9 @@ async def health_monitor_loop(
                 except Exception:
                     pass
                 asyncio.create_task(
-                    send_telegram_alert(
+                    send_priority_telegram_alert(
                         "⚠️ *HEALTH ALERT* Feed de mercado sin mensajes recientes (>120s)."
-                    )
+                    , priority="critical", dedup_key="health:market_feed_stale")
                 )
         else:
             stale_alert_sent = False
@@ -256,7 +260,7 @@ async def health_monitor_loop(
                 except Exception:
                     pass
                 asyncio.create_task(
-                    send_telegram_alert(
+                    send_priority_telegram_alert(
                         "🚨 *ALERTA DEL SISTEMA: ÓRDENES DE CIERRE RECHAZADAS*\n\n"
                         f"El bot ha intentado cerrar *{pending_count} posición(es)* repetidamente, pero el bróker (MT5) está rechazando las órdenes.\n\n"
                         "🛑 *¿Qué significa esto?*\n"
@@ -264,7 +268,9 @@ async def health_monitor_loop(
                         "⚠️ *Acción recomendada:*\n"
                         "Revisa la terminal de MT5 manualmente para confirmar si la orden sigue abierta o si ya se cerró. Si sigue abierta, es posible que debas cerrarla a mano.\n\n"
                         "*Detalles técnicos (Símbolo : Error):*\n"
-                        + "\n".join(f"• `{d}`" for d in details[:5])
+                        + "\n".join(f"• `{d}`" for d in details[:5]),
+                        priority="critical",
+                        dedup_key="health:pending_close_persistent",
                     )
                 )
         else:
@@ -307,3 +313,82 @@ async def close_pending_reconciler_loop(
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[RECONCILER] retry loop failed: %s", exc)
+
+
+def _report_tz() -> ZoneInfo:
+    tz_name = os.environ.get("REPORT_TIMEZONE", "America/Bogota").strip() or "America/Bogota"
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("America/Bogota")
+
+
+def _next_run_local(target_weekday: int | None, target_hour: int, target_minute: int = 0) -> datetime:
+    """Compute next run datetime in UTC from local schedule."""
+    tz = _report_tz()
+    now_local = datetime.now(tz=tz)
+    run_local = now_local.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+    if target_weekday is not None:
+        days_ahead = (target_weekday - now_local.weekday()) % 7
+        run_local = run_local + timedelta(days=days_ahead)
+        if run_local <= now_local:
+            run_local = run_local + timedelta(days=7)
+    else:
+        if run_local <= now_local:
+            if now_local.month == 12:
+                run_local = run_local.replace(year=now_local.year + 1, month=1, day=1)
+            else:
+                run_local = run_local.replace(month=now_local.month + 1, day=1)
+        else:
+            run_local = run_local.replace(day=1)
+    return run_local.astimezone(timezone.utc)
+
+
+async def weekly_report_loop(interval_floor: int = 30) -> None:
+    """Send automatic weekly Telegram summary in configured timezone."""
+    logger = logging.getLogger("clawdbot.reports.weekly")
+    from utils.telegram_notifier import _build_period_report  # local import to avoid circular load
+
+    weekly_hour = int(os.environ.get("REPORT_WEEKLY_HOUR_LOCAL", "21"))
+    while True:
+        next_run_utc = _next_run_local(target_weekday=6, target_hour=weekly_hour, target_minute=0)
+        sleep_s = max(interval_floor, int((next_run_utc - datetime.now(tz=timezone.utc)).total_seconds()))
+        logger.info("Weekly report scheduled for %s UTC (%ds).", next_run_utc.isoformat(), sleep_s)
+        await asyncio.sleep(sleep_s)
+        try:
+            tz_name = str(_report_tz())
+            report = await _build_period_report("week", tz_name)
+            await send_priority_telegram_alert(
+                report,
+                priority="summary",
+                dedup_key=f"auto:weekly:{datetime.now(tz=_report_tz()).strftime('%Y-%W')}",
+                force=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Weekly report failed: %s", exc)
+        await asyncio.sleep(interval_floor)
+
+
+async def monthly_report_loop(interval_floor: int = 30) -> None:
+    """Send automatic monthly Telegram summary in configured timezone."""
+    logger = logging.getLogger("clawdbot.reports.monthly")
+    from utils.telegram_notifier import _build_period_report  # local import to avoid circular load
+
+    monthly_hour = int(os.environ.get("REPORT_MONTHLY_HOUR_LOCAL", "21"))
+    while True:
+        next_run_utc = _next_run_local(target_weekday=None, target_hour=monthly_hour, target_minute=0)
+        sleep_s = max(interval_floor, int((next_run_utc - datetime.now(tz=timezone.utc)).total_seconds()))
+        logger.info("Monthly report scheduled for %s UTC (%ds).", next_run_utc.isoformat(), sleep_s)
+        await asyncio.sleep(sleep_s)
+        try:
+            tz_name = str(_report_tz())
+            report = await _build_period_report("month", tz_name)
+            await send_priority_telegram_alert(
+                report,
+                priority="summary",
+                dedup_key=f"auto:monthly:{datetime.now(tz=_report_tz()).strftime('%Y-%m')}",
+                force=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Monthly report failed: %s", exc)
+        await asyncio.sleep(interval_floor)
