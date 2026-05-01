@@ -4,13 +4,34 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 try:
     from dotenv import load_dotenv as _load_dotenv
 except ImportError:
     _load_dotenv = None  # type: ignore[assignment]
+
+# Embedded markdown max size (chars) before truncate — evita .md imposible de pegar.
+_MAX_EMBED_CHARS = 3_500_000
+
+
+def _report_tz() -> ZoneInfo:
+    name = os.environ.get("REPORT_TIMEZONE", "America/Bogota").strip() or "America/Bogota"
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def _parse_iso_dt(s: str) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 def _tail_text(path: Path, max_lines: int, max_bytes: int = 400_000) -> str:
@@ -142,73 +163,235 @@ def _filter_bot_debug_warnings(path: Path, max_lines: int = 120) -> str:
     return "\n".join(keep[-max_lines:]) + "\n"
 
 
+def _jsonl_for_local_date(path: Path, target: date, tz: ZoneInfo) -> tuple[str, int, int]:
+    """All JSONL lines whose ``ts`` falls on *target* in *tz*. Returns text, count, total_lines."""
+    if not path.is_file():
+        return "(no existe runtime_metrics.jsonl)\n", 0, 0
+    all_raw = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    total = len(all_raw)
+    out: list[str] = []
+    for raw in all_raw:
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        ts = row.get("ts")
+        dt = _parse_iso_dt(str(ts) if ts else "")
+        if dt is None:
+            continue
+        if dt.astimezone(tz).date() == target:
+            out.append(raw)
+    body = "\n".join(out) + ("\n" if out else "")
+    return body, len(out), total
+
+
+def _filter_bot_debug_for_local_date(path: Path, target: date, tz: ZoneInfo) -> str:
+    """ERROR/WARNING JSON lines whose timestamp falls on *target* in *tz*."""
+    if not path.is_file():
+        return f"(no existe {path})\n"
+    keep: list[str] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if '"level": "ERROR"' not in raw and '"level": "WARNING"' not in raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        ts = payload.get("timestamp")
+        dt = _parse_iso_dt(str(ts) if ts else "")
+        if dt is None:
+            continue
+        if dt.astimezone(tz).date() == target:
+            keep.append(raw)
+    if not keep:
+        return "_Sin ERROR/WARNING ese día en bot_debug (formato JSON)._ \n"
+    return "\n".join(keep) + "\n"
+
+
+def _sl_tp_timeline_from_jsonl_date(path: Path, target: date, tz: ZoneInfo) -> str:
+    if not path.is_file():
+        return "_Sin archivo JSONL._\n"
+    rows_out: list[str] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        ts = row.get("ts")
+        dt = _parse_iso_dt(str(ts) if ts else "")
+        if dt is None or dt.astimezone(tz).date() != target:
+            continue
+        ts_s = str(ts)
+        for p in row.get("positions") or []:
+            if not isinstance(p, dict):
+                continue
+            sym = p.get("symbol", "?")
+            rows_out.append(
+                f"| {ts_s} | {sym} | entry={p.get('entry_price')} | "
+                f"peak={p.get('peak_price')} | SL_now={p.get('current_stop_loss')} | "
+                f"SL_ini={p.get('initial_stop_price')} | trail={p.get('trailing_stop_active')} | "
+                f"tp_hint={p.get('dynamic_tp_hint')} |"
+            )
+    if not rows_out:
+        return "_Sin posiciones ese día en JSONL._\n"
+    return "```text\n" + "\n".join(rows_out) + "\n```\n"
+
+
+def _truncate_notice(s: str, limit: int) -> tuple[str, bool]:
+    if len(s) <= limit:
+        return s, False
+    return (
+        s[:limit]
+        + "\n\n---\n**TRUNCADO** por tamaño. Abrí `logs/runtime_metrics.jsonl` "
+        "completo o repetí export con día más corto.\n",
+        True,
+    )
+
+
 def write_diagnostic_bundle(
     *,
     repo_root: Path,
     output: Path | None = None,
     load_dotenv_file: bool = True,
+    mode: str = "snapshot",
+    report_date: date | None = None,
 ) -> Path:
-    """Write consolidated Markdown. Default ``output`` = ``repo_root/DIAGNOSTIC_FOR_REVIEW.md``."""
+    """Write consolidated Markdown.
+
+    Parameters
+    ----------
+    mode:
+        ``snapshot`` — colas cortas (comportamiento anterior).
+        ``full_day`` — todo el ``runtime_metrics.jsonl`` del día local (`REPORT_TIMEZONE`)
+        + ERROR/WARNING de ``bot_debug`` de ese día.
+    report_date:
+        Día a exportar en modo ``full_day`` (default: hoy en zona de informe).
+    """
     if load_dotenv_file and _load_dotenv is not None:
         _load_dotenv(repo_root / ".env")
 
     logs_dir = repo_root / "logs"
-    out = output if output is not None else repo_root / "DIAGNOSTIC_FOR_REVIEW.md"
+    tz = _report_tz()
+    target_d = report_date or datetime.now(tz=tz).date()
+
+    if mode == "full_day":
+        out = output if output is not None else (
+            repo_root / f"DIAGNOSTIC_DAY_{target_d.isoformat()}.md"
+        )
+    else:
+        out = output if output is not None else repo_root / "DIAGNOSTIC_FOR_REVIEW.md"
+
     now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     snap = _read_json(logs_dir / "bot_startup_snapshot.json")
 
-    metrics_tail, mstats = _parse_runtime_jsonl(logs_dir / "runtime_metrics.jsonl", max_lines=250)
-
     parts: list[str] = []
-    parts.append("# ClawdBot — paquete único para revisión (IA / humano)\n")
+    title = (
+        "# ClawdBot — revisión **día completo**\n"
+        if mode == "full_day"
+        else "# ClawdBot — paquete único para revisión (IA / humano)\n"
+    )
+    parts.append(title)
     parts.append(f"_Generado: `{now}` — repo: `{repo_root.resolve()}`_\n")
-    parts.append(
-        "## Cómo usar\n"
-        "Adjunta o pega **este archivo completo** al asistente.\n\n"
-        "**Automático:** el bot puede regenerar este archivo en la raíz cada X minutos "
-        "(`DIAGNOSTIC_BUNDLE_INTERVAL_S`). También podés ejecutar "
-        "`python scripts/export_diagnostic_bundle.py`.\n\n"
-    )
-
-    parts.append("## 1) Resumen rápido\n")
-    parts.append(f"- Líneas en `runtime_metrics.jsonl`: **{mstats.get('lines_total', 0)}**\n")
-    parts.append(f"- Primera muestra (último archivo): `{mstats.get('first_ts')}`\n")
-    parts.append(f"- Última muestra: `{mstats.get('last_ts')}`\n")
-    syms = mstats.get("symbols_ever_open")
-    if isinstance(syms, set) and syms:
-        parts.append(f"- Símbolos con posición en cola final JSONL: `{', '.join(sorted(syms))}`\n")
-    parts.append("\n")
-
-    parts.append("## 2) Variables entorno (sin secretos)\n")
-    parts.extend([x + "\n" for x in _sanitize_env_lines()])
-    parts.append("\n")
-
-    parts.append("## 3) Snapshot de arranque (`logs/bot_startup_snapshot.json`)\n")
-    if snap:
-        parts.append("```json\n" + json.dumps(snap, indent=2, ensure_ascii=False) + "\n```\n\n")
+    if mode == "full_day":
+        parts.append(
+            f"_**Día local** (`REPORT_TIMEZONE={tz.key}`): **{target_d.isoformat()}**_\n\n"
+            "Incluye **todas** las muestras `runtime_metrics.jsonl` de ese día y "
+            "ERROR/WARNING de `bot_debug` de ese día.\n\n"
+        )
     else:
-        parts.append("_Archivo ausente._\n\n")
+        parts.append(
+            "## Cómo usar\n"
+            "Adjunta o pega **este archivo completo** al asistente.\n\n"
+            "**Fin de día (todo el día):** "
+            "`python scripts/export_diagnostic_bundle.py --full-day`\n\n"
+        )
 
-    parts.append("## 4) Cronología SL / pico / trailing (desde JSONL)\n")
-    parts.append(
-        "Si **SL_now** sube cuando **peak** sube y **trailing** pasa a `true`, el ratchet funcionaba.\n\n"
-    )
-    parts.append(_sl_tp_timeline_from_jsonl(logs_dir / "runtime_metrics.jsonl"))
+    jsonl_path = logs_dir / "runtime_metrics.jsonl"
 
-    parts.append("\n## 5) Últimas líneas de `runtime_metrics.jsonl` (crudo)\n")
-    parts.append("```text\n" + metrics_tail + "```\n")
+    if mode == "full_day":
+        metrics_day, n_day, n_tot = _jsonl_for_local_date(jsonl_path, target_d, tz)
+        metrics_day, truncated = _truncate_notice(metrics_day, _MAX_EMBED_CHARS)
+        parts.append("## 1) Resumen día\n")
+        parts.append(
+            f"- Líneas totales en JSONL: **{n_tot}** | del día **{target_d}**: **{n_day}**\n"
+        )
+        if truncated:
+            parts.append("- **Texto JSONL truncado** en este .md — ver archivo fuente.\n")
+        parts.append("\n")
+        parts.append("## 2) Variables entorno (sin secretos)\n")
+        parts.extend([x + "\n" for x in _sanitize_env_lines()])
+        parts.append("\n")
+        parts.append("## 3) Snapshot de arranque (`logs/bot_startup_snapshot.json`)\n")
+        if snap:
+            parts.append("```json\n" + json.dumps(snap, indent=2, ensure_ascii=False) + "\n```\n\n")
+        else:
+            parts.append("_Archivo ausente._\n\n")
+        parts.append(
+            f"## 4) Cronología SL/pico/trailing (JSONL día {target_d})\n"
+        )
+        parts.append(_sl_tp_timeline_from_jsonl_date(jsonl_path, target_d, tz))
+        parts.append(f"\n## 5) `runtime_metrics.jsonl` **completo del día** ({target_d})\n")
+        parts.append("```text\n" + metrics_day + "```\n")
+        parts.append(
+            f"\n## 6) ERROR / WARNING `bot_debug.log` del día ({target_d})\n"
+        )
+        parts.append(
+            "```text\n"
+            + _filter_bot_debug_for_local_date(repo_root / "bot_debug.log", target_d, tz)
+            + "```\n"
+        )
+        parts.append("\n## 7) `logs/last_session.log` (sesión actual, últimas 400 líneas)\n")
+        parts.append("```text\n" + _tail_text(logs_dir / "last_session.log", 400, max_bytes=800_000) + "```\n")
+        parts.append("\n## 8) `audit.log` (últimas 2000 líneas)\n")
+        parts.append("```text\n" + _tail_text(repo_root / "audit.log", 2000, max_bytes=2_000_000) + "```\n")
+        parts.append("\n## 9) `logs/trade_journal.csv` (completo si <200KB, si no cola)\n")
+        jpath = logs_dir / "trade_journal.csv"
+        if jpath.is_file() and jpath.stat().st_size < 200_000:
+            parts.append("```text\n" + jpath.read_text(encoding="utf-8", errors="replace") + "```\n")
+        else:
+            parts.append("```text\n" + _tail_text(jpath, 400, max_bytes=400_000) + "```\n")
+    else:
+        metrics_tail, mstats = _parse_runtime_jsonl(jsonl_path, max_lines=250)
 
-    parts.append("\n## 6) `logs/last_session.log` (últimas 200 líneas)\n")
-    parts.append("```text\n" + _tail_text(logs_dir / "last_session.log", 200) + "```\n")
+        parts.append("## 1) Resumen rápido\n")
+        parts.append(f"- Líneas en `runtime_metrics.jsonl`: **{mstats.get('lines_total', 0)}**\n")
+        parts.append(f"- Primera muestra (último archivo): `{mstats.get('first_ts')}`\n")
+        parts.append(f"- Última muestra: `{mstats.get('last_ts')}`\n")
+        syms = mstats.get("symbols_ever_open")
+        if isinstance(syms, set) and syms:
+            parts.append(f"- Símbolos con posición en cola final JSONL: `{', '.join(sorted(syms))}`\n")
+        parts.append("\n")
 
-    parts.append("\n## 7) ERROR / WARNING en `bot_debug.log` (filtrado)\n")
-    parts.append("```text\n" + _filter_bot_debug_warnings(repo_root / "bot_debug.log") + "```\n")
+        parts.append("## 2) Variables entorno (sin secretos)\n")
+        parts.extend([x + "\n" for x in _sanitize_env_lines()])
+        parts.append("\n")
 
-    parts.append("\n## 8) `audit.log` (últimas 120 líneas)\n")
-    parts.append("```text\n" + _tail_text(repo_root / "audit.log", 120) + "```\n")
+        parts.append("## 3) Snapshot de arranque (`logs/bot_startup_snapshot.json`)\n")
+        if snap:
+            parts.append("```json\n" + json.dumps(snap, indent=2, ensure_ascii=False) + "\n```\n\n")
+        else:
+            parts.append("_Archivo ausente._\n\n")
 
-    parts.append("\n## 9) `logs/trade_journal.csv` (últimas 80 líneas)\n")
-    parts.append("```text\n" + _tail_text(logs_dir / "trade_journal.csv", 80) + "```\n")
+        parts.append("## 4) Cronología SL / pico / trailing (desde JSONL)\n")
+        parts.append(
+            "Si **SL_now** sube cuando **peak** sube y **trailing** pasa a `true`, el ratchet funcionaba.\n\n"
+        )
+        parts.append(_sl_tp_timeline_from_jsonl(jsonl_path))
+
+        parts.append("\n## 5) Últimas líneas de `runtime_metrics.jsonl` (crudo)\n")
+        parts.append("```text\n" + metrics_tail + "```\n")
+
+        parts.append("\n## 6) `logs/last_session.log` (últimas 200 líneas)\n")
+        parts.append("```text\n" + _tail_text(logs_dir / "last_session.log", 200) + "```\n")
+
+        parts.append("\n## 7) ERROR / WARNING en `bot_debug.log` (filtrado)\n")
+        parts.append("```text\n" + _filter_bot_debug_warnings(repo_root / "bot_debug.log") + "```\n")
+
+        parts.append("\n## 8) `audit.log` (últimas 120 líneas)\n")
+        parts.append("```text\n" + _tail_text(repo_root / "audit.log", 120) + "```\n")
+
+        parts.append("\n## 9) `logs/trade_journal.csv` (últimas 80 líneas)\n")
+        parts.append("```text\n" + _tail_text(logs_dir / "trade_journal.csv", 80) + "```\n")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("".join(parts), encoding="utf-8")

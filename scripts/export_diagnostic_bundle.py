@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """
-Genera un único Markdown para revisión (mismo contenido que el bot escribe en la raíz).
+Export Markdown para revisión (snapshot corto o día completo).
 
-Uso::
+Snapshot (rápido, colas)::
 
     .venv312\\Scripts\\python scripts\\export_diagnostic_bundle.py
 
-Salida por defecto: ``logs/diagnostic_bundle_FOR_REVIEW.md``
-(también existe ``DIAGNOSTIC_FOR_REVIEW.md`` en la raíz si el bot corre con intervalo > 0).
+Día completo — todo el JSONL de ese día local + errores del día (REPORT_TIMEZONE)::
+
+    .venv312\\Scripts\\python scripts\\export_diagnostic_bundle.py --full-day
+
+Otro día::
+
+    .venv312\\Scripts\\python scripts\\export_diagnostic_bundle.py --full-day --date 2026-05-01
+
+Salida snapshot default: ``logs/diagnostic_bundle_FOR_REVIEW.md``
+Salida full-day default: ``DIAGNOSTIC_DAY_YYYY-MM-DD.md`` en la raíz del repo.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from datetime import date
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 
-# Allow running without full package path
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
@@ -30,14 +38,45 @@ def main() -> None:
     ap.add_argument(
         "--output",
         type=Path,
-        default=_REPO / "logs" / "diagnostic_bundle_FOR_REVIEW.md",
-        help="Ruta del .md",
+        default=None,
+        help="Ruta del .md (opcional; full-day usa nombre por defecto si omitís)",
+    )
+    ap.add_argument(
+        "--full-day",
+        action="store_true",
+        help="Incluir todo runtime_metrics.jsonl del día + ERROR/WARNING bot_debug de ese día",
+    )
+    ap.add_argument(
+        "--date",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Día local (REPORT_TIMEZONE). Default: hoy. Solo con --full-day.",
     )
     args = ap.parse_args()
+
+    report_date: date | None = None
+    if args.date:
+        report_date = date.fromisoformat(args.date)
+
+    mode = "full_day" if args.full_day else "snapshot"
+    out_arg = args.output
+    if mode == "snapshot" and out_arg is None:
+        out_arg = _REPO / "logs" / "diagnostic_bundle_FOR_REVIEW.md"
+
     try:
-        out = write_diagnostic_bundle(repo_root=_REPO, output=args.output, load_dotenv_file=True)
+        out = write_diagnostic_bundle(
+            repo_root=_REPO,
+            output=out_arg,
+            load_dotenv_file=True,
+            mode=mode,
+            report_date=report_date,
+        )
         print(f"OK -> {out.resolve()} ({out.stat().st_size // 1024} KB approx)")
     except OSError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         sys.exit(1)
 
