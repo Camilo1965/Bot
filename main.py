@@ -28,6 +28,7 @@ verify PostgreSQL/TimescaleDB, MT5 login, and Telegram.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import logging.handlers
@@ -62,7 +63,12 @@ from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor
 from strategy.sentiment_llm import get_gemini_sentiment
-from utils.telegram_notifier import send_telegram_alert, telegram_command_poller
+from utils.telegram_notifier import (
+    install_asyncio_critical_telegram_alerts,
+    send_priority_telegram_alert,
+    send_telegram_alert,
+    telegram_command_poller,
+)
 
 from bot import state as dash_state
 from bot.constants import (
@@ -420,10 +426,14 @@ async def main() -> None:
     )
     root_logger.addHandler(_rich_handler)
 
+    install_asyncio_critical_telegram_alerts()
+
     logger.info("🚀 ClawdBot starting up...")
 
     # ── Telegram startup notification ─────────────────────────────────────────
-    asyncio.create_task(send_telegram_alert("🚀 *ClawdBot* ha iniciado correctamente."))
+    startup_alert_task: asyncio.Task[bool] | None = asyncio.create_task(
+        send_telegram_alert("🚀 *ClawdBot* ha iniciado correctamente.")
+    )
 
     # ── Record bot start time for uptime display ──────────────────────────────
     dash_state.bot_start_time = datetime.now(tz=timezone.utc)
@@ -744,6 +754,16 @@ async def main() -> None:
 
     if mt5_market_client is None:
         logger.error("❌ [MT5] Market feed client not available; cannot start bot loop.")
+        try:
+            await send_priority_telegram_alert(
+                "🚨 *NO ARRANCA EL BOT* — sin *market feed* MT5.\n"
+                "Revisa terminal MT5, credenciales y `EXECUTION_MODE`.",
+                priority="critical",
+                dedup_key="startup:no_market_feed",
+                force=True,
+            )
+        except Exception:  # noqa: BLE001
+            pass
         await close_db()
         return
 
@@ -778,9 +798,10 @@ async def main() -> None:
             "[LLM] Gemini sentiment refresher disabled (GEMINI_API_KEY missing). "
             "Using neutral sentiment baseline."
         )
+    running_tasks: list[asyncio.Task[Any]] = [asyncio.create_task(task) for task in run_tasks]
 
     try:
-        await asyncio.gather(*run_tasks)
+        await asyncio.gather(*running_tasks)
     except Exception as _critical_exc:  # noqa: BLE001
         logger.critical(
             "🚨 [CRITICAL] Bot loop terminated unexpectedly: %s – check bot_debug.log.",
@@ -788,14 +809,26 @@ async def main() -> None:
             exc_info=True,
         )
         try:
-            await send_telegram_alert(
-                f"🚨 *ERROR CRÍTICO* – ClawdBot se ha detenido inesperadamente.\n"
-                f"Causa: `{type(_critical_exc).__name__}: {str(_critical_exc)[:200]}`"
+            await send_priority_telegram_alert(
+                f"🚨 *ERROR CRÍTICO* – loop principal parado.\n"
+                f"Causa: `{type(_critical_exc).__name__}: {str(_critical_exc)[:200]}`",
+                priority="critical",
+                dedup_key=f"gather_fail:{type(_critical_exc).__name__}",
+                force=True,
             )
         except Exception:  # noqa: BLE001
             pass  # never let the Telegram call block the shutdown path
         raise
     finally:
+        for task in running_tasks:
+            if not task.done():
+                task.cancel()
+        if running_tasks:
+            await asyncio.gather(*running_tasks, return_exceptions=True)
+        if startup_alert_task and not startup_alert_task.done():
+            startup_alert_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await startup_alert_task
         _live.stop()
         if _mt5_initialized:
             shutdown_mt5()
@@ -805,4 +838,22 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        asyncio.run(main())
+    except BaseException as _fatal_exc:
+        if not isinstance(_fatal_exc, (KeyboardInterrupt, SystemExit)):
+            try:
+                asyncio.run(
+                    send_priority_telegram_alert(
+                        f"🚨 *PROCESO CAÍDO*\n"
+                        f"`{type(_fatal_exc).__name__}`: `{str(_fatal_exc)[:300]}`",
+                        priority="critical",
+                        dedup_key=f"fatal:{type(_fatal_exc).__name__}",
+                        force=True,
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        raise

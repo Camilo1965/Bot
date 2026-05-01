@@ -169,6 +169,58 @@ async def send_priority_telegram_alert(
     return ok
 
 
+def install_asyncio_critical_telegram_alerts() -> None:
+    """Hook asyncio loop errors → Telegram (priority critical, dedup+cooldown).
+
+    Call once from inside ``async def main()`` so ``get_running_loop()`` exists.
+    Complements ``gather`` exception handling: catches task/callback failures that
+    do not propagate to the main ``gather``.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _handler(async_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        async_loop.default_exception_handler(context)
+        exc = context.get("exception")
+        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+            return
+        if isinstance(exc, asyncio.CancelledError):
+            return
+        msg = str(context.get("message", "") or "")
+        task = context.get("task")
+        task_label = ""
+        if task is not None:
+            try:
+                task_label = task.get_name()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                task_label = repr(task)
+        exc_line = (
+            f"`{type(exc).__name__}`: `{str(exc)[:280]}`"
+            if exc is not None
+            else (msg[:380] if msg else "error sin excepción en contexto")
+        )
+        lines = [
+            "🚨 *ERROR ASYNC (loop)* — revisar logs / posible fix requerido",
+            "",
+            exc_line,
+        ]
+        if task_label:
+            lines.append(f"Task: `{task_label[:120]}`")
+        text = "\n".join(lines)
+        dedup_key = f"asyncio_ctx:{type(exc).__name__ if exc else 'nomsg'}:{hash(msg[:100]) % 100001}"
+        try:
+            asyncio.create_task(
+                send_priority_telegram_alert(
+                    text,
+                    priority="critical",
+                    dedup_key=dedup_key,
+                )
+            )
+        except RuntimeError:
+            pass
+
+    loop.set_exception_handler(_handler)
+
+
 def _report_timezone() -> ZoneInfo:
     tz_name = os.environ.get(_REPORT_TIMEZONE_ENV, _DEFAULT_REPORT_TIMEZONE).strip() or _DEFAULT_REPORT_TIMEZONE
     try:

@@ -678,9 +678,10 @@ async def start_web_dashboard(
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
-    
-    logger.info("🌐 Web dashboard server listening on http://%s:%d", host, port)
-    await site.start()
-    
-    while True:
-        await asyncio.sleep(3600)
+    try:
+        logger.info("🌐 Web dashboard server listening on http://%s:%d", host, port)
+        await site.start()
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await runner.cleanup()
