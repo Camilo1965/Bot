@@ -19,77 +19,156 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ClawdBot Dashboard</title>
+    <title>ClawdBot Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background-color: #0f172a; color: #f8fafc; font-family: 'Inter', sans-serif; }
-        .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
-        .neon-text { text-shadow: 0 0 10px rgba(56, 189, 248, 0.5); }
-        .neon-green { color: #4ade80; text-shadow: 0 0 8px rgba(74, 222, 128, 0.6); }
-        .neon-red { color: #f87171; text-shadow: 0 0 8px rgba(248, 113, 113, 0.6); }
-        .card-enter { animation: fadein 0.3s ease-in; }
-        @keyframes fadein { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body { 
+            background: radial-gradient(circle at top right, #1e293b, #0f172a 40%, #020617 100%);
+            color: #f8fafc; 
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+        }
+        .glass { 
+            background: rgba(30, 41, 59, 0.4); 
+            backdrop-filter: blur(16px); 
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.05); 
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+        }
+        .glass-card {
+            background: linear-gradient(145deg, rgba(30,41,59,0.4) 0%, rgba(15,23,42,0.6) 100%);
+            border: 1px solid rgba(255,255,255,0.05);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.1);
+        }
+        .glass-card:hover {
+            border-color: rgba(255,255,255,0.15);
+            transform: translateY(-2px);
+            transition: all 0.3s ease;
+        }
+        .neon-text { text-shadow: 0 0 15px rgba(56, 189, 248, 0.4); }
+        .text-glow-green { text-shadow: 0 0 10px rgba(74, 222, 128, 0.5); color: #4ade80; }
+        .text-glow-red { text-shadow: 0 0 10px rgba(248, 113, 113, 0.5); color: #f87171; }
+        
+        .pulse-dot {
+            height: 8px; width: 8px; border-radius: 50%; display: inline-block;
+            box-shadow: 0 0 8px currentColor;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(1.2); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+        
+        .value-up { animation: flash-green 1s ease-out; }
+        .value-down { animation: flash-red 1s ease-out; }
+        @keyframes flash-green { 0% { color: #4ade80; text-shadow: 0 0 15px #4ade80; } 100% { color: inherit; text-shadow: none; } }
+        @keyframes flash-red { 0% { color: #f87171; text-shadow: 0 0 15px #f87171; } 100% { color: inherit; text-shadow: none; } }
+        
+        .progress-bar-bg { background: rgba(0,0,0,0.3); border-radius: 999px; overflow: hidden; height: 6px; }
+        .progress-bar-fill { height: 100%; transition: width 0.5s ease-in-out; }
     </style>
 </head>
 <body class="p-4 md:p-8">
-    <div class="max-w-4xl mx-auto space-y-6">
+    <div class="max-w-5xl mx-auto space-y-6">
         
-        <!-- Header -->
-        <header class="glass rounded-2xl p-6 flex flex-col md:flex-row justify-between items-center shadow-lg">
+        <!-- Header & System Health -->
+        <header class="glass rounded-3xl p-6 flex flex-col md:flex-row justify-between items-start md:items-center">
             <div>
                 <h1 class="text-3xl font-bold text-sky-400 neon-text flex items-center gap-3">
-                    🤖 ClawdBot <span class="text-sm font-normal text-slate-400 bg-slate-800 px-3 py-1 rounded-full border border-slate-700" id="uptime">--:--:--</span>
+                    ClawdBot <span class="text-xs font-medium text-slate-400 bg-black/30 px-3 py-1 rounded-full border border-white/5 tracking-wider uppercase">Pro</span>
                 </h1>
-                <p class="text-slate-400 mt-2 text-sm">XGBoost_v3 + Gemini-2.5-Flash-Lite</p>
-            </div>
-            <div class="mt-4 md:mt-0 flex gap-4 text-center">
-                <div class="bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
-                    <div class="text-xs text-slate-400 uppercase">Lectura IA</div>
-                    <div class="text-xl font-bold" id="sentiment">--</div>
-                    <div class="text-[11px] text-slate-400 mt-1" id="sentiment-detail">--</div>
+                <div class="flex items-center gap-4 mt-3 text-xs text-slate-400">
+                    <span class="flex items-center gap-2"><span class="pulse-dot text-emerald-400"></span> MT5 Activo</span>
+                    <span class="flex items-center gap-2"><span class="pulse-dot text-emerald-400" style="animation-delay: 0.5s"></span> Feed OK</span>
+                    <span class="flex items-center gap-2"><span class="pulse-dot text-sky-400" style="animation-delay: 1s"></span> <span id="uptime">--:--:--</span></span>
                 </div>
-                <div class="bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
-                    <div class="text-xs text-slate-400 uppercase">Estado Bot</div>
-                    <div class="text-xl font-bold" id="bot-status">--</div>
+            </div>
+            
+            <div class="mt-6 md:mt-0 flex gap-3 w-full md:w-auto">
+                <div class="bg-black/20 p-4 rounded-2xl border border-white/5 flex-1 md:w-48">
+                    <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-1">Lectura IA</div>
+                    <div class="text-lg font-bold" id="sentiment">--</div>
+                    <div class="text-xs text-slate-400 mt-1" id="sentiment-detail">--</div>
+                </div>
+                <div class="bg-black/20 p-4 rounded-2xl border border-white/5 flex-1 md:w-40">
+                    <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-1">Estado Bot</div>
+                    <div class="text-lg font-bold" id="bot-status">--</div>
                 </div>
             </div>
         </header>
 
-        <!-- Riesgo y Billetera -->
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div class="glass rounded-xl p-4">
-                <div class="text-xs text-slate-400">Balance</div>
-                <div class="text-xl font-bold mt-1" id="balance">--</div>
-            </div>
-            <div class="glass rounded-xl p-4">
-                <div class="text-xs text-slate-400">Dinero Disponible</div>
-                <div class="text-xl font-bold mt-1" id="margin">--</div>
-            </div>
-            <div class="glass rounded-xl p-4">
-                <div class="text-xs text-slate-400">Ganancia Sesión</div>
-                <div class="text-xl font-bold mt-1" id="session-pnl">--</div>
-            </div>
-            <div class="glass rounded-xl p-4">
-                <div class="text-xs text-slate-400">Peor Caída Sesión</div>
-                <div class="text-xl font-bold mt-1" id="drawdown">--</div>
+        <!-- Fintech Wallet Panel -->
+        <div class="glass rounded-3xl p-6 relative overflow-hidden">
+            <div class="absolute -right-20 -top-20 w-64 h-64 bg-sky-500/10 rounded-full blur-3xl"></div>
+            
+            <div class="text-[11px] text-slate-400 uppercase tracking-widest font-semibold mb-6">Resumen Financiero</div>
+            
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-8">
+                <div>
+                    <div class="text-sm text-slate-400 mb-1">Balance Total</div>
+                    <div class="text-4xl font-light tracking-tight"><span class="text-slate-500">$</span><span id="balance" class="font-medium text-white">--</span></div>
+                </div>
+                <div class="border-l border-white/5 pl-8">
+                    <div class="text-sm text-slate-400 mb-1">Dinero Disponible</div>
+                    <div class="text-2xl font-light mt-2"><span class="text-slate-500">$</span><span id="margin" class="font-medium text-white">--</span></div>
+                </div>
+                <div class="border-l border-white/5 pl-8">
+                    <div class="text-sm text-slate-400 mb-1">Ganancia Sesión</div>
+                    <div class="text-2xl font-medium mt-2" id="session-pnl">--</div>
+                </div>
+                <div class="border-l border-white/5 pl-8">
+                    <div class="text-sm text-slate-400 mb-1">Peor Caída Sesión</div>
+                    <div class="text-2xl font-medium mt-2" id="drawdown">--</div>
+                </div>
             </div>
         </div>
 
-        <!-- Market Data -->
-        <h2 class="text-xl font-semibold text-slate-200 mt-8 mb-4 px-2">📊 Mercado en Vivo</h2>
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4" id="market-cards">
-            <!-- Renderizado por JS -->
+        <!-- Market Cards -->
+        <div class="flex justify-between items-end mt-10 mb-4 px-2">
+            <h2 class="text-lg font-medium text-slate-300 tracking-wide">MERCADO EN VIVO</h2>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6" id="market-cards">
+            <!-- JS Renders Here -->
         </div>
 
-        <!-- Eventos -->
-        <h2 class="text-xl font-semibold text-slate-200 mt-8 mb-4 px-2">📋 Últimos Eventos</h2>
-        <div class="glass rounded-xl p-4 space-y-2 text-sm text-slate-300 font-mono" id="events-log">
-            <!-- Renderizado por JS -->
+        <!-- Events -->
+        <div class="mt-8">
+            <h2 class="text-lg font-medium text-slate-300 tracking-wide mb-4 px-2">LÍNEA DE TIEMPO</h2>
+            <div class="glass rounded-2xl p-6 space-y-4" id="events-log">
+                <!-- JS Renders Here -->
+            </div>
         </div>
-
     </div>
 
     <script>
+        const stateCache = {};
+
+        function updateValue(id, newValue, className = '') {
+            const el = document.getElementById(id);
+            if (!el) return;
+            
+            if (stateCache[id] !== newValue) {
+                el.innerText = newValue;
+                if (className) el.className = className;
+                
+                // Flash effect
+                if (stateCache[id] !== undefined) {
+                    const oldNum = parseFloat(stateCache[id].toString().replace(/[^0-9.-]+/g, ""));
+                    const newNum = parseFloat(String(newValue).replace(/[^0-9.-]+/g, ""));
+                    
+                    if (!isNaN(oldNum) && !isNaN(newNum) && oldNum !== newNum) {
+                        el.classList.remove('value-up', 'value-down');
+                        void el.offsetWidth; // trigger reflow
+                        el.classList.add(newNum > oldNum ? 'value-up' : 'value-down');
+                    }
+                }
+                stateCache[id] = newValue;
+            }
+        }
+
         async function fetchState() {
             try {
                 const res = await fetch('/api/state');
@@ -105,76 +184,126 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             const sentEl = document.getElementById('sentiment');
             sentEl.innerText = data.sentiment_label;
-            sentEl.className = `text-xl font-bold ${data.sentiment_num >= 0.60 ? 'neon-green' : data.sentiment_num >= 0.45 ? 'text-yellow-400' : 'neon-red'}`;
+            sentEl.className = `text-lg font-bold ${data.sentiment_num >= 0.60 ? 'text-glow-green' : data.sentiment_num >= 0.45 ? 'text-yellow-400' : 'text-glow-red'}`;
             document.getElementById('sentiment-detail').innerText = data.sentiment_detail;
 
             const botStatusEl = document.getElementById('bot-status');
-            botStatusEl.innerHTML = data.global_hold ? '⛔ En pausa' : '✅ Operando';
-            botStatusEl.className = `text-xl font-bold ${data.global_hold ? 'neon-red' : 'neon-green'}`;
+            botStatusEl.innerHTML = data.global_hold ? '<span class="text-glow-red">En pausa</span>' : '<span class="text-glow-green">Operando</span>';
 
-            document.getElementById('balance').innerText = data.balance;
-            document.getElementById('margin').innerText = data.available_margin;
+            updateValue('balance', data.balance);
+            updateValue('margin', data.available_margin);
             
-            const pnlEl = document.getElementById('session-pnl');
-            pnlEl.innerText = data.session_pnl;
-            pnlEl.className = `text-xl font-bold mt-1 ${data.session_pnl_num >= 0 ? 'neon-green' : 'neon-red'}`;
-
-            const ddEl = document.getElementById('drawdown');
-            ddEl.innerText = data.max_drawdown;
-            ddEl.className = `text-xl font-bold mt-1 ${data.max_drawdown_num < 0 ? 'neon-red' : 'text-slate-200'}`;
+            updateValue('session-pnl', data.session_pnl, `text-2xl font-medium mt-2 ${data.session_pnl_num >= 0 ? 'text-glow-green' : 'text-glow-red'}`);
+            updateValue('drawdown', data.max_drawdown, `text-2xl font-medium mt-2 ${data.max_drawdown_num < 0 ? 'text-glow-red' : 'text-slate-200'}`);
 
             // Render Market Cards
             const marketContainer = document.getElementById('market-cards');
-            marketContainer.innerHTML = '';
+            let cardsHtml = '';
+            
             data.market.forEach(item => {
-                let actionColor = item.action.includes('Gestionando') ? 'text-sky-400' : item.action.includes('Comprar') ? 'neon-green' : 'text-yellow-400';
-                let bgStyle = item.has_position ? 'border-sky-500/50 bg-sky-900/20' : 'border-slate-700/50 bg-slate-800/30';
+                let actionBadge = '';
+                if (item.action.includes('Gestionando')) {
+                    actionBadge = '<span class="bg-sky-500/20 text-sky-400 border border-sky-500/30 px-2 py-1 rounded text-xs font-semibold tracking-wide">ACTIVA</span>';
+                } else if (item.action.includes('Comprar')) {
+                    actionBadge = '<span class="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-1 rounded text-xs font-semibold tracking-wide">COMPRAR</span>';
+                } else {
+                    actionBadge = '<span class="bg-slate-700/50 text-slate-400 border border-slate-600 px-2 py-1 rounded text-xs font-semibold tracking-wide">ESPERAR</span>';
+                }
+
+                let priceClass = item.has_position ? 'text-white' : 'text-slate-200';
                 
-                let html = `
-                    <div class="glass rounded-2xl p-5 border ${bgStyle} card-enter">
-                        <div class="flex justify-between items-start mb-3">
-                            <h3 class="text-2xl font-bold">${item.symbol}</h3>
-                            <span class="text-xs font-semibold px-2 py-1 rounded bg-slate-900/50 ${actionColor}">${item.action}</span>
-                        </div>
-                        <div class="text-3xl font-mono tracking-tight mb-1">${item.price}</div>
-                        <div class="text-sm ${item.change_num >= 0 ? 'neon-green' : 'neon-red'} mb-4">Cambio 24h: ${item.change}</div>
+                let mlColor = item.ml_conf.replace('%','') > 55 ? 'bg-emerald-400' : 'bg-sky-400';
+                let rsiNum = parseFloat(item.rsi);
+                let rsiColor = rsiNum > 70 ? 'bg-red-400' : (rsiNum < 30 ? 'bg-emerald-400' : 'bg-slate-400');
+                
+                cardsHtml += `
+                    <div class="glass-card rounded-3xl p-6 transition-all relative overflow-hidden" style="border-color: ${item.has_position ? 'rgba(14,165,233,0.3)' : ''}">
+                        ${item.has_position ? '<div class="absolute top-0 left-0 w-full h-1 bg-sky-500 shadow-[0_0_10px_rgba(14,165,233,0.8)]"></div>' : ''}
                         
-                        <div class="grid grid-cols-2 gap-y-3 gap-x-2 text-sm border-t border-slate-700/50 pt-4">
-                            <div class="text-slate-400">Confianza IA: <span class="text-slate-200 font-semibold float-right">${item.ml_conf}</span></div>
-                            <div class="text-slate-400">RSI: <span class="text-slate-200 font-semibold float-right">${item.rsi}</span></div>
-                            <div class="text-slate-400 col-span-2">Estado Mercado: <span class="text-slate-200 font-semibold float-right">${item.trend}</span></div>
+                        <div class="flex justify-between items-start mb-4">
+                            <h3 class="text-xl font-bold tracking-tight text-white">${item.symbol}</h3>
+                            ${actionBadge}
+                        </div>
+                        
+                        <div class="mb-6">
+                            <div class="text-3xl font-light tracking-tight ${priceClass} font-mono">${item.price}</div>
+                            <div class="text-sm font-medium mt-1 ${item.change_num >= 0 ? 'text-emerald-400' : 'text-red-400'}">
+                                ${item.change_num >= 0 ? '↗' : '↘'} ${item.change} <span class="text-slate-500 font-normal text-xs ml-1">24h</span>
+                            </div>
+                        </div>
+                        
+                        <div class="space-y-4 mb-2">
+                            <div>
+                                <div class="flex justify-between text-xs mb-1.5">
+                                    <span class="text-slate-400">Confianza IA</span>
+                                    <span class="text-white font-medium">${item.ml_conf}</span>
+                                </div>
+                                <div class="progress-bar-bg">
+                                    <div class="progress-bar-fill ${mlColor}" style="width: ${item.ml_conf}"></div>
+                                </div>
+                            </div>
+                            
+                            <div>
+                                <div class="flex justify-between text-xs mb-1.5">
+                                    <span class="text-slate-400">RSI (Fuerza)</span>
+                                    <span class="text-white font-medium">${item.rsi}</span>
+                                </div>
+                                <div class="progress-bar-bg">
+                                    <div class="progress-bar-fill ${rsiColor}" style="width: ${rsiNum}%"></div>
+                                </div>
+                            </div>
+                            
+                            <div class="flex justify-between text-xs pt-2">
+                                <span class="text-slate-400">Tendencia (HTF)</span>
+                                <span class="text-white font-medium">${item.trend}</span>
+                            </div>
                         </div>
                 `;
 
                 if (item.has_position) {
-                    let pnlColor = item.unrealized_pnl_num >= 0 ? 'neon-green' : 'neon-red';
-                    html += `
-                        <div class="mt-4 bg-slate-900/50 rounded-lg p-3 border border-slate-700">
-                            <div class="text-xs text-slate-400 mb-1">Operación activa</div>
-                            <div class="flex justify-between text-sm mb-1">
-                                <span class="text-sky-400 font-semibold">${item.position_str}</span>
-                                <span class="${pnlColor} font-bold font-mono">${item.unrealized_pnl_label}: ${item.unrealized_pnl}</span>
+                    let pnlColor = item.unrealized_pnl_num >= 0 ? 'text-glow-green' : 'text-glow-red';
+                    cardsHtml += `
+                        <div class="mt-5 bg-black/40 rounded-2xl p-4 border border-sky-500/20">
+                            <div class="text-[10px] uppercase tracking-widest text-sky-400/80 mb-2 font-semibold">Trade Activo</div>
+                            <div class="flex justify-between items-end">
+                                <div>
+                                    <div class="text-xs text-slate-400 mb-0.5">${item.position_str}</div>
+                                    <div class="text-xs text-slate-500">${item.unrealized_pnl_label}</div>
+                                </div>
+                                <div class="${pnlColor} font-bold text-lg font-mono tracking-tight">${item.unrealized_pnl}</div>
                             </div>
                         </div>
                     `;
                 }
 
-                html += `</div>`;
-                marketContainer.innerHTML += html;
+                cardsHtml += `</div>`;
             });
+            
+            marketContainer.innerHTML = cardsHtml;
 
             // Render Events
             const eventsContainer = document.getElementById('events-log');
             if (data.events.length > 0) {
-                eventsContainer.innerHTML = data.events.map(e => `<div class="border-b border-slate-800 pb-2 last:border-0">${e}</div>`).join('');
+                let eventsHtml = '';
+                data.events.forEach((e, i) => {
+                    eventsHtml += `
+                        <div class="flex items-start gap-4">
+                            <div class="mt-1">
+                                <div class="w-2 h-2 rounded-full ${i === 0 ? 'bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]' : 'bg-slate-600'}"></div>
+                                ${i !== data.events.length - 1 ? '<div class="w-[1px] h-full bg-white/5 mx-auto mt-1"></div>' : ''}
+                            </div>
+                            <div class="text-sm text-slate-300 pb-4">${e}</div>
+                        </div>
+                    `;
+                });
+                eventsContainer.innerHTML = eventsHtml;
             } else {
-                eventsContainer.innerHTML = '<div class="text-slate-500 italic">Sin eventos recientes...</div>';
+                eventsContainer.innerHTML = '<div class="text-slate-500 text-sm py-2">Sin eventos en la línea de tiempo.</div>';
             }
         }
 
-        // Init
         fetchState();
-        setInterval(fetchState, 1000); // Refresca cada 1 segundo
+        setInterval(fetchState, 1000);
     </script>
 </body>
 </html>
