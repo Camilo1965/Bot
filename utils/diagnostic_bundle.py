@@ -15,6 +15,8 @@ except ImportError:
 
 # Embedded markdown max size (chars) before truncate — evita .md imposible de pegar.
 _MAX_EMBED_CHARS = 3_500_000
+# bot_debug día completo (todos los niveles) puede ser grande — límite aparte.
+_MAX_EMBED_BOT_DEBUG = 4_500_000
 
 
 def _report_tz() -> ZoneInfo:
@@ -45,6 +47,23 @@ def _tail_text(path: Path, max_lines: int, max_bytes: int = 400_000) -> str:
     if len(lines) > max_lines:
         lines = lines[-max_lines:]
     return "\n".join(lines) + "\n"
+
+
+def _read_full_or_tail(
+    path: Path,
+    *,
+    whole_max_bytes: int,
+    tail_lines: int,
+    tail_max_bytes: int,
+) -> tuple[str, str]:
+    """Lee archivo completo si cabe; si no, cola. Devuelve (texto, nota corta)."""
+    if not path.is_file():
+        return f"(no existe: {path})\n", ""
+    sz = path.stat().st_size
+    if sz <= whole_max_bytes:
+        return path.read_text(encoding="utf-8", errors="replace"), "archivo completo"
+    note = f"cola (archivo ~{sz // 1024} KB > {whole_max_bytes // 1024} KB; últimas ~{tail_lines} líneas)"
+    return _tail_text(path, tail_lines, max_bytes=tail_max_bytes), note
 
 
 def _read_json(path: Path) -> dict | None:
@@ -185,14 +204,19 @@ def _jsonl_for_local_date(path: Path, target: date, tz: ZoneInfo) -> tuple[str, 
     return body, len(out), total
 
 
-def _filter_bot_debug_for_local_date(path: Path, target: date, tz: ZoneInfo) -> str:
-    """ERROR/WARNING JSON lines whose timestamp falls on *target* in *tz*."""
-    if not path.is_file():
-        return f"(no existe {path})\n"
+def _collect_bot_debug_for_day(
+    path: Path,
+    target: date,
+    tz: ZoneInfo,
+    *,
+    errors_only: bool,
+) -> tuple[str, dict[str, int], int]:
+    """Líneas JSON de bot_debug con ``timestamp`` en *target*; opcional solo ERROR/WARNING."""
+    counts: dict[str, int] = {}
     keep: list[str] = []
+    if not path.is_file():
+        return f"(no existe {path})\n", counts, 0
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if '"level": "ERROR"' not in raw and '"level": "WARNING"' not in raw:
-            continue
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
@@ -201,11 +225,15 @@ def _filter_bot_debug_for_local_date(path: Path, target: date, tz: ZoneInfo) -> 
         dt = _parse_iso_dt(str(ts) if ts else "")
         if dt is None:
             continue
-        if dt.astimezone(tz).date() == target:
-            keep.append(raw)
-    if not keep:
-        return "_Sin ERROR/WARNING ese día en bot_debug (formato JSON)._ \n"
-    return "\n".join(keep) + "\n"
+        if dt.astimezone(tz).date() != target:
+            continue
+        lvl = str(payload.get("level", "?"))
+        counts[lvl] = counts.get(lvl, 0) + 1
+        if errors_only and lvl not in ("ERROR", "WARNING"):
+            continue
+        keep.append(raw)
+    body = "\n".join(keep) + ("\n" if keep else "")
+    return body, counts, len(keep)
 
 
 def _sl_tp_timeline_from_jsonl_date(path: Path, target: date, tz: ZoneInfo) -> str:
@@ -255,6 +283,7 @@ def write_diagnostic_bundle(
     load_dotenv_file: bool = True,
     mode: str = "snapshot",
     report_date: date | None = None,
+    full_day_bot_debug_errors_only: bool = False,
 ) -> Path:
     """Write consolidated Markdown.
 
@@ -262,10 +291,12 @@ def write_diagnostic_bundle(
     ----------
     mode:
         ``snapshot`` — colas cortas (comportamiento anterior).
-        ``full_day`` — todo el ``runtime_metrics.jsonl`` del día local (`REPORT_TIMEZONE`)
-        + ERROR/WARNING de ``bot_debug`` de ese día.
+        ``full_day`` — todo el ``runtime_metrics.jsonl`` del día local (``REPORT_TIMEZONE``)
+        + ``bot_debug`` de ese día (por defecto **todos** los niveles JSON: INFO/DEBUG/WARNING/ERROR).
     report_date:
         Día a exportar en modo ``full_day`` (default: hoy en zona de informe).
+    full_day_bot_debug_errors_only:
+        Si True, en ``full_day`` solo incluye ERROR/WARNING en ``bot_debug`` (bundle más chico).
     """
     if load_dotenv_file and _load_dotenv is not None:
         _load_dotenv(repo_root / ".env")
@@ -295,8 +326,14 @@ def write_diagnostic_bundle(
     if mode == "full_day":
         parts.append(
             f"_**Día local** (`REPORT_TIMEZONE={tz.key}`): **{target_d.isoformat()}**_\n\n"
-            "Incluye **todas** las muestras `runtime_metrics.jsonl` de ese día y "
-            "ERROR/WARNING de `bot_debug` de ese día.\n\n"
+            "Incluye **todas** las muestras `runtime_metrics.jsonl` de ese día; "
+            "`bot_debug` con líneas JSON de ese día "
+            + (
+                "(solo ERROR/WARNING)."
+                if full_day_bot_debug_errors_only
+                else "(INFO/DEBUG/WARNING/ERROR según existan)."
+            )
+            + " `last_session`, `audit`, `trade_journal` ampliados; `state.json` si existe.\n\n"
         )
     else:
         parts.append(
@@ -311,12 +348,42 @@ def write_diagnostic_bundle(
     if mode == "full_day":
         metrics_day, n_day, n_tot = _jsonl_for_local_date(jsonl_path, target_d, tz)
         metrics_day, truncated = _truncate_notice(metrics_day, _MAX_EMBED_CHARS)
+        bd_path = repo_root / "bot_debug.log"
+        bd_body, bd_counts, bd_n = _collect_bot_debug_for_day(
+            bd_path, target_d, tz, errors_only=full_day_bot_debug_errors_only
+        )
+        bd_body, bd_trunc = _truncate_notice(bd_body, _MAX_EMBED_BOT_DEBUG)
+        bd_mode_lbl = (
+            "solo ERROR/WARNING" if full_day_bot_debug_errors_only else "todos los niveles"
+        )
+
         parts.append("## 1) Resumen día\n")
         parts.append(
             f"- Líneas totales en JSONL: **{n_tot}** | del día **{target_d}**: **{n_day}**\n"
         )
+        if n_tot == 0:
+            parts.append(
+                "- **Sin `runtime_metrics.jsonl` o vacío.** "
+                "Definí `RUNTIME_METRICS_INTERVAL_S` (>0) en `.env`, reiniciá el bot y dejalo correr ese día.\n"
+            )
+        elif n_day == 0:
+            parts.append(
+                "- **0 líneas JSONL para este día** (en `REPORT_TIMEZONE`). "
+                "Revisá `--date` y zona; si el bot no estuvo activo, es esperable.\n"
+            )
         if truncated:
             parts.append("- **Texto JSONL truncado** en este .md — ver archivo fuente.\n")
+        lvl_parts = ", ".join(f"{k}: **{v}**" for k, v in sorted(bd_counts.items()))
+        parts.append(
+            f"- `bot_debug.log` (JSON con `timestamp` ese día): **{bd_n}** líneas"
+            + (f" — niveles: {lvl_parts}" if lvl_parts else "")
+            + ".\n"
+        )
+        if bd_trunc:
+            parts.append(
+                "- **Texto embebido de `bot_debug` truncado** — abrí `bot_debug.log` local si necesitás el día completo.\n"
+            )
+        parts.append(f"- Modo inclusión bot_debug: **{bd_mode_lbl}**.\n")
         parts.append("\n")
         parts.append("## 2) Variables entorno (sin secretos)\n")
         parts.extend([x + "\n" for x in _sanitize_env_lines()])
@@ -332,24 +399,52 @@ def write_diagnostic_bundle(
         parts.append(_sl_tp_timeline_from_jsonl_date(jsonl_path, target_d, tz))
         parts.append(f"\n## 5) `runtime_metrics.jsonl` **completo del día** ({target_d})\n")
         parts.append("```text\n" + metrics_day + "```\n")
-        parts.append(
-            f"\n## 6) ERROR / WARNING `bot_debug.log` del día ({target_d})\n"
+        parts.append(f"\n## 6) `bot_debug.log` — día {target_d} ({bd_mode_lbl})\n")
+        parts.append("```text\n" + bd_body + "```\n")
+
+        ls_text, ls_note = _read_full_or_tail(
+            logs_dir / "last_session.log",
+            whole_max_bytes=5_000_000,
+            tail_lines=8000,
+            tail_max_bytes=4_000_000,
         )
-        parts.append(
-            "```text\n"
-            + _filter_bot_debug_for_local_date(repo_root / "bot_debug.log", target_d, tz)
-            + "```\n"
+        parts.append(f"\n## 7) `logs/last_session.log` ({ls_note or 'contenido'})\n")
+        parts.append("```text\n" + ls_text + "```\n")
+
+        au_text, au_note = _read_full_or_tail(
+            repo_root / "audit.log",
+            whole_max_bytes=10_000_000,
+            tail_lines=15000,
+            tail_max_bytes=6_000_000,
         )
-        parts.append("\n## 7) `logs/last_session.log` (sesión actual, últimas 400 líneas)\n")
-        parts.append("```text\n" + _tail_text(logs_dir / "last_session.log", 400, max_bytes=800_000) + "```\n")
-        parts.append("\n## 8) `audit.log` (últimas 2000 líneas)\n")
-        parts.append("```text\n" + _tail_text(repo_root / "audit.log", 2000, max_bytes=2_000_000) + "```\n")
-        parts.append("\n## 9) `logs/trade_journal.csv` (completo si <200KB, si no cola)\n")
+        parts.append(f"\n## 8) `audit.log` ({au_note or 'contenido'})\n")
+        parts.append("```text\n" + au_text + "```\n")
+
         jpath = logs_dir / "trade_journal.csv"
-        if jpath.is_file() and jpath.stat().st_size < 200_000:
-            parts.append("```text\n" + jpath.read_text(encoding="utf-8", errors="replace") + "```\n")
-        else:
-            parts.append("```text\n" + _tail_text(jpath, 400, max_bytes=400_000) + "```\n")
+        tj_text, tj_note = _read_full_or_tail(
+            jpath,
+            whole_max_bytes=1_000_000,
+            tail_lines=4000,
+            tail_max_bytes=800_000,
+        )
+        parts.append(f"\n## 9) `logs/trade_journal.csv` ({tj_note or 'contenido'})\n")
+        parts.append("```text\n" + tj_text + "```\n")
+
+        st_path = repo_root / "state.json"
+        if st_path.is_file():
+            st_text, st_note = _read_full_or_tail(
+                st_path,
+                whole_max_bytes=500_000,
+                tail_lines=200,
+                tail_max_bytes=200_000,
+            )
+            parts.append(f"\n## 10) `state.json` ({st_note or 'contenido'})\n")
+            parts.append("```text\n" + st_text + "```\n")
+
+        rot = repo_root / "bot_debug.log.1"
+        if rot.is_file():
+            parts.append("\n## 11) `bot_debug.log.1` (rotación; últimas 300 líneas)\n")
+            parts.append("```text\n" + _tail_text(rot, 300, max_bytes=600_000) + "```\n")
     else:
         metrics_tail, mstats = _parse_runtime_jsonl(jsonl_path, max_lines=250)
 

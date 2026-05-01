@@ -6,7 +6,7 @@ Snapshot (rápido, colas)::
 
     .venv312\\Scripts\\python scripts\\export_diagnostic_bundle.py
 
-Día completo — todo el JSONL de ese día local + errores del día (REPORT_TIMEZONE)::
+Día completo — JSONL del día + ``bot_debug`` (INFO/DEBUG/WARNING/ERROR) + last_session/audit/journal ampliados::
 
     .venv312\\Scripts\\python scripts\\export_diagnostic_bundle.py --full-day
 
@@ -44,7 +44,12 @@ def main() -> None:
     ap.add_argument(
         "--full-day",
         action="store_true",
-        help="Incluir todo runtime_metrics.jsonl del día + ERROR/WARNING bot_debug de ese día",
+        help="JSONL del día + bot_debug (todos niveles JSON por defecto) + logs ampliados",
+    )
+    ap.add_argument(
+        "--bot-debug-errors-only",
+        action="store_true",
+        help="Con --full-day: solo ERROR/WARNING en bot_debug (bundle más chico)",
     )
     ap.add_argument(
         "--date",
@@ -71,6 +76,7 @@ def main() -> None:
             load_dotenv_file=True,
             mode=mode,
             report_date=report_date,
+            full_day_bot_debug_errors_only=args.bot_debug_errors_only,
         )
         print(f"OK -> {out.resolve()} ({out.stat().st_size // 1024} KB approx)")
     except OSError as exc:
