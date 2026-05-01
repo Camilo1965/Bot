@@ -70,6 +70,7 @@ from bot.constants import (
     NEWS_FILTER_VOLATILITY_THRESHOLD as _NEWS_FILTER_VOLATILITY_THRESHOLD,
 )
 from bot.dashboard import generate_dashboard
+from bot.web_server import start_web_dashboard
 from bot.loops import (
     close_pending_reconciler_loop,
     dashboard_logger,
@@ -753,6 +754,7 @@ async def main() -> None:
         health_monitor_loop(shared_state, market_queue, paper_executor, interval=30),
         close_pending_reconciler_loop(shared_state, paper_executor, interval=20),
         telegram_command_poller(shared_state, paper_executor, risk_manager, interval=5),
+        start_web_dashboard(shared_state, paper_executor, risk_manager, WATCHLIST, port=8080),
     ]
     if _GEMINI_ENABLED:
         run_tasks.append(gemini_sentiment_refresher(shared_state))
