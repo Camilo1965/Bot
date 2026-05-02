@@ -22,7 +22,7 @@ MetaTrader5 Python package and `PyQt6`/`pyqtgraph` are **Windows-only**. On Linu
 python3 -m pytest tests/ -q --tb=short --ignore=tests/manual_order_test.py
 ```
 
-`tests/manual_order_test.py` imports `MetaTrader5` (Windows-only) — always exclude on Linux. One pre-existing test failure (`test_generate_signal_buy_muted_when_1h_not_bullish`) exists in the repo.
+`tests/manual_order_test.py` imports `MetaTrader5` (Windows-only) — always exclude on Linux (CI uses `--ignore`).
 
 ### Running the app
 

@@ -641,9 +641,9 @@ class MLPredictor:
                          ``"neutral"``).  Only a ``"bearish"`` value mutes a BUY
                          signal to HOLD ("General" filter); ``"neutral"`` is
                          permitted alongside ``"bullish"``.
-        htf_trend_1h:    1-hour trend status (same values).  A ``"bearish"``
-                         value mutes BUY to HOLD; ``"neutral"`` and
-                         ``"bullish"`` both permit BUY to proceed.
+        htf_trend_1h:    1-hour trend status (same values).  BUY requires
+                         ``"bullish"`` ("Colonel" filter); ``"bearish"`` or
+                         ``"neutral"`` mutes BUY to HOLD.
         Returns
         -------
         ``"BUY"``, ``"SELL"``, or ``"HOLD"`` with the following logic:
@@ -655,7 +655,7 @@ class MLPredictor:
 
         HTF Filter ("General" + "Colonel"):
           * 4H trend bearish                           → BUY → HOLD
-          * 1H trend bearish                           → BUY → HOLD
+          * 1H trend not bullish                     → BUY → HOLD
 
         Market Regime override (ADX-based):
           * ADX > 25 (trending): BUY only when RSI > 50 AND momentum > 0;
@@ -744,10 +744,15 @@ class MLPredictor:
             elite_factors.append(
                 f"[MTA] General filter: 4H trend is bearish – BUY muted to HOLD"
             )
-        elif signal == "BUY" and htf_trend_1h == HTF_TREND_BEARISH:
+        elif signal == "BUY" and htf_trend_1h != HTF_TREND_BULLISH:
             signal = "HOLD"
+            _1h_desc = (
+                "bearish"
+                if htf_trend_1h == HTF_TREND_BEARISH
+                else "neutral"
+            )
             elite_factors.append(
-                f"[MTA] Colonel filter: 1H trend is bearish – BUY muted to HOLD"
+                f"[MTA] Colonel filter: 1H trend is {_1h_desc} – BUY muted to HOLD"
             )
 
         # ── Logging ───────────────────────────────────────────────────────
