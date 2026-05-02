@@ -550,6 +550,8 @@ class MT5Executor(PaperExecutor):
         self._mt5_tp_trace_at: dict[str, float] = {}
         # Same SL source → same clamp every tick would spam WARNING; throttle per MT5 symbol.
         self._sl_widen_last_warn_mono: dict[str, float] = {}
+        # 10016 on SLTP is often quote vs clamp edge — throttle; avoid ERROR every tick.
+        self._sltp_10016_last_mono: dict[str, float] = {}
 
     def _tp_sync_trace(self, sym: str, reason: str, message: str) -> None:
         """Why TP/SLTP sync skipped or changed; throttled per (sym,reason).
@@ -569,6 +571,33 @@ class MT5Executor(PaperExecutor):
                 return
             self._mt5_tp_trace_at[key] = now
         logger.info("[MT5 TP sync] %s | %s | %s", sym, reason, message)
+
+    def _log_sltp_10016_throttled(self, mt5_sym: str | None) -> None:
+        """INVALID_STOPS on position modify — expected at broker edge; do not log as ERROR each tick."""
+        try:
+            interval = float(
+                os.environ.get("MT5_SLTP_10016_LOG_INTERVAL_S", "90").strip() or "90"
+            )
+        except ValueError:
+            interval = 90.0
+        key = mt5_sym or "?"
+        now_m = time.monotonic()
+        if interval > 0:
+            last = self._sltp_10016_last_mono.get(key, 0.0)
+            if (now_m - last) < interval:
+                logger.debug(
+                    "[MT5 RETCODE 10016] INVALID_STOPS SL/TP %s (suppressed, %.0fs throttle)",
+                    key,
+                    interval,
+                )
+                return
+            self._sltp_10016_last_mono[key] = now_m
+        logger.warning(
+            "[MT5] SL/TP modify rejected — 10016 INVALID_STOPS (%s). "
+            "Quote vs min distance/freeze; next sync re-clamps. "
+            "If often: raise MT5_STOPS_BUFFER_POINTS.",
+            key,
+        )
 
     # ------------------------------------------------------------------
     # Spread helper
@@ -1235,13 +1264,19 @@ class MT5Executor(PaperExecutor):
                     await asyncio.sleep(0.5 * attempt)
                 continue
 
-            _log_mt5_retcode(
-                result.retcode,
-                context=(
-                    f"attempt {attempt}/{max_retries}  symbol={request.get('symbol')}  "
-                    f"failure_count={self._mt5_failure_count}"
-                ),
+            sltp_10016 = (
+                result.retcode == 10016
+                and request.get("action") == mt5.TRADE_ACTION_SLTP
             )
+            # Do not ERROR-log expected SLTP edge rejects; _log_sltp_10016_throttled handles it.
+            if not sltp_10016:
+                _log_mt5_retcode(
+                    result.retcode,
+                    context=(
+                        f"attempt {attempt}/{max_retries}  symbol={request.get('symbol')}  "
+                        f"failure_count={self._mt5_failure_count}"
+                    ),
+                )
 
             if result.retcode in _MT5_SOFT_SESSION_RETCODES:
                 return None
@@ -1278,15 +1313,8 @@ class MT5Executor(PaperExecutor):
 
             # SLTP + 10016: retrying the *same* request dict never fixes INVALID_STOPS —
             # quote moved vs clamp; next _sync_exchange_stops tick rebuilds levels.
-            if (
-                result.retcode == 10016
-                and request.get("action") == mt5.TRADE_ACTION_SLTP
-            ):
-                logger.warning(
-                    "[MT5] INVALID_STOPS on SL/TP %s — not retrying identical request; "
-                    "next sync re-clamps (raise MT5_STOPS_BUFFER_POINTS if this spams).",
-                    request.get("symbol"),
-                )
+            if sltp_10016:
+                self._log_sltp_10016_throttled(request.get("symbol"))
                 return None
 
             if result.retcode in _RETRYABLE_RETCODES and attempt < max_retries:
