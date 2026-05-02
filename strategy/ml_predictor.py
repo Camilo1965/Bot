@@ -638,12 +638,11 @@ class MLPredictor:
         funding_rate:    Current perpetual-futures funding rate as a decimal
                          (e.g. 0.0001 = 0.01 % per 8-hour window).
         htf_trend_4h:    4-hour trend status (``"bullish"``, ``"bearish"``, or
-                         ``"neutral"``).  Only a ``"bearish"`` value mutes a BUY
-                         signal to HOLD ("General" filter); ``"neutral"`` is
-                         permitted alongside ``"bullish"``.
-        htf_trend_1h:    1-hour trend status (same values).  A ``"bearish"``
-                         value mutes BUY to HOLD; ``"neutral"`` and
-                         ``"bullish"`` both permit BUY to proceed.
+                         ``"neutral"``).  BUY requires ``"bullish"``; any other
+                         value mutes BUY to HOLD ("General" filter).
+        htf_trend_1h:    1-hour trend status (same values).  BUY requires
+                         ``"bullish"``; any other value mutes BUY to HOLD
+                         ("Colonel" filter).
         Returns
         -------
         ``"BUY"``, ``"SELL"``, or ``"HOLD"`` with the following logic:
@@ -654,8 +653,8 @@ class MLPredictor:
           * otherwise                                  → HOLD
 
         HTF Filter ("General" + "Colonel"):
-          * 4H trend bearish                           → BUY → HOLD
-          * 1H trend bearish                           → BUY → HOLD
+          * 4H trend not bullish                       → BUY → HOLD
+          * 1H trend not bullish                       → BUY → HOLD
 
         Market Regime override (ADX-based):
           * ADX > 25 (trending): BUY only when RSI > 50 AND momentum > 0;
@@ -739,15 +738,17 @@ class MLPredictor:
             )
 
         # ── HTF Trend Filter ("General" 4H + "Colonel" 1H) ───────────────
-        if signal == "BUY" and htf_trend_4h == HTF_TREND_BEARISH:
+        # BUY requires BULLISH confirmation on both 4H and 1H timeframes.
+        # Neutral or bearish on either → BUY muted to HOLD.
+        if signal == "BUY" and htf_trend_4h != HTF_TREND_BULLISH:
             signal = "HOLD"
             elite_factors.append(
-                f"[MTA] General filter: 4H trend is bearish – BUY muted to HOLD"
+                f"[MTA] General filter: 4H trend is {htf_trend_4h} (not bullish) – BUY muted to HOLD"
             )
-        elif signal == "BUY" and htf_trend_1h == HTF_TREND_BEARISH:
+        elif signal == "BUY" and htf_trend_1h != HTF_TREND_BULLISH:
             signal = "HOLD"
             elite_factors.append(
-                f"[MTA] Colonel filter: 1H trend is bearish – BUY muted to HOLD"
+                f"[MTA] Colonel filter: 1H trend is {htf_trend_1h} (not bullish) – BUY muted to HOLD"
             )
 
         # ── Logging ───────────────────────────────────────────────────────
