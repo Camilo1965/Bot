@@ -1261,6 +1261,11 @@ class PaperExecutor:
         if pnl < 0.0:
             self._risk.record_daily_loss(-pnl)
         self.total_pnl += pnl
+        from bot import state as _dash_state
+        if pnl >= 0:
+            _dash_state.session_wins += 1
+        else:
+            _dash_state.session_losses += 1
         del self.open_positions[symbol]
 
         # ── Trade journal CSV (SELL row) ───────────────────────────────────

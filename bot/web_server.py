@@ -99,6 +99,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-1">Estado Bot</div>
                     <div class="text-lg font-bold" id="bot-status">--</div>
                 </div>
+                <div class="bg-black/20 p-4 rounded-2xl border border-white/5 flex-1 md:w-40">
+                    <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-1">Posiciones</div>
+                    <div class="text-lg font-bold text-sky-400" id="pos-count">--</div>
+                </div>
             </div>
         </header>
 
@@ -125,6 +129,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <div class="text-sm text-slate-400 mb-1">Peor Caída Sesión</div>
                     <div class="text-2xl font-medium mt-2" id="drawdown">--</div>
                 </div>
+            </div>
+        </div>
+
+        <!-- Session Performance -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div class="glass-card rounded-2xl p-5 text-center">
+                <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-2">Win / Loss</div>
+                <div class="text-2xl font-bold"><span class="text-emerald-400" id="s-wins">0</span><span class="text-slate-600"> / </span><span class="text-red-400" id="s-losses">0</span></div>
+            </div>
+            <div class="glass-card rounded-2xl p-5 text-center">
+                <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-2">Winrate Sesión</div>
+                <div class="text-2xl font-bold text-slate-100" id="s-winrate">--%</div>
+            </div>
+            <div class="glass-card rounded-2xl p-5 text-center">
+                <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-2">Latencia API</div>
+                <div class="text-2xl font-bold text-sky-400" id="api-latency">--</div>
+            </div>
+            <div class="glass-card rounded-2xl p-5 text-center">
+                <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-2">Sentimiento IA</div>
+                <div class="text-2xl font-bold" id="sent-num">--</div>
+                <div class="progress-bar-bg mt-2"><div class="progress-bar-fill bg-sky-400" id="sent-bar" style="width:50%"></div></div>
             </div>
         </div>
 
@@ -269,7 +294,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('sentiment-detail').innerText = data.sentiment_detail;
 
             const botStatusEl = document.getElementById('bot-status');
-            botStatusEl.innerHTML = data.global_hold ? '<span class="text-glow-red">En pausa</span>' : '<span class="text-glow-green">Operando</span>';
+            if (data.global_hold) {
+                botStatusEl.innerHTML = '<span class="text-glow-red">⛔ Pausa</span>';
+            } else if (data.open_count > 0) {
+                botStatusEl.innerHTML = '<span class="text-sky-400">⚡ Operando</span>';
+            } else {
+                botStatusEl.innerHTML = '<span class="text-glow-green">✅ Listo</span>';
+            }
+
+            updateValue('pos-count', `${data.open_count || 0}/${data.max_positions || 3}`);
+            updateValue('s-wins', data.session_wins || 0);
+            updateValue('s-losses', data.session_losses || 0);
+            updateValue('s-winrate', data.session_winrate || '--%');
+
+            const sentNum = data.sentiment_num || 0;
+            const sentEl2 = document.getElementById('sent-num');
+            if (sentEl2) {
+                sentEl2.innerText = sentNum.toFixed(4);
+                sentEl2.className = `text-2xl font-bold ${sentNum >= 0.55 ? 'text-glow-green' : sentNum >= 0.35 ? 'text-yellow-400' : 'text-glow-red'}`;
+            }
+            const sentBar = document.getElementById('sent-bar');
+            if (sentBar) sentBar.style.width = `${Math.max(0, Math.min(100, (sentNum + 1) / 2 * 100))}%`;
 
             updateValue('balance', data.balance);
             updateValue('margin', data.available_margin);
@@ -726,10 +771,15 @@ async def start_web_dashboard(
             })
 
         # Events
-        events = list(dash_state.dashboard_events)[-3:]
-        # Strip rich tags like [dim], [red], etc for HTML
+        events = list(dash_state.dashboard_events)[-6:]
         import re
         clean_events = [re.sub(r'\[.*?\]', '', e) for e in events]
+
+        # Session win/loss stats
+        wins = dash_state.session_wins
+        losses = dash_state.session_losses
+        total_trades_session = wins + losses
+        winrate_session = (wins / total_trades_session * 100) if total_trades_session > 0 else 0.0
 
         ceo = await build_ceo_snapshot()
         resp = {
@@ -745,6 +795,11 @@ async def start_web_dashboard(
             "session_pnl_num": paper_executor.total_pnl,
             "max_drawdown": f"{state.get('max_drawdown', 0.0):+.2f}",
             "max_drawdown_num": state.get("max_drawdown", 0.0),
+            "open_count": len(paper_executor.open_positions),
+            "max_positions": risk_manager.max_positions,
+            "session_wins": wins,
+            "session_losses": losses,
+            "session_winrate": f"{winrate_session:.0f}%",
             "market": market_data,
             "events": clean_events,
             "ceo": ceo,
