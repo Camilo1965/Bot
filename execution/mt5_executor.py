@@ -546,6 +546,27 @@ class MT5Executor(PaperExecutor):
         self._mt5_max_consecutive_failures: int = 10
         self._mt5_cooldown_seconds: float = 300.0  # 5 minutes
         self._mt5_last_circuit_log_mono: float = 0.0
+        # Throttle visibility logs for why TP was / wasn't pushed to MT5.
+        self._mt5_tp_trace_at: dict[str, float] = {}
+
+    def _tp_sync_trace(self, sym: str, reason: str, message: str) -> None:
+        """Why TP/SLTP sync skipped or changed; throttled per (sym,reason).
+
+        INFO → console + ``logs/last_session.log`` + ``bot_debug.log``.
+        Interval ``MT5_TP_TRACE_INTERVAL_S`` (default 45; ``0`` = every call, very noisy).
+        """
+        try:
+            interval = float(os.environ.get("MT5_TP_TRACE_INTERVAL_S", "45").strip() or "45")
+        except ValueError:
+            interval = 45.0
+        key = f"{sym}|{reason}"
+        now = time.monotonic()
+        if interval > 0:
+            last = self._mt5_tp_trace_at.get(key, 0.0)
+            if (now - last) < interval:
+                return
+            self._mt5_tp_trace_at[key] = now
+        logger.info("[MT5 TP sync] %s | %s | %s", sym, reason, message)
 
     # ------------------------------------------------------------------
     # Spread helper
@@ -2235,17 +2256,48 @@ class MT5Executor(PaperExecutor):
         send_tp = cur_tp_br
         if cand_tp is not None:
             cn = self._normalize_price(cand_tp, digits)
-            if cn > ask + min_step and self._validate_stops(
+            need = ask + min_step
+            if cn > need and self._validate_stops(
                 mt5_sym, ask, send_sl, cn, is_buy=True, tick=tick
             ):
                 send_tp = max(cur_tp_br, cn)
+            else:
+                if cn <= need:
+                    self._tp_sync_trace(
+                        sym,
+                        "TP_TOO_CLOSE_TO_ASK",
+                        f"cand_tp={cn:.5f} need > {need:.5f} (ask={ask:.5f} min_step={min_step:.5f})",
+                    )
+                else:
+                    self._tp_sync_trace(
+                        sym,
+                        "TP_FAIL_BROKER_RULES",
+                        f"cand_tp={cn:.5f} sl={send_sl:.5f} check logs for [MT5 VALIDATION]",
+                    )
+        else:
+            self._tp_sync_trace(
+                sym,
+                "NO_TP_HINT",
+                f"peak={pos.peak_price:.5f} entry={pos.entry_price:.5f} (need peak > entry for dynamic TP)",
+            )
 
         if not self._validate_stops(mt5_sym, ask, send_sl, 0.0, is_buy=True, tick=tick):
+            self._tp_sync_trace(
+                sym,
+                "SL_SYNC_VALIDATE_FAIL",
+                f"send_sl={send_sl:.5f} ask={ask:.5f} bid={bid:.5f}",
+            )
             return
 
         sl_delta = abs(send_sl - cur_sl_br)
         tp_delta = abs(send_tp - cur_tp_br) if send_tp > 0.0 or cur_tp_br > 0.0 else 0.0
-        if sl_delta < min_step * 0.35 and tp_delta < min_step * 0.35:
+        thr = min_step * 0.35
+        if sl_delta < thr and tp_delta < thr:
+            self._tp_sync_trace(
+                sym,
+                "SKIP_NO_CHANGE",
+                f"sl_delta={sl_delta:.6f} tp_delta={tp_delta:.6f} thr={thr:.6f} broker_sl={cur_sl_br:.5f} broker_tp={cur_tp_br:.5f} target_tp={send_tp:.5f}",
+            )
             return
 
         ok = await self.modify_position(
@@ -2254,6 +2306,12 @@ class MT5Executor(PaperExecutor):
             new_tp=send_tp if send_tp > 0.0 else 0.0,
             symbol=sym,
         )
+        if not ok:
+            self._tp_sync_trace(
+                sym,
+                "MODIFY_REJECTED",
+                f"wanted sl={send_sl:.5f} tp={send_tp:.5f} (see MT5 RETCODE lines above)",
+            )
         if ok:
             pos.last_broker_sl_synced = send_sl
             pos.last_broker_tp_synced = send_tp
