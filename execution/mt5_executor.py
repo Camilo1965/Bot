@@ -1259,6 +1259,19 @@ class MT5Executor(PaperExecutor):
                     )
                 return result
 
+            # SLTP + 10016: retrying the *same* request dict never fixes INVALID_STOPS —
+            # quote moved vs clamp; next _sync_exchange_stops tick rebuilds levels.
+            if (
+                result.retcode == 10016
+                and request.get("action") == mt5.TRADE_ACTION_SLTP
+            ):
+                logger.warning(
+                    "[MT5] INVALID_STOPS on SL/TP %s — not retrying identical request; "
+                    "next sync re-clamps (raise MT5_STOPS_BUFFER_POINTS if this spams).",
+                    request.get("symbol"),
+                )
+                return None
+
             if result.retcode in _RETRYABLE_RETCODES and attempt < max_retries:
                 self._mt5_failure_count += 1
                 self._mt5_last_failure_time = time.time()
@@ -1271,21 +1284,6 @@ class MT5Executor(PaperExecutor):
                     max_retries,
                     self._mt5_failure_count,
                     back_off,
-                )
-                await asyncio.sleep(back_off)
-            elif (
-                result.retcode == 10016
-                and request.get("action") == mt5.TRADE_ACTION_SLTP
-                and attempt < max_retries
-            ):
-                # Marginal SL vs live quote — same clamp often succeeds on retry.
-                back_off = 0.35 * attempt
-                logger.warning(
-                    "[MT5] INVALID_STOPS on SL/TP modify %s — retry in %.2f s (%d/%d)",
-                    request.get("symbol"),
-                    back_off,
-                    attempt,
-                    max_retries,
                 )
                 await asyncio.sleep(back_off)
             else:
