@@ -548,6 +548,8 @@ class MT5Executor(PaperExecutor):
         self._mt5_last_circuit_log_mono: float = 0.0
         # Throttle visibility logs for why TP was / wasn't pushed to MT5.
         self._mt5_tp_trace_at: dict[str, float] = {}
+        # Same SL source → same clamp every tick would spam WARNING; throttle per MT5 symbol.
+        self._sl_widen_last_warn_mono: dict[str, float] = {}
 
     def _tp_sync_trace(self, sym: str, reason: str, message: str) -> None:
         """Why TP/SLTP sync skipped or changed; throttled per (sym,reason).
@@ -851,15 +853,30 @@ class MT5Executor(PaperExecutor):
             if self._validate_stops(mt5_sym, ask_f, sl_adj, 0.0, is_buy=True, tick=tick):
                 adjusted = abs(sl_adj - self._normalize_price(original, digits)) > point * 0.01
                 if adjusted:
-                    logger.warning(
+                    try:
+                        widen_iv = float(
+                            os.environ.get("MT5_SL_WIDEN_LOG_INTERVAL_S", "120").strip()
+                            or "120"
+                        )
+                    except ValueError:
+                        widen_iv = 120.0
+                    now_m = time.monotonic()
+                    last_m = self._sl_widen_last_warn_mono.get(mt5_sym, 0.0)
+                    msg = (
                         "[MT5] SL widened to broker minimum for %s: %.5f → %.5f "
-                        "(stops_level=%d + buffer=%.1f pts)",
+                        "(stops_level=%d + buffer=%.1f pts)"
+                    ) % (
                         mt5_sym,
                         original,
                         sl_adj,
                         stops_level,
                         buffer_pts,
                     )
+                    if widen_iv <= 0 or (now_m - last_m) >= widen_iv:
+                        self._sl_widen_last_warn_mono[mt5_sym] = now_m
+                        logger.warning(msg)
+                    else:
+                        logger.debug(msg)
                 return sl_adj, adjusted
             sl_adj = self._normalize_price(sl_adj - point, digits)
             if sl_adj <= 0 or sl_adj >= bid:
