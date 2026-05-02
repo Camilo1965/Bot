@@ -721,29 +721,24 @@ class PaperExecutor:
                 return False
 
             ts = timestamp or datetime.now(tz=timezone.utc)
-            # self._risk.deduct(position_size)  <-- Removed to avoid Circuit Breaker false positives
             self._risk.register_open()
 
-        # ── Compute dynamic risk thresholds from sentiment ─────────────────
-        thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
-        logger.debug(
-            "DYNAMIC THRESHOLDS  symbol=%s  sentiment=%.4f  multiplier=%.2f  "
-            "sl=%.4f  activation=%.4f  trailing_dist=%.4f",
-            sym,
-            sentiment_score,
-            thresholds.multiplier,
-            thresholds.sl_pct,
-            thresholds.activation_pct,
-            thresholds.trailing_distance_pct,
-        )
+            # ── Compute dynamic risk thresholds from sentiment ─────────────
+            thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
+            logger.debug(
+                "DYNAMIC THRESHOLDS  symbol=%s  sentiment=%.4f  multiplier=%.2f  "
+                "sl=%.4f  activation=%.4f  trailing_dist=%.4f",
+                sym,
+                sentiment_score,
+                thresholds.multiplier,
+                thresholds.sl_pct,
+                thresholds.activation_pct,
+                thresholds.trailing_distance_pct,
+            )
 
         # ── Live Binance Futures order ─────────────────────────────────────
         if self._exchange is not None:
             try:
-                # Set leverage at the symbol level (required by Binance Futures).
-                # On Testnet this call may fail with NotSupported because there
-                # is no sapi URL for the sandbox; in that case log a warning and
-                # proceed with the order using whatever leverage is already set.
                 try:
                     await self._exchange.set_leverage(LEVERAGE, sym)
                 except CcxtNotSupported:
@@ -752,8 +747,6 @@ class PaperExecutor:
                         "proceeding with existing leverage setting.",
                         sym,
                     )
-                # position_size is the leveraged notional value; convert to base
-                # currency quantity by dividing by the entry price.
                 amount = position_size / entry_price
                 try:
                     await self._exchange.create_market_buy_order(
@@ -762,9 +755,6 @@ class PaperExecutor:
                         params={"leverage": LEVERAGE},
                     )
                 except CcxtNotSupported:
-                    # Testnet sapi endpoints are not available; the fapi order
-                    # may still have been routed correctly.  Log a warning and
-                    # continue rather than treating this as a hard failure.
                     logger.warning(
                         "create_market_buy_order raised NotSupported for %s "
                         "(testnet sapi metadata unavailable). "
@@ -786,43 +776,48 @@ class PaperExecutor:
                     "rolling back balance deduction and aborting trade.",
                     sym,
                 )
-                # Roll back the balance deduction and open-position counter that
-                # were applied before the order attempt.  No paper position should
-                # be recorded because no real order was submitted successfully.
-                self._risk.credit(position_size)
-                self._risk.register_close()
+                async with self._positions_lock:
+                    self._risk.credit(position_size)
+                    self._risk.register_close()
                 return False
 
-        trade_id = await self._db.insert_open_trade(
-            symbol=sym,
-            entry_price=entry_price,
-            position_size=position_size,
-            entry_time=ts,
-        )
+        try:
+            trade_id = await self._db.insert_open_trade(
+                symbol=sym,
+                entry_price=entry_price,
+                position_size=position_size,
+                entry_time=ts,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[DB] insert_open_trade failed for %s — rolling back: %s", sym, exc)
+            async with self._positions_lock:
+                self._risk.register_close()
+            return False
 
         # ── ATR-based dynamic SL / trailing distance ───────────────────────
         sl_distance: float | None = None
-        stop_loss_price: float = 0.0  # 0.0 → __post_init__ derives from sl_pct
-        atr_trailing_distance: float = 0.0  # 0.0 → use pct-based trailing
+        stop_loss_price: float = 0.0
+        atr_trailing_distance: float = 0.0
         if current_atr is not None and current_atr > 0.0:
             sl_distance = current_atr * ATR_SL_MULTIPLIER
-            stop_loss_price = entry_price - sl_distance  # LONG position
+            stop_loss_price = entry_price - sl_distance
             atr_trailing_distance = current_atr * ATR_TRAILING_MULTIPLIER
 
-        self.open_positions[sym] = OpenPosition(
-            symbol=sym,
-            entry_price=entry_price,
-            position_size=position_size,
-            entry_time=ts,
-            trade_id=trade_id,
-            sl_pct=thresholds.sl_pct,
-            activation_pct=thresholds.activation_pct,
-            trailing_distance_pct=thresholds.trailing_distance_pct,
-            stop_loss_price=stop_loss_price,
-            atr_trailing_distance=atr_trailing_distance,
-            ml_confidence=win_probability,
-            sentiment_score=sentiment_score,
-        )
+        async with self._positions_lock:
+            self.open_positions[sym] = OpenPosition(
+                symbol=sym,
+                entry_price=entry_price,
+                position_size=position_size,
+                entry_time=ts,
+                trade_id=trade_id,
+                sl_pct=thresholds.sl_pct,
+                activation_pct=thresholds.activation_pct,
+                trailing_distance_pct=thresholds.trailing_distance_pct,
+                stop_loss_price=stop_loss_price,
+                atr_trailing_distance=atr_trailing_distance,
+                ml_confidence=win_probability,
+                sentiment_score=sentiment_score,
+            )
         # ── Trade journal CSV (BUY row) ────────────────────────────────────
         record_trade(
             timestamp=ts,
@@ -1249,6 +1244,7 @@ class PaperExecutor:
                     pnl=pnl,
                     pnl_net=net_pnl,
                     fee=total_fees,
+                    exit_reason=exit_reason_code,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -1358,6 +1354,16 @@ class PaperExecutor:
                     len(self.open_positions),
                     len(live_symbols),
                 )
+
+            # Enforce counter invariant after sync
+            actual = len(self.open_positions)
+            if self._risk.open_count != actual:
+                logger.warning(
+                    "[SYNC] Counter drift detected: risk.open_count=%d actual=%d — correcting.",
+                    self._risk.open_count,
+                    actual,
+                )
+                self._risk.sync_open_count(actual)
 
         return len(live_symbols)
 

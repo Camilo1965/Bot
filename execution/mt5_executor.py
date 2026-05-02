@@ -1376,52 +1376,6 @@ class MT5Executor(PaperExecutor):
         """
         sym = symbol or self.symbol
 
-        # ── Duplicate and circuit-breaker checks (inherited logic) ─────────
-        if self._risk.is_trading_halted():
-            logger.warning(
-                "⚠️ [ALERT] Trading halted due to daily loss limit (symbol=%s).",
-                sym,
-            )
-            return False
-
-        if self._risk.is_portfolio_dd_exceeded():
-            logger.warning(
-                "🚨 [CIRCUIT BREAKER] All new positions blocked – "
-                "portfolio drawdown limit reached (symbol=%s).",
-                sym,
-            )
-            return False
-
-        if sym in self.open_positions:
-            logger.debug("Trade skipped – a position for %s is already open.", sym)
-            return False
-
-        if not self._risk.can_open_position():
-            logger.debug(
-                "Trade skipped – max open positions (%d) reached.",
-                self._risk.max_positions,
-            )
-            return False
-
-        if self._risk.is_sector_exposed(sym, list(self.open_positions.keys())):
-            sector = get_sector(sym)
-            logger.warning(
-                "🛡️ [RISK CONTROL] BUY signal for %s ignored – "
-                "maximum sector exposure reached: %s.",
-                sym,
-                sector,
-            )
-            return False
-
-        position_size = self._risk.calculate_position_size(win_probability)
-        if not self._risk.has_sufficient_balance(position_size):
-            logger.warning(
-                "⚠️ [ALERT] Insufficient balance (%.2f) for position size %.2f.",
-                self._risk.balance,
-                position_size,
-            )
-            return False
-
         # ── MT5 symbol resolution (fail-fast before any state mutation) ────
         mt5_sym: str | None = None
         if self._live:
@@ -1429,9 +1383,55 @@ class MT5Executor(PaperExecutor):
             if mt5_sym is None:
                 return False
 
-        ts = timestamp or datetime.now(tz=timezone.utc)
-        # self._risk.deduct(position_size)  <-- Removed to avoid false drawdown triggers
-        self._risk.register_open()
+        # ── All pre-checks under lock to prevent race conditions ───────────
+        async with self._positions_lock:
+            if self._risk.is_trading_halted():
+                logger.warning(
+                    "⚠️ [ALERT] Trading halted due to daily loss limit (symbol=%s).",
+                    sym,
+                )
+                return False
+
+            if self._risk.is_portfolio_dd_exceeded():
+                logger.warning(
+                    "🚨 [CIRCUIT BREAKER] All new positions blocked – "
+                    "portfolio drawdown limit reached (symbol=%s).",
+                    sym,
+                )
+                return False
+
+            if sym in self.open_positions:
+                logger.debug("Trade skipped – a position for %s is already open.", sym)
+                return False
+
+            if not self._risk.can_open_position():
+                logger.debug(
+                    "Trade skipped – max open positions (%d) reached.",
+                    self._risk.max_positions,
+                )
+                return False
+
+            if self._risk.is_sector_exposed(sym, list(self.open_positions.keys())):
+                sector = get_sector(sym)
+                logger.warning(
+                    "🛡️ [RISK CONTROL] BUY signal for %s ignored – "
+                    "maximum sector exposure reached: %s.",
+                    sym,
+                    sector,
+                )
+                return False
+
+            position_size = self._risk.calculate_position_size(win_probability)
+            if not self._risk.has_sufficient_balance(position_size):
+                logger.warning(
+                    "⚠️ [ALERT] Insufficient balance (%.2f) for position size %.2f.",
+                    self._risk.balance,
+                    position_size,
+                )
+                return False
+
+            ts = timestamp or datetime.now(tz=timezone.utc)
+            self._risk.register_open()
 
         # ── Dynamic risk thresholds from sentiment ─────────────────────────
         thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
@@ -1540,32 +1540,40 @@ class MT5Executor(PaperExecutor):
             result = await self._send_order_with_retry(request)
             if result is None:
                 # Order rejected – roll back counter (balance wasn't deducted)
-                self._risk.register_close()
+                async with self._positions_lock:
+                    self._risk.register_close()
                 return False
             mt5_ticket = await self._resolve_position_ticket_after_buy(mt5_sym, result)
 
-        trade_id = await self._db.insert_open_trade(
-            symbol=sym,
-            entry_price=entry_price,
-            position_size=position_size,
-            entry_time=ts,
-        )
+        try:
+            trade_id = await self._db.insert_open_trade(
+                symbol=sym,
+                entry_price=entry_price,
+                position_size=position_size,
+                entry_time=ts,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[MT5][DB] insert_open_trade failed for %s — rolling back: %s", sym, exc)
+            async with self._positions_lock:
+                self._risk.register_close()
+            return False
 
-        self.open_positions[sym] = OpenPosition(
-            symbol=sym,
-            entry_price=entry_price,
-            position_size=position_size,
-            entry_time=ts,
-            trade_id=trade_id,
-            sl_pct=thresholds.sl_pct,
-            activation_pct=thresholds.activation_pct,
-            trailing_distance_pct=thresholds.trailing_distance_pct,
-            stop_loss_price=stop_loss_price,
-            atr_trailing_distance=atr_trailing_distance,
-            ml_confidence=win_probability,
-            sentiment_score=sentiment_score,
-            mt5_position_ticket=mt5_ticket,
-        )
+        async with self._positions_lock:
+            self.open_positions[sym] = OpenPosition(
+                symbol=sym,
+                entry_price=entry_price,
+                position_size=position_size,
+                entry_time=ts,
+                trade_id=trade_id,
+                sl_pct=thresholds.sl_pct,
+                activation_pct=thresholds.activation_pct,
+                trailing_distance_pct=thresholds.trailing_distance_pct,
+                stop_loss_price=stop_loss_price,
+                atr_trailing_distance=atr_trailing_distance,
+                ml_confidence=win_probability,
+                sentiment_score=sentiment_score,
+                mt5_position_ticket=mt5_ticket,
+            )
 
         record_trade(
             timestamp=ts,
@@ -1666,6 +1674,7 @@ class MT5Executor(PaperExecutor):
                     commission=commission,
                     swap=swap,
                     fee=fee,
+                    exit_reason=exit_reason_code,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -1674,13 +1683,15 @@ class MT5Executor(PaperExecutor):
                     exc,
                 )
 
-        self._risk.credit(gross_pnl)
-        self._risk.register_close()
-        if gross_pnl < 0.0:
-            self._risk.record_daily_loss(-gross_pnl)
-        self.total_pnl += gross_pnl
-        sym_ref = pos.symbol
-        del self.open_positions[symbol]
+        async with self._positions_lock:
+            self._risk.credit(gross_pnl)
+            self._risk.register_close()
+            if gross_pnl < 0.0:
+                self._risk.record_daily_loss(-gross_pnl)
+            self.total_pnl += gross_pnl
+            sym_ref = pos.symbol
+            if symbol in self.open_positions:
+                del self.open_positions[symbol]
 
         margin_used = pos.position_size / LEVERAGE
         pnl_pct = (pnl_net / margin_used * 100) if margin_used > 0 else 0.0
@@ -1756,7 +1767,8 @@ class MT5Executor(PaperExecutor):
 
     async def _reconcile_ghost_position(self, sym: str) -> None:
         """Ghost = local open but MT5 has no position; close DB + notify."""
-        pos = self.open_positions.get(sym)
+        async with self._positions_lock:
+            pos = self.open_positions.get(sym)
         if pos is None:
             return
         mt5_sym = self._resolve_symbol(sym)
@@ -1870,8 +1882,12 @@ class MT5Executor(PaperExecutor):
         if tp_raw > 0.0:
             op.last_broker_tp_synced = self._normalize_price(tp_raw, digits)
 
-        self.open_positions[sym] = op
-        self._risk.register_open()
+        async with self._positions_lock:
+            if sym in self.open_positions:
+                logger.debug("_try_adopt_mt5_position: %s already tracked — skipping.", sym)
+                return False
+            self.open_positions[sym] = op
+            self._risk.register_open()
 
         record_trade(
             timestamp=ts,
@@ -2114,12 +2130,14 @@ class MT5Executor(PaperExecutor):
         }
 
         # Ghost detection — broker closed without bot bookkeeping (SL/TP / manual)
-        ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
+        async with self._positions_lock:
+            ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
         for sym in ghost_symbols:
             await self._reconcile_ghost_position(sym)
 
         # Broker-only positions → import into local book (LONG + our magic)
-        untracked = [sym for sym in live_symbols if sym not in self.open_positions]
+        async with self._positions_lock:
+            untracked = [sym for sym in live_symbols if sym not in self.open_positions]
         for sym in untracked:
             adopted = await self._try_adopt_mt5_position(sym)
             if not adopted:
@@ -2128,6 +2146,17 @@ class MT5Executor(PaperExecutor):
                     "(adoption failed — check logs).",
                     sym,
                 )
+
+        # Enforce counter invariant after sync
+        async with self._positions_lock:
+            actual = len(self.open_positions)
+            if self._risk.open_count != actual:
+                logger.warning(
+                    "[MT5 SYNC] Counter drift detected: risk.open_count=%d actual=%d — correcting.",
+                    self._risk.open_count,
+                    actual,
+                )
+                self._risk.sync_open_count(actual)
 
         return len(live_symbols)
 

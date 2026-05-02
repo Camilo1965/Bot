@@ -110,7 +110,11 @@ ALTER TABLE trades_history
 ADD COLUMN IF NOT EXISTS pnl_net DOUBLE PRECISION,
 ADD COLUMN IF NOT EXISTS commission DOUBLE PRECISION,
 ADD COLUMN IF NOT EXISTS swap DOUBLE PRECISION,
-ADD COLUMN IF NOT EXISTS fee DOUBLE PRECISION;
+ADD COLUMN IF NOT EXISTS fee DOUBLE PRECISION,
+ADD COLUMN IF NOT EXISTS exit_reason TEXT,
+ADD COLUMN IF NOT EXISTS mt5_ticket BIGINT,
+ADD COLUMN IF NOT EXISTS sl_price DOUBLE PRECISION,
+ADD COLUMN IF NOT EXISTS tp_price DOUBLE PRECISION;
 """
 
 _CREATE_COMMANDS = """
@@ -148,6 +152,7 @@ SET exit_price = $2,
     commission = $6,
     swap       = $7,
     fee        = $8,
+    exit_reason = $9,
     status     = 'closed'
 WHERE id = $1;
 """
@@ -443,15 +448,17 @@ class DatabaseManager:
         commission: float = 0.0,
         swap: float = 0.0,
         fee: float = 0.0,
+        exit_reason: str = "",
     ) -> None:
         """Update a trade record in *trades_history* to mark it as closed.
 
         Parameters
         ----------
-        trade_id:   Row id of the trade to close.
-        exit_price: Price at which the trade was exited.
-        exit_time:  Trade exit time (UTC).  Defaults to *now*.
-        pnl:        Realised profit / loss in quote currency.
+        trade_id:    Row id of the trade to close.
+        exit_price:  Price at which the trade was exited.
+        exit_time:   Trade exit time (UTC).  Defaults to *now*.
+        pnl:         Realised profit / loss in quote currency.
+        exit_reason: Exit reason code (e.g. SL_BASE, TRAILING_STOP, SMART_EXIT_ML).
         """
         if self._pool is None:
             raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
@@ -467,6 +474,7 @@ class DatabaseManager:
                 commission,
                 swap,
                 fee,
+                exit_reason,
             )
 
     async def upsert_htf_trend(
