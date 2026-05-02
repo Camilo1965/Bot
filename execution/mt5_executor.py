@@ -2334,7 +2334,16 @@ class MT5Executor(PaperExecutor):
 
         sl_delta = abs(send_sl - cur_sl_br)
         tp_delta = abs(send_tp - cur_tp_br) if send_tp > 0.0 or cur_tp_br > 0.0 else 0.0
-        thr = min_step * 0.35
+        try:
+            skip_mult = float(
+                os.environ.get("MT5_SLTP_SKIP_THRESHOLD_MULT", "0.35").strip()
+                or "0.35"
+            )
+        except ValueError:
+            skip_mult = 0.35
+        thr = min_step * max(0.05, min(skip_mult, 1.0))
+        # ETH/SOL: trailing moves often < default thr vs broker SL → no MT5 modify.
+        # Lower MT5_SLTP_SKIP_THRESHOLD_MULT (e.g. 0.12) if alts must track tighter.
         if sl_delta < thr and tp_delta < thr:
             self._tp_sync_trace(
                 sym,
