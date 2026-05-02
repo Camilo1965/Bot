@@ -324,23 +324,62 @@ def _report_tz() -> ZoneInfo:
 
 
 def _next_run_local(target_weekday: int | None, target_hour: int, target_minute: int = 0) -> datetime:
-    """Compute next run datetime in UTC from local schedule."""
+    """Compute next run datetime in UTC from local schedule.
+
+    * **Weekly:** next *target_weekday* at *target_hour*:*target_minute* (local).
+    * **Monthly:** 1st of the month at *target_hour*:*target_minute* (local).  The
+      previous implementation used “today at hour” and then ``.replace(day=1)`` when
+      the time was still in the future, which produced a datetime **in the past**
+      whenever ``now.day > 1`` — causing a tight loop (``sleep_s == interval_floor``)
+      and spam logs.
+    """
     tz = _report_tz()
     now_local = datetime.now(tz=tz)
-    run_local = now_local.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-    if target_weekday is not None:
-        days_ahead = (target_weekday - now_local.weekday()) % 7
-        run_local = run_local + timedelta(days=days_ahead)
-        if run_local <= now_local:
-            run_local = run_local + timedelta(days=7)
-    else:
-        if run_local <= now_local:
+
+    if target_weekday is None:
+        # Monthly — always anchor to the 1st at target hour in REPORT_TIMEZONE.
+        first_this_month = datetime(
+            now_local.year,
+            now_local.month,
+            1,
+            target_hour,
+            target_minute,
+            0,
+            0,
+            tzinfo=tz,
+        )
+        if first_this_month <= now_local:
             if now_local.month == 12:
-                run_local = run_local.replace(year=now_local.year + 1, month=1, day=1)
+                run_local = datetime(
+                    now_local.year + 1,
+                    1,
+                    1,
+                    target_hour,
+                    target_minute,
+                    0,
+                    0,
+                    tzinfo=tz,
+                )
             else:
-                run_local = run_local.replace(month=now_local.month + 1, day=1)
+                run_local = datetime(
+                    now_local.year,
+                    now_local.month + 1,
+                    1,
+                    target_hour,
+                    target_minute,
+                    0,
+                    0,
+                    tzinfo=tz,
+                )
         else:
-            run_local = run_local.replace(day=1)
+            run_local = first_this_month
+        return run_local.astimezone(timezone.utc)
+
+    run_local = now_local.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+    days_ahead = (target_weekday - now_local.weekday()) % 7
+    run_local = run_local + timedelta(days=days_ahead)
+    if run_local <= now_local:
+        run_local = run_local + timedelta(days=7)
     return run_local.astimezone(timezone.utc)
 
 
