@@ -795,12 +795,14 @@ class MT5Executor(PaperExecutor):
             return None, False
 
         stops_level = int(getattr(info, "trade_stops_level", 0) or 0)
+        freeze_level = int(getattr(info, "trade_freeze_level", 0) or 0)
         try:
             buffer_pts = float(os.environ.get("MT5_STOPS_BUFFER_POINTS", "2").strip() or "2")
         except ValueError:
             buffer_pts = 2.0
 
-        min_total_pts = float(stops_level) + buffer_pts
+        # Stops + freeze (broker forbids SL/TP mods inside freeze distance — causes 10016).
+        min_total_pts = float(stops_level + freeze_level) + buffer_pts
         min_total_price = min_total_pts * point
 
         bid = float(tick.bid)
@@ -861,10 +863,10 @@ class MT5Executor(PaperExecutor):
         *,
         tick: Any | None = None,
     ) -> bool:
-        """Check that SL/TP distances satisfy the broker's minimum stops_level.
+        """Check that SL/TP distances satisfy broker minimum distance.
 
-        MT5 rejects orders with INVALID_STOPS (10016) when the SL or TP is
-        closer to the current price than ``symbol_info.trade_stops_level`` points.
+        Uses ``trade_stops_level + trade_freeze_level`` (points × point) — freeze
+        applies to SL/TP modifications and triggers 10016 if omitted.
 
         CRITICAL: For a BUY order, the SL is triggered by the BID price.
         For a SELL order, it is triggered by the ASK price. This method uses the
@@ -886,16 +888,22 @@ class MT5Executor(PaperExecutor):
         # Reference price for SL triggering:
         # BUY positions exit at BID; SELL positions exit at ASK.
         ref_price = tick_use.bid if is_buy else tick_use.ask
-        min_distance_price = info.trade_stops_level * info.point
+        stops_pts = int(getattr(info, "trade_stops_level", 0) or 0)
+        freeze_pts = int(getattr(info, "trade_freeze_level", 0) or 0)
+        min_pts = stops_pts + freeze_pts
+        min_distance_price = min_pts * info.point
 
         # 1. Check distance from execution price (the price in the order request)
         sl_from_exec = abs(execution_price - sl)
         if sl_from_exec < min_distance_price:
             logger.error(
                 "[MT5 VALIDATION] SL too close to ORDER PRICE for %s: "
-                "min %.2f pts, current %.2f pts. Order: %.5f | SL: %.5f",
-                symbol, info.trade_stops_level, sl_from_exec / info.point if info.point > 0 else 0,
-                execution_price, sl
+                "min %.2f pts (stops+freeze), current %.2f pts. Order: %.5f | SL: %.5f",
+                symbol,
+                float(min_pts),
+                sl_from_exec / info.point if info.point > 0 else 0,
+                execution_price,
+                sl,
             )
             return False
 
@@ -904,9 +912,13 @@ class MT5Executor(PaperExecutor):
         if sl_from_ref < min_distance_price:
             logger.error(
                 "[MT5 VALIDATION] SL too close to TRIGGER PRICE (%s) for %s: "
-                "min %.2f pts, current %.2f pts. Trigger: %.5f | SL: %.5f. (SPREAD TOO WIDE?)",
-                "BID" if is_buy else "ASK", symbol, info.trade_stops_level,
-                sl_from_ref / info.point if info.point > 0 else 0, ref_price, sl
+                "min %.2f pts (stops+freeze), current %.2f pts. Trigger: %.5f | SL: %.5f. (SPREAD TOO WIDE?)",
+                "BID" if is_buy else "ASK",
+                symbol,
+                float(min_pts),
+                sl_from_ref / info.point if info.point > 0 else 0,
+                ref_price,
+                sl,
             )
             return False
 
@@ -923,7 +935,9 @@ class MT5Executor(PaperExecutor):
             if tp_from_ref < min_distance_price:
                 logger.error(
                     "[MT5 VALIDATION] TP too close to trigger for %s: min %.2f pts, current %.2f pts.",
-                    symbol, info.trade_stops_level, tp_from_ref / info.point if info.point > 0 else 0
+                    symbol,
+                    float(min_pts),
+                    tp_from_ref / info.point if info.point > 0 else 0,
                 )
                 return False
 
@@ -1236,6 +1250,21 @@ class MT5Executor(PaperExecutor):
                     max_retries,
                     self._mt5_failure_count,
                     back_off,
+                )
+                await asyncio.sleep(back_off)
+            elif (
+                result.retcode == 10016
+                and request.get("action") == mt5.TRADE_ACTION_SLTP
+                and attempt < max_retries
+            ):
+                # Marginal SL vs live quote — same clamp often succeeds on retry.
+                back_off = 0.35 * attempt
+                logger.warning(
+                    "[MT5] INVALID_STOPS on SL/TP modify %s — retry in %.2f s (%d/%d)",
+                    request.get("symbol"),
+                    back_off,
+                    attempt,
+                    max_retries,
                 )
                 await asyncio.sleep(back_off)
             else:
