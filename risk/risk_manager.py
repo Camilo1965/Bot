@@ -135,7 +135,7 @@ _MULTIPLIER_HIGH: float = 1.8              # expand thresholds in high-sentiment
 _MULTIPLIER_MIN: float = 0.5               # absolute floor (safety net)
 _MULTIPLIER_MAX: float = 2.5               # absolute cap (safety net)
 _SL_CAP: float = 0.05                      # maximum allowed stop-loss fraction (5 %)
-_ACTIVATION_PCT_MIN: float = 0.02          # activation must always be >= 2 % to outpace fees
+_ACTIVATION_PCT_MIN: float = 0.005         # Floor lowered to 0.5 % to allow 1.0 % strategy (covers 0.08 % fees)
 
 
 @dataclass
