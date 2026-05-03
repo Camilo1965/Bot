@@ -17,6 +17,51 @@ from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
+
+def _dashboard_client_ip(request: web.Request) -> str:
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote or "unknown"
+
+
+def _make_api_rate_middleware(per_minute: int, window_s: float = 60.0):
+    """Return aiohttp middleware limiting /api/state requests per client IP."""
+    hits: dict[str, list[float]] = {}
+
+    @web.middleware
+    async def _middleware(request: web.Request, handler):
+        if per_minute <= 0 or request.path != "/api/state":
+            return await handler(request)
+        ip = _dashboard_client_ip(request)
+        now = asyncio.get_running_loop().time()
+        bucket = hits.setdefault(ip, [])
+        cutoff = now - window_s
+        while bucket and bucket[0] < cutoff:
+            bucket.pop(0)
+        if len(bucket) >= per_minute:
+            return web.json_response(
+                {"error": "rate_limited", "retry_after_s": int(window_s)},
+                status=429,
+                headers={"Retry-After": str(int(window_s))},
+            )
+        bucket.append(now)
+        return await handler(request)
+
+    return _middleware
+
+
+def _htf_trend_letters(t15: str, t1h: str, t4h: str) -> str:
+    def _one(v: str) -> str:
+        if v == "bullish":
+            return "B"
+        if v == "bearish":
+            return "S"
+        return "N"
+
+    return f"{_one(t15)}/{_one(t1h)}/{_one(t4h)}"
+
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -428,7 +473,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             </div>
                             
                             <div class="flex justify-between text-xs pt-2">
-                                <span class="text-slate-400">Tendencia (HTF)</span>
+                                <span class="text-slate-400">Tendencia 15m/1h/4h</span>
                                 <span class="text-white font-medium">${item.trend}</span>
                             </div>
                         </div>
@@ -507,7 +552,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         fetchState();
-        setInterval(fetchState, 1000);
+        setInterval(fetchState, 2500);
         document.getElementById('ceo-trades-more').addEventListener('click', () => {
             ceoTradeVisibleCount += 20;
             render({ ...window.__lastData, ceo: { ...(window.__lastData?.ceo || {}), recent_trades: ceoTradeRows } });
@@ -688,8 +733,10 @@ async def start_web_dashboard(
                     
             rsi = compute_rsi(prices) if len(prices) >= 15 else None
             prob = ml_probs.get(sym, 0.0)
-            t1h = htf_trend.get(sym, {}).get("1h", "neut")
-            
+            t15 = htf_trend.get(sym, {}).get("15m", "neutral")
+            t1h = htf_trend.get(sym, {}).get("1h", "neutral")
+            t4h = htf_trend.get(sym, {}).get("4h", "neutral")
+
             pos = paper_executor.open_positions.get(sym)
             has_pos = bool(pos)
             unrl = 0.0
@@ -748,11 +795,8 @@ async def start_web_dashboard(
                 "change_num": pct,
                 "rsi": f"{rsi:.1f}" if rsi is not None else "--",
                 "ml_conf": f"{prob*100:.0f}%",
-                "trend": (
-                    "Alcista" if t1h == "bullish"
-                    else "Bajista" if t1h == "bearish"
-                    else "Neutral"
-                ),
+                "trend": _htf_trend_letters(t15, t1h, t4h),
+                "trend_detail": {"15m": t15, "1h": t1h, "4h": t4h},
                 "action": action,
                 "has_position": has_pos,
                 "position_str": pos_str,
@@ -807,7 +851,13 @@ async def start_web_dashboard(
         
         return web.json_response(resp)
 
-    app = web.Application()
+    _rpm_raw = os.environ.get("DASH_API_RATE_PER_MIN", "180").strip()
+    try:
+        _rpm = max(0, int(_rpm_raw))
+    except ValueError:
+        _rpm = 180
+    _middlewares = [_make_api_rate_middleware(_rpm)] if _rpm > 0 else []
+    app = web.Application(middlewares=_middlewares)
     app.add_routes([
         web.get("/", handle_html),
         web.get("/api/state", handle_api)

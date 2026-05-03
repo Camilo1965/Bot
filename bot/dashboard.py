@@ -155,7 +155,11 @@ def generate_dashboard(
     table.add_column("PnL", justify="right")
     table.add_column("Señal", justify="center")
 
-    _trend_icon = {"bullish": "🟢", "bearish": "🔴", "neutral": "🟡"}
+    _trend_token = {
+        "bullish": "[bright_green]B[/bright_green]",
+        "bearish": "[bright_red]S[/bright_red]",
+        "neutral": "[yellow]N[/yellow]",
+    }
 
     for sym in watchlist:
         prices = list(state["prices"].get(sym, []))
@@ -197,12 +201,16 @@ def generate_dashboard(
             ml_color = "dim"
         ml_str = f"[{ml_color}]{prob_pct:.0f}%[/{ml_color}] {_bar(prob_pct, 100, 8, 'green' if prob_pct >= 62 else 'yellow' if prob_pct >= 50 else 'white')}"
 
-        # HTF trend icons
+        # HTF trend tags (15m/1h/4h): B=bullish, S=bearish, N=neutral.
         htf = state.get("htf_trend", {}).get(sym, {})
         t15 = htf.get("15m", "neutral")
         t1h = htf.get("1h", "neutral")
         t4h = htf.get("4h", "neutral")
-        trend_str = f"{_trend_icon.get(t15, '⚪')}{_trend_icon.get(t1h, '⚪')}{_trend_icon.get(t4h, '⚪')}"
+        trend_str = (
+            f"{_trend_token.get(t15, '[dim]?[/dim]')}/"
+            f"{_trend_token.get(t1h, '[dim]?[/dim]')}/"
+            f"{_trend_token.get(t4h, '[dim]?[/dim]')}"
+        )
 
         # Position
         pos = paper_executor.open_positions.get(sym)

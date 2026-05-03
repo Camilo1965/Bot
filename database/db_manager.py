@@ -318,7 +318,20 @@ class DatabaseManager:
         """Open the connection pool and initialise the schema."""
         dsn = self._build_dsn()
         logger.info("Connecting to TimescaleDB at %s", self._redacted_dsn())
-        self._pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=20)
+        raw_to = os.environ.get("DB_COMMAND_TIMEOUT_S", "90").strip()
+        cmd_timeout: float | None
+        if not raw_to or raw_to == "0":
+            cmd_timeout = None
+        else:
+            try:
+                cmd_timeout = max(5.0, min(float(raw_to), 600.0))
+            except ValueError:
+                cmd_timeout = 90.0
+        pool_kw: dict[str, Any] = {"dsn": dsn, "min_size": 1, "max_size": 20}
+        if cmd_timeout is not None:
+            pool_kw["command_timeout"] = cmd_timeout
+            logger.info("asyncpg command_timeout=%.0fs (set DB_COMMAND_TIMEOUT_S=0 to disable).", cmd_timeout)
+        self._pool = await asyncpg.create_pool(**pool_kw)
         await self._initialise_schema()
         # Start background batcher
         self._batcher_task = asyncio.create_task(self._background_batcher())

@@ -444,6 +444,9 @@ async def main() -> None:
     )
     root_logger.addHandler(_rich_handler)
 
+    if os.environ.get("DASH_QUIET_ACCESS_LOG", "").strip().lower() in ("1", "true", "yes"):
+        logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+
     install_asyncio_critical_telegram_alerts()
     install_telegram_log_alerts()
 

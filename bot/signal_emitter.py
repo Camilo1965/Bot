@@ -56,8 +56,9 @@ async def signal_emitter(
                 scores = [s for _, s in sentiment_history]
                 if max(scores) - min(scores) > NEWS_FILTER_VOLATILITY_THRESHOLD:
                     new_hold_until = now + timedelta(minutes=NEWS_FILTER_HOLD_MINUTES)
-                    # Extend the HOLD window on every new trigger.
-                    if hold_until is None or new_hold_until > hold_until:
+                    # Do not keep extending HOLD forever while volatility remains high.
+                    # Only open a new HOLD window when there is no active one.
+                    if hold_until is None or now >= hold_until:
                         state["news_hold_until"] = new_hold_until
                         logger.info(
                             "[PRO] News Filter triggered – sentiment swing %.4f > %.2f "
@@ -65,6 +66,12 @@ async def signal_emitter(
                             max(scores) - min(scores),
                             NEWS_FILTER_VOLATILITY_THRESHOLD,
                             new_hold_until.isoformat(),
+                        )
+                    else:
+                        logger.debug(
+                            "[PRO] News Filter volatility still high (swing=%.4f) but HOLD already active until %s.",
+                            max(scores) - min(scores),
+                            hold_until.isoformat(),
                         )
 
         # Honour the active HOLD period: skip all signal evaluation.
