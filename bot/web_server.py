@@ -423,7 +423,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 let actionBadge = '';
                 if (item.action.includes('Gestionando')) {
                     actionBadge = '<span class="bg-sky-500/20 text-sky-400 border border-sky-500/30 px-2 py-1 rounded text-xs font-semibold tracking-wide">ACTIVA</span>';
-                } else if (item.action.includes('Comprar')) {
+                } else if (item.can_enter === true) {
                     actionBadge = '<span class="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-1 rounded text-xs font-semibold tracking-wide">COMPRAR</span>';
                 } else {
                     actionBadge = '<span class="bg-slate-700/50 text-slate-400 border border-slate-600 px-2 py-1 rounded text-xs font-semibold tracking-wide">ESPERAR</span>';
@@ -454,7 +454,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <div class="space-y-4 mb-2">
                             <div>
                                 <div class="flex justify-between text-xs mb-1.5">
-                                    <span class="text-slate-400">Confianza IA</span>
+                                    <span class="text-slate-400">Prob. modelo (XGB)</span>
                                     <span class="text-white font-medium">${item.ml_conf}</span>
                                 </div>
                                 <div class="progress-bar-bg">
@@ -478,6 +478,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             </div>
                         </div>
                 `;
+                if (!item.has_position) {
+                    cardsHtml += `
+                        <div class="mt-2 pt-2 border-t border-white/5 space-y-1">
+                            <div class="flex justify-between text-[10px]">
+                                <span class="text-slate-500">Señal estrategia</span>
+                                <span class="text-slate-300 font-mono">${item.strategy_signal}</span>
+                            </div>
+                            ${item.entry_hint ? `<div class="text-[10px] text-slate-500 leading-snug">${item.entry_hint}</div>` : ''}
+                        </div>`;
+                }
 
                 if (item.has_position) {
                     let pnlColor = item.unrealized_pnl_num >= 0 ? 'text-glow-green' : 'text-glow-red';
@@ -695,6 +705,7 @@ async def start_web_dashboard(
         # Market Data
         market_data = []
         ml_probs = state.get("ml_probs", {})
+        ml_signals = state.get("ml_signals", {})
         htf_trend = state.get("htf_trend", {})
         mt5_profit_by_ticket: dict[int, float] = {}
         mt5_by_ticket: dict[int, dict[str, Any]] = {}
@@ -750,6 +761,9 @@ async def start_web_dashboard(
             trail_progress = "—"
             broker_sl_display = "—"
             broker_tp_display = "—"
+            strategy_signal = "HOLD"
+            can_buy = False
+            entry_hint = ""
 
             if has_pos and pos is not None:
                 mt5_ticket = getattr(pos, "mt5_position_ticket", None)
@@ -786,7 +800,23 @@ async def start_web_dashboard(
                     broker_sl_display = f"{slb:,.2f}" if slb > 0.0 else "—"
                     broker_tp_display = f"{tpb:,.2f}" if tpb > 0.0 else "—"
             else:
-                action = "Comprar" if prob >= BUY_PROB_THRESHOLD else "Esperar"
+                strategy_signal = ml_signals.get(sym, "HOLD")
+                can_buy = (
+                    not global_hold
+                    and prob >= BUY_PROB_THRESHOLD
+                    and strategy_signal == "BUY"
+                )
+                action = "Comprar" if can_buy else "Esperar"
+                if global_hold:
+                    entry_hint = "Pausa global (sentimiento / filtro noticias) — no se abren entradas."
+                elif prob >= BUY_PROB_THRESHOLD and strategy_signal != "BUY":
+                    entry_hint = (
+                        "Prob. ≥ umbral; señal final HOLD (ADX/HTF/funding u otros filtros)."
+                    )
+                elif prob < BUY_PROB_THRESHOLD:
+                    entry_hint = "Prob. modelo por debajo del umbral de compra."
+                else:
+                    entry_hint = ""
 
             market_data.append({
                 "symbol": sym.split("/")[0],
@@ -798,6 +828,9 @@ async def start_web_dashboard(
                 "trend": _htf_trend_letters(t15, t1h, t4h),
                 "trend_detail": {"15m": t15, "1h": t1h, "4h": t4h},
                 "action": action,
+                "strategy_signal": strategy_signal if not has_pos else "—",
+                "can_enter": can_buy if not has_pos else False,
+                "entry_hint": entry_hint if not has_pos else "",
                 "has_position": has_pos,
                 "position_str": pos_str,
                 "stop_loss": sl_display,

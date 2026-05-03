@@ -149,17 +149,19 @@ def generate_dashboard(
     table.add_column("24h", justify="right")
     table.add_column("ATR", justify="right")
     table.add_column("RSI", justify="center", width=16)
-    table.add_column("ML", justify="center", width=16)
+    table.add_column("Prob.", justify="center", width=16)
     table.add_column("15m/1H/4H", justify="center")
     table.add_column("Posición", justify="center")
     table.add_column("PnL", justify="right")
-    table.add_column("Señal", justify="center")
+    table.add_column("Ejec.", justify="center")
 
     _trend_token = {
         "bullish": "[bright_green]B[/bright_green]",
         "bearish": "[bright_red]S[/bright_red]",
         "neutral": "[yellow]N[/yellow]",
     }
+
+    ml_signals_map: dict[str, str] = state.get("ml_signals", {})
 
     for sym in watchlist:
         prices = list(state["prices"].get(sym, []))
@@ -233,7 +235,13 @@ def generate_dashboard(
             pos_str = "[dim]—[/dim]"
             pnl_str_r = "[dim]—[/dim]"
 
-        # Signal
+        # Executable signal: same gates as try_open_trade path (strategy + global pause)
+        raw_sig = ml_signals_map.get(sym, "HOLD")
+        can_enter = (
+            not global_hold
+            and prob >= BUY_PROB_THRESHOLD
+            and raw_sig == "BUY"
+        )
         if pos:
             pending = getattr(pos, "close_pending", False)
             if pending:
@@ -242,8 +250,12 @@ def generate_dashboard(
                 signal_str = "[bold bright_yellow]🔒 TRAIL[/bold bright_yellow]"
             else:
                 signal_str = "[bold bright_cyan]📊 HOLD[/bold bright_cyan]"
-        elif prob >= BUY_PROB_THRESHOLD:
+        elif global_hold:
+            signal_str = "[yellow]⏸ WAIT[/yellow]"
+        elif can_enter:
             signal_str = "[bold bright_green]🚀 BUY[/bold bright_green]"
+        elif raw_sig == "SELL":
+            signal_str = "[bold bright_red]▼ SELL[/bold bright_red]"
         else:
             signal_str = "[dim]WAIT[/dim]"
 

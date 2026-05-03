@@ -164,6 +164,7 @@ async def signal_emitter(
                 htf_trend_4h=trend_4h,
                 htf_trend_1h=trend_1h,
             )
+            state["ml_signals"][symbol] = signal
             win_prob: float = predictor.predict_proba(
                 prices,
                 effective_sentiment,

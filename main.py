@@ -502,6 +502,8 @@ async def main() -> None:
         },
         # [ML] Latest XGBoost win-probability per symbol (0.0 = not yet computed)
         "ml_probs": {symbol: 0.0 for symbol in WATCHLIST},
+        # [ML] Last generate_signal() per symbol (BUY/SELL/HOLD); drives TUI/web vs raw prob
+        "ml_signals": {symbol: "HOLD" for symbol in WATCHLIST},
         # [DASHBOARD] Mega-dashboard telemetry
         "api_latency_ms": 0.0,   # REST/WS round-trip latency in milliseconds
         "max_drawdown": 0.0,     # most negative unrealised PnL seen this session
@@ -756,6 +758,12 @@ async def main() -> None:
         "trading_halted=%s",
         shared_state.get("sentiment"),
         risk_manager.is_trading_halted(),
+    )
+    logger.info(
+        "🔍 [AUDIT] UI coherence: COMPRAR/BUY only when "
+        "ml_signals[symbol]==BUY from generate_signal, prob≥%.2f, "
+        "and not global_hold (sentiment/news pause). Raw prob bar alone never opens.",
+        BUY_PROB_THRESHOLD,
     )
 
     try:
