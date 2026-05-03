@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 
+import asyncio
 import asyncpg
 
 logger = logging.getLogger(__name__)
