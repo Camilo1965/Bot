@@ -728,6 +728,17 @@ class PaperExecutor:
 
             # ── Compute dynamic risk thresholds from sentiment ─────────────
             thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
+            
+            # ── ATR-based dynamic SL logging ──────────────────────────────────
+            if current_atr is not None and current_atr > 0.0:
+                sl_dist = current_atr * ATR_SL_MULTIPLIER * thresholds.multiplier
+                logger.info(
+                    "🛡️ [RIESGO] SL configurado a distancia ATR: %.2f (Sentimiento: %.2f, Multiplicador: %.2f)",
+                    sl_dist,
+                    sentiment_score,
+                    thresholds.multiplier
+                )
+            
             logger.debug(
                 "DYNAMIC THRESHOLDS  symbol=%s  sentiment=%.4f  multiplier=%.2f  "
                 "sl=%.4f  activation=%.4f  trailing_dist=%.4f",
