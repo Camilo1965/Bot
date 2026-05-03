@@ -121,6 +121,8 @@ _JOURNAL_COLUMNS = [
 
 # Default TTL for open positions (hours).  Set to None to disable.
 _DEFAULT_TTL_HOURS: float = 12.0
+# [NEW] Profit stagnation timeout: close if in profit after X hours without hitting trailing.
+_PROFIT_STAGNATION_TIMEOUT_HOURS: float = 6.0
 
 # Smart-exit ML confidence multiplier for Layer 1 (Exhaustion Exit).
 # The closing threshold is: min_confidence * _ML_EXIT_CONFIDENCE_FACTOR
@@ -144,6 +146,7 @@ _EXIT_REASON_LABELS: dict[str, str] = {
     "SMART_EXIT_ML":         "SMART_EXIT_ML: El modelo XGBoost detectó agotamiento de tendencia.",
     "SMART_EXIT_SENTIMENT":  "SMART_EXIT_SENTIMENT: Gemini detectó un cambio brusco a sentimiento negativo.",
     "TTL_TIMEOUT":           "TTL_TIMEOUT: Tiempo máximo de exposición alcanzado.",
+    "STAGNATION_EXIT":      "STAGNATION_EXIT: Posición estancada en ganancia por demasiado tiempo.",
     "BROKER_CLOSED":         "BROKER_CLOSED: El broker cerró la posición (p. ej. SL/TP) antes del sell del bot.",
     "GHOST_SYNC":            "GHOST_SYNC: Sincronización MT5 — posición ya cerrada; libro local reconciliado.",
 }
@@ -1074,6 +1077,7 @@ class PaperExecutor:
             price_change_pct = (current_price - pos.entry_price) / pos.entry_price
             pnl = price_change_pct * pos.position_size
             ts = timestamp or datetime.now(tz=timezone.utc)
+            age_hours = (ts - pos.entry_time).total_seconds() / 3600.0
 
             if ml_signal == "SELL" and ml_probability is not None:
                 sell_confidence = 1.0 - ml_probability
@@ -1118,6 +1122,51 @@ class PaperExecutor:
                         pnl,
                     )
                     return pnl
+
+            # [NEW] Layer 5 – Stagnation Exit
+            # If the position has been open for longer than _PROFIT_STAGNATION_TIMEOUT_HOURS
+            # (default 6 h) and is currently in profit (pnl > 0), close it to take
+            # whatever gains are on the table and free up margin.
+            if age_hours >= _PROFIT_STAGNATION_TIMEOUT_HOURS and pnl > 0:
+                closed = await self._close_position(
+                    symbol=sym,
+                    exit_price=current_price,
+                    exit_time=ts,
+                    pnl=pnl,
+                    exit_reason_code="STAGNATION_EXIT",
+                )
+                if not closed:
+                    return None
+                logger.info(
+                    "⌛ [STAGNATION EXIT] %s cerrado por estancamiento en ganancia (>%.1fh). PnL: %.4f",
+                    sym,
+                    _PROFIT_STAGNATION_TIMEOUT_HOURS,
+                    pnl,
+                )
+                asyncio.create_task(
+                    send_telegram_alert(
+                        _build_trade_report(
+                            sym=sym,
+                            pos=pos,
+                            exit_price=current_price,
+                            exit_time=ts,
+                            gross_pnl=pnl,
+                            exit_reason_code="STAGNATION_EXIT",
+                            current_balance=self._risk.balance,
+                        )
+                    )
+                )
+                logger.debug(
+                    "TRADE CLOSED [STAGNATION]  symbol=%s  entry=%.2f  exit=%.2f  "
+                    "age_hours=%.2f  timeout=%.2f  pnl=%.4f",
+                    sym,
+                    pos.entry_price,
+                    current_price,
+                    age_hours,
+                    _PROFIT_STAGNATION_TIMEOUT_HOURS,
+                    pnl,
+                )
+                return pnl
 
             if pos.max_ttl_hours is not None:
                 age_hours = (ts - pos.entry_time).total_seconds() / 3600.0

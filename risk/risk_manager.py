@@ -124,7 +124,7 @@ def get_sector(symbol: str) -> str:
 
 # ── Dynamic risk management – base thresholds (neutral market) ────────────────
 BASE_SL: float = 0.015                      # 1.5 % base stop loss
-BASE_ACTIVATION_PCT: float = 0.025          # 2.5 % profit to activate trailing stop
+BASE_ACTIVATION_PCT: float = 0.010          # 1.0 % profit to activate trailing stop
 BASE_TRAILING_DISTANCE: float = 0.015       # 1.5 % trailing distance
 
 # ── Dynamic risk management – sentiment multiplier bounds ─────────────────────
