@@ -24,16 +24,26 @@ async def market_consumer(
 ) -> None:
     logger = logging.getLogger("clawdbot.market")
     _last_price_log: dict[str, float] = {}  # symbol → last log timestamp (monotonic)
+    _last_check_close: dict[str, float] = {} # symbol → last check_and_close timestamp (monotonic)
+    
+    # Tick sampling interval: 100ms (10 Hz) is enough for stop-loss checks 
+    # and prevents CPU/IPC bottleneck when MT5 sends micro-ticks.
+    CHECK_CLOSE_INTERVAL_S = 0.1 
+
     while True:
         message = await market_queue.get()
+        _now_mono = time.monotonic()
         state["last_market_message_at"] = datetime.now(tz=timezone.utc)
         symbol: str = message.get("symbol", "BTC/USDT")
 
         if message.get("type") == "trade":
             if isinstance(paper_executor, MT5Executor) and paper_executor._live:
+                # Wallet snapshot is expensive (MT5 IPC), throttle it if needed.
+                # For now, it stays per-trade-tick but consider moving to a loop.
                 snap = fetch_mt5_wallet_snapshot()
                 if snap:
                     state["mt5_wallet"] = snap
+            
             price = message.get("price")
             b_raw, a_raw = message.get("bid"), message.get("ask")
             if b_raw is not None and a_raw is not None:
@@ -47,13 +57,13 @@ async def market_consumer(
                         "mid": mid_q,
                         "ts_ms": int(ts_ms) if isinstance(ts_ms, (int, float)) else 0,
                     }
+            
             # Guard against None sentiment (startup race) to avoid TypeError.
             sentiment = state.get("sentiment") or 0.0
 
             # Demoted to DEBUG – throttled to once per 60 s per symbol.
-            _now = time.monotonic()
-            if _now - _last_price_log.get(symbol, 0.0) >= 60.0:
-                _last_price_log[symbol] = _now
+            if _now_mono - _last_price_log.get(symbol, 0.0) >= 60.0:
+                _last_price_log[symbol] = _now_mono
                 prices_buf = state["prices"].get(symbol, [])
                 logger.debug(
                     "%s price=%.2f  sentiment_score=%.4f | Buffer: %d/500",
@@ -61,30 +71,27 @@ async def market_consumer(
                 )
 
             if price is not None:
-                try:
-                    pnl = await paper_executor.check_and_close(
-                        float(price),
-                        symbol=symbol,
-                        current_atr=state.get("atrs", {}).get(symbol),
-                    )
-                    if pnl is not None:
-                        logger.debug(
-                            "Position closed on trade tick  symbol=%s  pnl=%.4f  total_pnl=%.4f",
-                            symbol,
-                            pnl,
-                            paper_executor.total_pnl,
+                # ── TICK SAMPLING ─────────────────────────────────────────────
+                # Only check exit conditions at most once per CHECK_CLOSE_INTERVAL_S.
+                # This drastically reduces MT5 IPC calls and DB overhead.
+                if (_now_mono - _last_check_close.get(symbol, 0.0)) >= CHECK_CLOSE_INTERVAL_S:
+                    _last_check_close[symbol] = _now_mono
+                    try:
+                        pnl = await paper_executor.check_and_close(
+                            float(price),
+                            symbol=symbol,
+                            current_atr=state.get("atrs", {}).get(symbol),
                         )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("⚠️ [ALERTA] check_and_close failed: %s %s", exc, DEBUG_LOG_HINT)
+                        if pnl is not None:
+                            logger.info(
+                                "💰 [CIERRE] %s | PnL: %.4f USDT | Tick Trade",
+                                symbol, pnl
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("⚠️ [ALERTA] check_and_close failed: %s %s", exc, DEBUG_LOG_HINT)
 
         elif message.get("type") == "kline":
-            # ----------------------------------------------------------------
-            # Route kline messages by timeframe.
-            # 15m candles update the primary price/high/low buffers used by
-            # the ML model.  1H and 4H candles update the HTF buffers used by
-            # the Multi-Timeframe Analysis (MTA) trend filter.
-            # All timeframes are deduplicated by timestamp.
-            # ----------------------------------------------------------------
+            # ... (timeframe logic remains same) ...
             timeframe: str = message.get("timeframe", "15m")
             close_price = message.get("close")
             open_price = message.get("open")
@@ -100,17 +107,13 @@ async def market_consumer(
                         prices_dict: dict[str, deque[float]] = state["prices"]
                         if symbol in prices_dict:
                             prices_dict[symbol].append(float(close_price))
-                        # [ELITE] Store high / low for ADX/ATR features
                         if high_price is not None and symbol in state.get("highs", {}):
                             state["highs"][symbol].append(float(high_price))
                         if low_price is not None and symbol in state.get("lows", {}):
                             state["lows"][symbol].append(float(low_price))
                         logger.debug(
-                            "📊 [KLINE] %s – new 15m candle close=%.2f | Buffer: %d/%d",
-                            symbol,
-                            float(close_price),
-                            len(prices_dict.get(symbol, [])),
-                            prices_dict[symbol].maxlen if symbol in prices_dict else 0,
+                            "📊 [KLINE] %s – new 15m candle close=%.2f",
+                            symbol, float(close_price)
                         )
 
             elif timeframe in ("1h", "4h"):
@@ -125,12 +128,6 @@ async def market_consumer(
                             htf_closes[timeframe].append(float(close_price))
                         if timeframe in htf_opens and open_price is not None:
                             htf_opens[timeframe].append(float(open_price))
-                        logger.debug(
-                            "📊 [HTF KLINE] %s – new %s candle close=%.2f",
-                            symbol,
-                            timeframe.upper(),
-                            float(close_price),
-                        )
 
         elif message.get("type") == "order_book":
             bids: list[Any] = message.get("bids", [])
@@ -150,38 +147,38 @@ async def market_consumer(
                     "ts_ms": int(raw_ts) if isinstance(raw_ts, (int, float)) else 0,
                 }
 
-                # [ELITE] Order Book Imbalance: total bid volume vs ask volume
                 bid_vol = sum(float(b[1]) for b in bids[:5])
                 ask_vol = sum(float(a[1]) for a in asks[:5])
                 obi_ratio = bid_vol / ask_vol if ask_vol > 0 else 1.0
-                obi_ratios: dict[str, float] = state.get("obi_ratios", {})
-                obi_ratios[symbol] = obi_ratio
-                try:
-                    await db.insert_market_tick(
-                        symbol=symbol,
-                        best_bid=float(bids[0][0]),
-                        bid_volume=float(bids[0][1]),
-                        best_ask=float(asks[0][0]),
-                        ask_volume=float(asks[0][1]),
-                        timestamp=ts,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("⚠️ [ALERTA] DB insert_market_tick failed: %s %s", exc, DEBUG_LOG_HINT)
+                state.get("obi_ratios", {})[symbol] = obi_ratio
+                
+                # ── ASYNC DB PERSISTENCE ──────────────────────────────────────
+                # Non-critical market ticks are buffered in background.
+                asyncio.create_task(db.insert_market_tick(
+                    symbol=symbol,
+                    best_bid=float(bids[0][0]),
+                    bid_volume=float(bids[0][1]),
+                    best_ask=float(asks[0][0]),
+                    ask_volume=float(asks[0][1]),
+                    timestamp=ts,
+                ))
 
-                try:
-                    pnl = await paper_executor.check_and_close(
-                        mid_price,
-                        symbol=symbol,
-                        timestamp=ts,
-                        current_atr=state.get("atrs", {}).get(symbol),
-                    )
-                    if pnl is not None:
-                        logger.debug(
-                            "Position closed on order-book tick  symbol=%s  pnl=%.4f  total_pnl=%.4f",
-                            symbol,
-                            pnl,
-                            paper_executor.total_pnl,
+                # ── TICK SAMPLING FOR ORDER BOOK ──────────────────────────────
+                if (_now_mono - _last_check_close.get(symbol, 0.0)) >= CHECK_CLOSE_INTERVAL_S:
+                    _last_check_close[symbol] = _now_mono
+                    try:
+                        pnl = await paper_executor.check_and_close(
+                            mid_price,
+                            symbol=symbol,
+                            timestamp=ts,
+                            current_atr=state.get("atrs", {}).get(symbol),
                         )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("⚠️ [ALERTA] check_and_close (order_book) failed: %s %s", exc, DEBUG_LOG_HINT)
+                        if pnl is not None:
+                            logger.info(
+                                "💰 [CIERRE] %s | PnL: %.4f USDT | OrderBook Tick",
+                                symbol, pnl
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("⚠️ [ALERTA] check_and_close (order_book) failed: %s", exc)
+        
         market_queue.task_done()

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -301,6 +302,12 @@ class DatabaseManager:
 
     def __init__(self) -> None:
         self._pool: asyncpg.Pool | None = None
+        # Background batching for market data
+        self._market_tick_buffer: list[tuple] = []
+        self._batch_size_threshold: int = 100
+        self._flush_interval: float = 1.0  # seconds
+        self._last_flush_time: float = time.monotonic()
+        self._batcher_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -310,16 +317,53 @@ class DatabaseManager:
         """Open the connection pool and initialise the schema."""
         dsn = self._build_dsn()
         logger.info("Connecting to TimescaleDB at %s", self._redacted_dsn())
-        self._pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5)
+        self._pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=20)
         await self._initialise_schema()
+        # Start background batcher
+        self._batcher_task = asyncio.create_task(self._background_batcher())
         logger.info("DatabaseManager ready.")
 
     async def close(self) -> None:
         """Close the connection pool gracefully."""
+        if self._batcher_task:
+            self._batcher_task.cancel()
+            try:
+                await self._batcher_task
+            except asyncio.CancelledError:
+                pass
+        # Final flush
+        await self._flush_market_ticks()
+        
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
             logger.info("DatabaseManager connection pool closed.")
+
+    async def _background_batcher(self) -> None:
+        """Background task that flushes the market tick buffer periodically."""
+        while True:
+            try:
+                await asyncio.sleep(self._flush_interval)
+                await self._flush_market_ticks()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("[DB] Market batcher background error: %s", exc)
+
+    async def _flush_market_ticks(self) -> None:
+        """Execute a bulk insert of all buffered market ticks."""
+        if not self._market_tick_buffer or self._pool is None:
+            return
+        
+        async with self._pool.acquire() as conn:
+            batch = list(self._market_tick_buffer)
+            self._market_tick_buffer.clear()
+            try:
+                # executemany is much faster for batch inserts
+                await conn.executemany(_INSERT_MARKET_TICK, batch)
+                self._last_flush_time = time.monotonic()
+            except Exception as exc:
+                logger.error("[DB] Bulk insert market ticks failed: %s. Dropping %d records.", exc, len(batch))
 
     # ------------------------------------------------------------------
     # Insert helpers
@@ -334,30 +378,18 @@ class DatabaseManager:
         ask_volume: float,
         timestamp: datetime | None = None,
     ) -> None:
-        """Insert one order-book top-of-book snapshot into *market_data*.
-
-        Parameters
-        ----------
-        symbol:     Trading pair, e.g. ``"BTC/USDT"``.
-        best_bid:   Best bid price.
-        bid_volume: Volume at best bid.
-        best_ask:   Best ask price.
-        ask_volume: Volume at best ask.
-        timestamp:  Event time (UTC).  Defaults to *now* when ``None``.
+        """Buffer one order-book top-of-book snapshot into the batch queue.
+        
+        This method is now NON-BLOCKING for the database write.
         """
-        if self._pool is None:
-            raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
         ts = timestamp or datetime.now(tz=timezone.utc)
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                _INSERT_MARKET_TICK,
-                ts,
-                symbol,
-                best_bid,
-                bid_volume,
-                best_ask,
-                ask_volume,
-            )
+        self._market_tick_buffer.append((
+            ts, symbol, best_bid, bid_volume, best_ask, ask_volume
+        ))
+        
+        # Immediate background flush if buffer is full
+        if len(self._market_tick_buffer) >= self._batch_size_threshold:
+            asyncio.create_task(self._flush_market_ticks())
 
     async def insert_sentiment(
         self,
