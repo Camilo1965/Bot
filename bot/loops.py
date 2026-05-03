@@ -126,7 +126,7 @@ async def dashboard_logger(
 
 async def position_sync_loop(
     paper_executor: PaperExecutor,
-    interval: int = 60,
+    interval: int = 15,
 ) -> None:
     """Periodically reconcile local position state with the live exchange.
 

@@ -25,6 +25,7 @@ async def market_consumer(
     logger = logging.getLogger("clawdbot.market")
     _last_price_log: dict[str, float] = {}  # symbol → last log timestamp (monotonic)
     _last_check_close: dict[str, float] = {} # symbol → last check_and_close timestamp (monotonic)
+    _last_wallet_snap: float = 0.0
     
     # Tick sampling interval: 100ms (10 Hz) is enough for stop-loss checks 
     # and prevents CPU/IPC bottleneck when MT5 sends micro-ticks.
@@ -38,11 +39,12 @@ async def market_consumer(
 
         if message.get("type") == "trade":
             if isinstance(paper_executor, MT5Executor) and paper_executor._live:
-                # Wallet snapshot is expensive (MT5 IPC), throttle it if needed.
-                # For now, it stays per-trade-tick but consider moving to a loop.
-                snap = fetch_mt5_wallet_snapshot()
-                if snap:
-                    state["mt5_wallet"] = snap
+                # Wallet snapshot is expensive (MT5 IPC), throttle to 1 second.
+                if _now_mono - _last_wallet_snap >= 1.0:
+                    _last_wallet_snap = _now_mono
+                    snap = fetch_mt5_wallet_snapshot()
+                    if snap:
+                        state["mt5_wallet"] = snap
             
             price = message.get("price")
             b_raw, a_raw = message.get("bid"), message.get("ask")
