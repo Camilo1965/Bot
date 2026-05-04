@@ -10,7 +10,9 @@ from aiohttp import web
 
 from bot.dashboard_helpers import compute_rsi, mt5_dashboard_mark
 from bot import state as dash_state
+from bot.constants import DEBUG_LOG_HINT
 from database.db_manager import db
+from execution.mt5_executor import MT5Executor
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD
@@ -590,6 +592,15 @@ async def start_web_dashboard(
     """Run an aiohttp web server providing a modern real-time mobile dashboard."""
     report_tz = os.environ.get("REPORT_TIMEZONE", "America/Bogota")
     ceo_cache: dict[str, Any] = {"expires_mono": 0.0, "data": None}
+    api_mt5_sync_last_mono = 0.0
+    _raw_api_iv = os.environ.get(
+        "WEB_API_MT5_SYNC_EVERY_S",
+        os.environ.get("DASHBOARD_MT5_SYNC_EVERY_S", "5"),
+    ).strip()
+    try:
+        api_mt5_sync_iv = float(_raw_api_iv) if _raw_api_iv else 5.0
+    except ValueError:
+        api_mt5_sync_iv = 5.0
 
     async def build_ceo_snapshot() -> dict[str, Any]:
         now_mono = asyncio.get_event_loop().time()
@@ -650,7 +661,21 @@ async def start_web_dashboard(
         return web.Response(text=HTML_TEMPLATE, content_type="text/html")
 
     async def handle_api(request: web.Request) -> web.Response:
+        nonlocal api_mt5_sync_last_mono
         now_utc = datetime.now(tz=timezone.utc)
+
+        if isinstance(paper_executor, MT5Executor) and paper_executor._live and api_mt5_sync_iv > 0:
+            now_mono = asyncio.get_running_loop().time()
+            if (now_mono - api_mt5_sync_last_mono) >= api_mt5_sync_iv:
+                api_mt5_sync_last_mono = now_mono
+                try:
+                    await paper_executor.sync_positions_with_exchange()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Web /api/state MT5 sync failed: %s %s",
+                        exc,
+                        DEBUG_LOG_HINT,
+                    )
         
         # Uptime
         if dash_state.bot_start_time is not None:

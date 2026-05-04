@@ -832,7 +832,7 @@ async def main() -> None:
         weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
         position_sync_loop(
             paper_executor,
-            interval=max(5, min(int(float(os.environ.get("MT5_POSITION_SYNC_S", "20"))), 300)),
+            interval=max(5, min(int(float(os.environ.get("MT5_POSITION_SYNC_S", "10"))), 300)),
         ),
         health_monitor_loop(shared_state, market_queue, paper_executor, interval=30),
         close_pending_reconciler_loop(shared_state, paper_executor, interval=20),

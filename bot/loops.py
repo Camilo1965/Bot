@@ -55,6 +55,12 @@ async def dashboard_logger(
     """
     logger_dash = logging.getLogger("clawdbot.dashboard")
     audit = logging.getLogger("clawdbot.audit")
+    last_mt5_sync_mono = 0.0
+    raw_iv = os.environ.get("DASHBOARD_MT5_SYNC_EVERY_S", "5").strip()
+    try:
+        dash_sync_iv = float(raw_iv) if raw_iv else 5.0
+    except ValueError:
+        dash_sync_iv = 5.0
     while True:
         await asyncio.sleep(interval)
 
@@ -62,6 +68,20 @@ async def dashboard_logger(
             snap = fetch_mt5_wallet_snapshot()
             if snap:
                 state["mt5_wallet"] = snap
+            # Reconcile before painting TUI so ghosts disappear without waiting
+            # for the slower periodic sync loop (fixes stale open_count under lag).
+            if dash_sync_iv > 0:
+                now_mono = asyncio.get_running_loop().time()
+                if (now_mono - last_mt5_sync_mono) >= dash_sync_iv:
+                    last_mt5_sync_mono = now_mono
+                    try:
+                        await paper_executor.sync_positions_with_exchange()
+                    except Exception as exc:  # noqa: BLE001
+                        logger_dash.warning(
+                            "Pre-dashboard MT5 sync failed: %s %s",
+                            exc,
+                            DEBUG_LOG_HINT,
+                        )
 
         # ── Refresh the live TUI table ────────────────────────────────────────
         live.update(generate_dashboard(state, paper_executor, risk_manager, watchlist))

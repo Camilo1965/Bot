@@ -2109,12 +2109,84 @@ class MT5Executor(PaperExecutor):
     # sync_positions_with_exchange override
     # ------------------------------------------------------------------
 
+    async def _mt5_positions_get_retry(self) -> Any | None:
+        """Call ``mt5.positions_get()`` from a worker thread with retries.
+
+        ``None`` means MT5 could not return a snapshot (transient terminal/API).
+        """
+        if not _MT5_AVAILABLE:
+            return None
+        delay = 0.04
+        for attempt in range(4):
+            raw = await asyncio.to_thread(mt5.positions_get)
+            if raw is not None:
+                return raw
+            await asyncio.sleep(delay * (attempt + 1))
+        return None
+
+    async def _mt5_positions_fallback_symbols(self) -> list[Any]:
+        """When global ``positions_get()`` fails, merge per known local symbols.
+
+        Prevents total sync starvation when the aggregate call returns ``None``
+        (seen under terminal stress): we still see broker tickets for symbols we track.
+        """
+        merged: list[Any] = []
+        seen_tickets: set[int] = set()
+        async with self._positions_lock:
+            syms = list(self.open_positions.keys())
+        for sym in syms:
+            mt5_sym = self._resolve_symbol(sym)
+            if not mt5_sym:
+                continue
+            raw = await asyncio.to_thread(lambda s=mt5_sym: mt5.positions_get(symbol=s))
+            if not raw:
+                continue
+            for p in raw:
+                tid = int(getattr(p, "ticket", 0) or 0)
+                if tid and tid not in seen_tickets:
+                    seen_tickets.add(tid)
+                    merged.append(p)
+        return merged
+
+    async def _reconcile_stale_tickets(self) -> None:
+        """Remove locals whose MT5 *ticket* no longer exists.
+
+        Symbol-set reconciliation misses the case: old ticket closed on broker,
+        new position opened same symbol (still ``live_symbols`` contains sym).
+        """
+        if not _MT5_AVAILABLE:
+            return
+        async with self._positions_lock:
+            snapshot = [(s, p) for s, p in self.open_positions.items()]
+        for sym, pos in snapshot:
+            tid = getattr(pos, "mt5_position_ticket", None)
+            if not isinstance(tid, int) or tid <= 0:
+                continue
+            pins = await asyncio.to_thread(lambda t=tid: mt5.positions_get(ticket=t))
+            if pins is None:
+                logger.warning(
+                    "[MT5 SYNC] positions_get(ticket=%s) returned None — deferring ghost for %s.",
+                    tid,
+                    sym,
+                )
+                continue
+            if len(pins) == 0:
+                logger.info(
+                    "[MT5 SYNC] Ticket %s closed on broker — ghost reconcile %s",
+                    tid,
+                    sym,
+                )
+                await self._reconcile_ghost_position(sym)
+
     async def sync_positions_with_exchange(self) -> int:
         """Re-sync local state against live MT5 positions.
 
         Detects *ghost* positions (in local memory but not on MT5) and removes
         them.  Positions open on MT5 with our *magic* but missing locally are
         **adopted** (LONG only) into ``open_positions`` + DB.
+
+        Also reconciles by **position ticket** so a stale local row does not
+        survive when a new trade on the same symbol replaced the broker ticket.
 
         In pure paper mode (``live=False``) returns the local position count
         unchanged.
@@ -2126,16 +2198,26 @@ class MT5Executor(PaperExecutor):
             logger.warning("[MT5 SYNC] MetaTrader5 not available – skipping sync.")
             return len(self.open_positions)
 
-        mt5_positions = mt5.positions_get()
-        if mt5_positions is None:
-            logger.warning("[MT5 SYNC] mt5.positions_get() returned None.")
-            return len(self.open_positions)
+        mt5_positions_raw = await self._mt5_positions_get_retry()
+        if mt5_positions_raw is None:
+            logger.warning(
+                "[MT5 SYNC] mt5.positions_get() still None after retries — "
+                "using per-symbol fallback + ticket checks.",
+            )
+            mt5_positions_raw = await self._mt5_positions_fallback_symbols()
+            if not mt5_positions_raw:
+                await self._reconcile_stale_tickets()
+                async with self._positions_lock:
+                    actual = len(self.open_positions)
+                    if self._risk.open_count != actual:
+                        self._risk.sync_open_count(actual)
+                return actual
 
         # Convert broker symbols (e.g. BTCUSD-T) to local symbols (BTC/USDT)
         # so comparisons against self.open_positions keys are consistent.
         live_symbols: set[str] = {
             self._local_symbol_from_broker(p.symbol)
-            for p in mt5_positions
+            for p in mt5_positions_raw
             if p.magic == self._magic
         }
 
@@ -2144,6 +2226,9 @@ class MT5Executor(PaperExecutor):
             ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
         for sym in ghost_symbols:
             await self._reconcile_ghost_position(sym)
+
+        # Same symbol, new broker ticket — remove stale local ticket row
+        await self._reconcile_stale_tickets()
 
         # Broker-only positions → import into local book (LONG + our magic)
         async with self._positions_lock:
