@@ -196,6 +196,19 @@ async def health_monitor_loop(
     stale_alert_sent = False
     backlog_alert_sent = False
     pending_alert_streak = 0
+    last_hospital_sync_mono = 0.0
+    try:
+        _q_thr = max(100, int(os.environ.get("HEALTH_FORCE_SYNC_QUEUE", "800")))
+    except ValueError:
+        _q_thr = 800
+    try:
+        _stale_thr = max(30.0, float(os.environ.get("HEALTH_FORCE_SYNC_STALE_S", "90")))
+    except ValueError:
+        _stale_thr = 90.0
+    try:
+        _hosp_iv = max(5.0, float(os.environ.get("HEALTH_FORCE_SYNC_INTERVAL_S", "15")))
+    except ValueError:
+        _hosp_iv = 15.0
     while True:
         await asyncio.sleep(interval)
         now = datetime.now(tz=timezone.utc)
@@ -205,6 +218,25 @@ async def health_monitor_loop(
         stale_seconds: float | None = None
         if last_msg is not None:
             stale_seconds = (now - last_msg).total_seconds()
+
+        # Under backlog or stale feed the trading loop may skip ticks; force a
+        # broker ↔ memory reconcile so dashboards/Telegram stay aligned with MT5.
+        if isinstance(paper_executor, MT5Executor) and paper_executor._live:
+            stressed = queue_size > _q_thr or (
+                stale_seconds is not None and stale_seconds > _stale_thr
+            )
+            now_mono = asyncio.get_running_loop().time()
+            if stressed and (now_mono - last_hospital_sync_mono) >= _hosp_iv:
+                last_hospital_sync_mono = now_mono
+                try:
+                    await paper_executor.sync_positions_with_exchange()
+                    logger.info(
+                        "[HEALTH] MT5 sync forced (queue=%d stale_s=%s)",
+                        queue_size,
+                        f"{stale_seconds:.1f}" if stale_seconds is not None else "n/a",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[HEALTH] forced MT5 sync failed: %s %s", exc, DEBUG_LOG_HINT)
 
         logger.debug(
             "[HEALTH] queue=%d open_positions=%d stale_seconds=%s",
