@@ -182,6 +182,8 @@ class DatabaseManager:
         if not self._pool:
             return
         b = self._to_timestamptz(bucket)
+        v_bar = max(float(volume), 0.0)
+        # Split bar volume across bid/ask so NOT NULL tick columns stay consistent (~total preserved).
         row: dict[str, Any] = {
             "timestamp": b,
             "symbol": symbol,
@@ -193,6 +195,8 @@ class DatabaseManager:
             # Quote bracket for the bar — satisfies tick-schema NOT NULL without inventing spread:
             "best_bid": float(low),
             "best_ask": float(high),
+            "bid_volume": v_bar * 0.5,
+            "ask_volume": v_bar * 0.5,
         }
         order = (
             "timestamp",
@@ -204,6 +208,8 @@ class DatabaseManager:
             "volume",
             "best_bid",
             "best_ask",
+            "bid_volume",
+            "ask_volume",
         )
         async with self._pool.acquire() as conn:
             if not self._market_cols:

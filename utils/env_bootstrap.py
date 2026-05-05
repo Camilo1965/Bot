@@ -34,3 +34,40 @@ def load_env_file(path: Path, *, override: bool = False) -> None:
         if override or os.getenv(key) is None:
             os.environ[key] = val
     logging.getLogger("dotenv.main").setLevel(logging.ERROR)
+
+
+def patch_dotenv_load() -> None:
+    """Make ``dotenv.load_dotenv()`` UTF-safe so libs that call it stop spamming parse errors."""
+    try:
+        import dotenv.main as dm
+
+        _orig = dm.load_dotenv
+
+        def _patched(
+            dotenv_path: str | os.PathLike[str] | None = None,
+            stream: object | None = None,
+            verbose: bool = False,
+            override: bool = False,
+            interpolate: bool = True,
+            encoding: str | None = None,
+        ) -> bool:
+            if stream is not None:
+                return bool(
+                    _orig(
+                        stream=stream,
+                        verbose=verbose,
+                        override=override,
+                        interpolate=interpolate,
+                        encoding=encoding,
+                    )
+                )
+            path = Path(dotenv_path) if dotenv_path else Path.cwd() / ".env"
+            load_env_file(path, override=override)
+            return path.is_file()
+
+        dm.load_dotenv = _patched  # type: ignore[method-assign]
+    except Exception:
+        pass
+
+
+patch_dotenv_load()

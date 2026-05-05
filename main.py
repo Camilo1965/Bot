@@ -40,9 +40,10 @@ from zoneinfo import ZoneInfo
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
-try:
-    from utils.env_bootstrap import load_env_file
+import utils.env_bootstrap  # noqa: E402 — patches dotenv.load_dotenv (UTF-16 .env)
+from utils.env_bootstrap import load_env_file
 
+try:
     load_env_file(_ROOT / ".env")
 except Exception:
     pass
