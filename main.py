@@ -727,7 +727,7 @@ async def main() -> None:
         # ------------------------------------------------------------------
         paper_executor.load_state()
         try:
-            real_count = await paper_executor.sync_positions_with_exchange()
+            real_count = await paper_executor.sync_positions_with_exchange(confirmations_required=1)
             if real_count > 0:
                 logger.info(
                     "✅ [MT5 SYNC] Startup reconcile complete – "
@@ -742,6 +742,11 @@ async def main() -> None:
                     "🔄 [MT5 SYNC] No live MT5 positions at startup – "
                     "starting fresh session."
                 )
+            logger.info(
+                "[MT5 SYNC] Startup ghost confirmation override=%d (runtime=%d).",
+                1,
+                getattr(paper_executor, "_ghost_min_confirmations", 1),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "⚠️ [MT5 SYNC] Startup position sync failed: %s – "

@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+from bot.web_server import _fallback_ceo_payload
 from execution.mt5_executor import SYMBOL_MAP, MT5Executor
 
 
@@ -24,6 +25,18 @@ class MT5SyncGuardsTests(unittest.TestCase):
         self.assertTrue(ex._ghost_mark_missing("ticket:1"))
         ex._ghost_reset("ticket:1")
         self.assertFalse(ex._ghost_mark_missing("ticket:1"))
+
+    def test_ghost_confirmation_override_for_startup(self) -> None:
+        ex = MT5Executor(db=_FakeDB(), risk_manager=_FakeRiskManager(), live=False)
+        ex._ghost_min_confirmations = 3
+        self.assertTrue(ex._ghost_mark_missing("ticket:2", confirmations_required=1))
+
+    def test_web_ceo_fallback_payload_shape(self) -> None:
+        payload = _fallback_ceo_payload("America/Bogota")
+        self.assertEqual(payload["trades_7d"], 0)
+        self.assertEqual(payload["symbols_month"], [])
+        self.assertEqual(payload["recent_trades"], [])
+        self.assertIn("last_updated_local", payload)
 
     @patch("execution.mt5_executor.mt5")
     @patch("execution.mt5_executor._MT5_AVAILABLE", True)

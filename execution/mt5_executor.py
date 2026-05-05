@@ -615,11 +615,12 @@ class MT5Executor(PaperExecutor):
             return f"ticket:{ticket}"
         return f"symbol:{sym}"
 
-    def _ghost_mark_missing(self, key: str) -> bool:
+    def _ghost_mark_missing(self, key: str, confirmations_required: int | None = None) -> bool:
         """Increment miss counter. True when ghost is confirmed."""
         count = self._ghost_missing_counts.get(key, 0) + 1
         self._ghost_missing_counts[key] = count
-        return count >= self._ghost_min_confirmations
+        needed = self._ghost_min_confirmations if confirmations_required is None else max(1, confirmations_required)
+        return count >= needed
 
     def _ghost_reset(self, key: str) -> None:
         self._ghost_missing_counts.pop(key, None)
@@ -2279,7 +2280,7 @@ class MT5Executor(PaperExecutor):
                     merged.append(p)
         return merged
 
-    async def _reconcile_stale_tickets(self) -> None:
+    async def _reconcile_stale_tickets(self, confirmations_required: int | None = None) -> None:
         """Remove locals whose MT5 *ticket* no longer exists.
 
         Symbol-set reconciliation misses the case: old ticket closed on broker,
@@ -2305,13 +2306,18 @@ class MT5Executor(PaperExecutor):
                 )
                 continue
             if len(pins) == 0:
-                if not self._ghost_mark_missing(gk):
+                needed = (
+                    self._ghost_min_confirmations
+                    if confirmations_required is None
+                    else max(1, confirmations_required)
+                )
+                if not self._ghost_mark_missing(gk, confirmations_required=needed):
                     logger.warning(
                         "[MT5 SYNC] Ticket %s missing for %s (%d/%d) — waiting confirmation.",
                         tid,
                         sym,
                         self._ghost_missing_counts.get(gk, 0),
-                        self._ghost_min_confirmations,
+                        needed,
                     )
                     continue
                 logger.info(
@@ -2323,7 +2329,7 @@ class MT5Executor(PaperExecutor):
             else:
                 self._ghost_reset(gk)
 
-    async def sync_positions_with_exchange(self) -> int:
+    async def sync_positions_with_exchange(self, confirmations_required: int | None = None) -> int:
         """Re-sync local state against live MT5 positions.
 
         Detects *ghost* positions (in local memory but not on MT5) and removes
@@ -2348,6 +2354,11 @@ class MT5Executor(PaperExecutor):
             logger.warning("[MT5 SYNC] MT5 disconnected — sync skipped (no ghost actions).")
             return len(self.open_positions)
 
+        needed_confirmations = (
+            self._ghost_min_confirmations
+            if confirmations_required is None
+            else max(1, confirmations_required)
+        )
         mt5_positions_raw = await self._mt5_positions_get_retry()
         if mt5_positions_raw is None:
             logger.warning(
@@ -2356,7 +2367,7 @@ class MT5Executor(PaperExecutor):
             )
             mt5_positions_raw = await self._mt5_positions_fallback_symbols()
             if not mt5_positions_raw:
-                await self._reconcile_stale_tickets()
+                await self._reconcile_stale_tickets(confirmations_required=needed_confirmations)
                 async with self._positions_lock:
                     actual = len(self.open_positions)
                     if self._risk.open_count != actual:
@@ -2380,20 +2391,20 @@ class MT5Executor(PaperExecutor):
                     self._ghost_reset(self._ghost_key(sym, getattr(pos, "mt5_position_ticket", None)))
                     continue
                 gk = self._ghost_key(sym, getattr(pos, "mt5_position_ticket", None))
-                if self._ghost_mark_missing(gk):
+                if self._ghost_mark_missing(gk, confirmations_required=needed_confirmations):
                     ghost_symbols.append(sym)
                 else:
                     logger.warning(
                         "[MT5 SYNC] Ghost candidate %s (%d/%d) — waiting confirmation.",
                         sym,
                         self._ghost_missing_counts.get(gk, 0),
-                        self._ghost_min_confirmations,
+                        needed_confirmations,
                     )
         for sym in ghost_symbols:
             await self._reconcile_ghost_position(sym)
 
         # Same symbol, new broker ticket — remove stale local ticket row
-        await self._reconcile_stale_tickets()
+        await self._reconcile_stale_tickets(confirmations_required=needed_confirmations)
 
         # Broker-only positions → import into local book (LONG + our magic)
         async with self._positions_lock:
@@ -2898,11 +2909,16 @@ class MT5Executor(PaperExecutor):
             "time": datetime.fromtimestamp(tick.time, tz=timezone.utc),
         }
 
-    def get_open_positions(self, symbol: str | None = None) -> list[dict]:
+    def get_open_positions(
+        self,
+        symbol: str | None = None,
+        *,
+        include_foreign: bool = False,
+    ) -> list[dict]:
         """Return open MT5 positions opened by this bot instance.
 
-        Filters by :attr:`_magic` so that manual trades made directly in the
-        MT5 terminal are not included.
+        By default filters by :attr:`_magic` (bot positions only). Set
+        ``include_foreign=True`` to include manual/other-EA broker positions.
 
         Parameters
         ----------
@@ -2937,7 +2953,7 @@ class MT5Executor(PaperExecutor):
 
         result: list[dict] = []
         for pos in raw:
-            if pos.magic != self._magic:
+            if not include_foreign and pos.magic != self._magic:
                 continue  # Ignore positions not opened by this bot instance.
             result.append({
                 "ticket": pos.ticket,

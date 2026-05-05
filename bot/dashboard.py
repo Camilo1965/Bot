@@ -78,7 +78,26 @@ def generate_dashboard(
     sentiment_str = f"{sentiment_val:.4f}" if sentiment is not None else "—"
     s_color = "bright_green" if sentiment_val >= 0.55 else "yellow" if sentiment_val >= 0.35 else "bright_red"
 
-    n_pos = len(paper_executor.open_positions)
+    broker_positions_any: list[dict[str, Any]] = []
+    broker_open_symbols: set[str] = set()
+    get_positions = getattr(paper_executor, "get_open_positions", None)
+    if callable(get_positions):
+        try:
+            broker_positions_any = get_positions(include_foreign=True)
+            if isinstance(broker_positions_any, list):
+                for p in broker_positions_any:
+                    bsym = str(p.get("symbol", ""))
+                    local_sym = (
+                        paper_executor._local_symbol_from_broker(bsym)
+                        if hasattr(paper_executor, "_local_symbol_from_broker")
+                        else bsym
+                    )
+                    if local_sym:
+                        broker_open_symbols.add(local_sym)
+        except Exception:
+            broker_positions_any = []
+            broker_open_symbols = set()
+    n_pos = len(broker_open_symbols) if broker_open_symbols else len(paper_executor.open_positions)
     total_pnl = paper_executor.total_pnl
     wins = dash_state.session_wins
     losses = dash_state.session_losses
@@ -282,8 +301,11 @@ def generate_dashboard(
     ops_table.add_column("Trailing", justify="center")
     ops_table.add_column("Duración", justify="right")
 
-    if paper_executor.open_positions:
-        for sym, pos in list(paper_executor.open_positions.items())[:6]:
+    if paper_executor.open_positions or broker_positions_any:
+        shown = 0
+        for sym, pos in list(paper_executor.open_positions.items()):
+            if shown >= 6:
+                break
             px_buf = state.get("prices", {}).get(sym, [])
             candle_m = float(px_buf[-1]) if px_buf else pos.entry_price
             mark = mt5_dashboard_mark(state, sym, candle_m) or pos.entry_price
@@ -306,6 +328,37 @@ def generate_dashboard(
                 trail,
                 f"[dim]{dur}[/dim]",
             )
+            shown += 1
+        if shown < 6:
+            for p in broker_positions_any:
+                if shown >= 6:
+                    break
+                bsym = str(p.get("symbol", ""))
+                local_sym = (
+                    paper_executor._local_symbol_from_broker(bsym)
+                    if hasattr(paper_executor, "_local_symbol_from_broker")
+                    else bsym
+                )
+                if local_sym in paper_executor.open_positions:
+                    continue
+                entry = float(p.get("price_open", 0.0) or 0.0)
+                current = float(p.get("price_current", 0.0) or 0.0)
+                profit = float(p.get("profit", 0.0) or 0.0)
+                slb = float(p.get("sl", 0.0) or 0.0)
+                tpb = float(p.get("tp", 0.0) or 0.0)
+                pnl_color = "bright_green" if profit >= 0 else "bright_red"
+                ops_table.add_row(
+                    str(local_sym).split("/")[0],
+                    f"{entry:,.2f}" if entry > 0 else "—",
+                    f"{current:,.2f}" if current > 0 else "—",
+                    f"{slb:,.2f}" if slb > 0 else "—",
+                    f"{tpb:,.2f}" if tpb > 0 else "—",
+                    "[dim]—[/dim]",
+                    f"[{pnl_color}]{profit:+.2f}[/{pnl_color}]",
+                    "[dim]MANUAL[/dim]",
+                    "[dim]broker[/dim]",
+                )
+                shown += 1
     else:
         ops_table.add_row("[dim]Sin posiciones abiertas[/dim]", *[""] * 8)
 

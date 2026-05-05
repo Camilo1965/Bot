@@ -66,6 +66,26 @@ def _htf_trend_letters(t15: str, t1h: str, t4h: str) -> str:
     return f"{_one(t15)}/{_one(t1h)}/{_one(t4h)}"
 
 
+def _fallback_ceo_payload(report_tz: str) -> dict[str, Any]:
+    """Return safe CEO block when DB is unavailable."""
+    try:
+        tz_obj = ZoneInfo(report_tz)
+    except Exception:
+        tz_obj = timezone.utc  # type: ignore[assignment]
+    return {
+        "pnl_7d": "+0.00 USDT",
+        "pnl_7d_num": 0.0,
+        "winrate_7d": "0.0%",
+        "trades_7d": 0,
+        "pnl_30d": "+0.00 USDT",
+        "pnl_30d_num": 0.0,
+        "profit_factor_30d": "N/A",
+        "symbols_month": [],
+        "recent_trades": [],
+        "last_updated_local": datetime.now(tz=tz_obj).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -610,10 +630,18 @@ async def start_web_dashboard(
         now_mono = asyncio.get_event_loop().time()
         if ceo_cache["data"] is not None and now_mono < float(ceo_cache["expires_mono"]):
             return ceo_cache["data"]
-        week = await db.fetch_period_summary("week", tz_name=report_tz)
-        month = await db.fetch_period_summary("month", tz_name=report_tz)
-        symbols = await db.fetch_symbol_performance("month", tz_name=report_tz)
-        recent = await db.fetch_recent_closed_trades(limit=250)
+        try:
+            week = await db.fetch_period_summary("week", tz_name=report_tz)
+            month = await db.fetch_period_summary("month", tz_name=report_tz)
+            symbols = await db.fetch_symbol_performance("month", tz_name=report_tz)
+            recent = await db.fetch_recent_closed_trades(limit=250)
+        except Exception as exc:  # noqa: BLE001
+            # Keep API alive while DB reconnects/shuts down.
+            logger.warning("Web CEO snapshot fallback (DB unavailable): %s", exc)
+            fallback = _fallback_ceo_payload(report_tz)
+            ceo_cache["data"] = fallback
+            ceo_cache["expires_mono"] = now_mono + 5.0
+            return fallback
         tz_obj = ZoneInfo(report_tz)
         recent_rows: list[dict[str, Any]] = []
         for row in recent:
@@ -740,12 +768,14 @@ async def start_web_dashboard(
         htf_trend = state.get("htf_trend", {})
         mt5_profit_by_ticket: dict[int, float] = {}
         mt5_by_ticket: dict[int, dict[str, Any]] = {}
+        mt5_symbol_open_any: set[str] = set()
+        mt5_symbol_open_bot: set[str] = set()
 
         # MT5 live mode: prefer broker-reported unrealized PnL so dashboard matches terminal.
         get_positions = getattr(paper_executor, "get_open_positions", None)
         if callable(get_positions):
             try:
-                mt5_positions = get_positions()
+                mt5_positions = get_positions(include_foreign=True)
                 if isinstance(mt5_positions, list):
                     for p in mt5_positions:
                         t = p.get("ticket")
@@ -754,9 +784,17 @@ async def start_web_dashboard(
                         tid = int(t)
                         mt5_profit_by_ticket[tid] = float(p.get("profit", 0.0))
                         mt5_by_ticket[tid] = p
+                        br_sym = str(p.get("symbol", ""))
+                        local_sym = paper_executor._local_symbol_from_broker(br_sym) if hasattr(paper_executor, "_local_symbol_from_broker") else br_sym
+                        if local_sym:
+                            mt5_symbol_open_any.add(local_sym)
+                            if int(p.get("magic", 0) or 0) == int(getattr(paper_executor, "_magic", -1)):
+                                mt5_symbol_open_bot.add(local_sym)
             except Exception:
                 mt5_profit_by_ticket = {}
                 mt5_by_ticket = {}
+                mt5_symbol_open_any = set()
+                mt5_symbol_open_bot = set()
         
         for sym in watchlist:
             prices = list(state["prices"].get(sym, []))
@@ -780,7 +818,9 @@ async def start_web_dashboard(
             t4h = htf_trend.get(sym, {}).get("4h", "neutral")
 
             pos = paper_executor.open_positions.get(sym)
-            has_pos = bool(pos)
+            has_pos_local = bool(pos)
+            has_pos_broker = sym in mt5_symbol_open_any
+            has_pos = has_pos_local or has_pos_broker
             unrl = 0.0
             pos_str = ""
             sl_display = ""
@@ -796,7 +836,7 @@ async def start_web_dashboard(
             can_buy = False
             entry_hint = ""
 
-            if has_pos and pos is not None:
+            if has_pos_local and pos is not None:
                 mt5_ticket = getattr(pos, "mt5_position_ticket", None)
                 if isinstance(mt5_ticket, int) and mt5_ticket in mt5_profit_by_ticket:
                     unrl = mt5_profit_by_ticket[mt5_ticket]
@@ -828,6 +868,22 @@ async def start_web_dashboard(
                     br = mt5_by_ticket[mt5_ticket]
                     slb = float(br.get("sl") or 0.0)
                     tpb = float(br.get("tp") or 0.0)
+                    broker_sl_display = f"{slb:,.2f}" if slb > 0.0 else "—"
+                    broker_tp_display = f"{tpb:,.2f}" if tpb > 0.0 else "—"
+            elif has_pos_broker:
+                pos_str = "Abierta en broker (manual/externa)"
+                action = "Gestionando en broker"
+                strategy_signal = "MANUAL/BROKER"
+                trail_progress = "No gestionada por libro local"
+                br_positions = [x for x in mt5_by_ticket.values() if (paper_executor._local_symbol_from_broker(str(x.get("symbol", ""))) if hasattr(paper_executor, "_local_symbol_from_broker") else str(x.get("symbol", ""))) == sym]
+                if br_positions:
+                    p0 = br_positions[0]
+                    entry_br = float(p0.get("price_open", 0.0) or 0.0)
+                    if entry_br > 0:
+                        pos_str = f"Broker @ {entry_br:,.2f}"
+                    unrl = float(p0.get("profit", 0.0) or 0.0)
+                    slb = float(p0.get("sl") or 0.0)
+                    tpb = float(p0.get("tp") or 0.0)
                     broker_sl_display = f"{slb:,.2f}" if slb > 0.0 else "—"
                     broker_tp_display = f"{tpb:,.2f}" if tpb > 0.0 else "—"
             else:
@@ -889,7 +945,11 @@ async def start_web_dashboard(
         total_trades_session = wins + losses
         winrate_session = (wins / total_trades_session * 100) if total_trades_session > 0 else 0.0
 
-        ceo = await build_ceo_snapshot()
+        try:
+            ceo = await build_ceo_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Web CEO snapshot failed unexpectedly: %s", exc)
+            ceo = _fallback_ceo_payload(report_tz)
         resp = {
             "uptime": uptime_str,
             "sentiment": f"{sentiment:.4f}" if sentiment is not None else "--",
@@ -903,7 +963,10 @@ async def start_web_dashboard(
             "session_pnl_num": paper_executor.total_pnl,
             "max_drawdown": f"{state.get('max_drawdown', 0.0):+.2f}",
             "max_drawdown_num": state.get("max_drawdown", 0.0),
-            "open_count": len(paper_executor.open_positions),
+            "open_count": len(mt5_symbol_open_any) if mt5_symbol_open_any else len(paper_executor.open_positions),
+            "open_count_local": len(paper_executor.open_positions),
+            "open_count_broker": len(mt5_symbol_open_any),
+            "server_time_utc": now_utc.isoformat(),
             "max_positions": risk_manager.max_positions,
             "session_wins": wins,
             "session_losses": losses,
