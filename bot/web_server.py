@@ -969,7 +969,3 @@ async def start_web_dashboard(
             await asyncio.sleep(3600)
     finally:
         await runner.cleanup()
-rue:
-            await asyncio.sleep(3600)
-    finally:
-        await runner.cleanup()
