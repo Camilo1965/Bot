@@ -9,35 +9,17 @@ Position size formula::
     position_size = balance * RISK_PER_TRADE * LEVERAGE
 
 where:
-* ``RISK_PER_TRADE`` is the fraction of the balance risked per trade (15 %).
-* ``LEVERAGE``       is the futures leverage multiplier (5× – Elite Sniper).
+* ``RISK_PER_TRADE`` is the fraction of the balance risked per trade.
+* ``LEVERAGE``       is the futures leverage multiplier (5×).
 
 Trailing stop parameters
 ------------------------
-* ``INITIAL_SL``:        Hard stop loss during the entry phase (1.5 %).
+* ``INITIAL_SL``:        Hard stop loss during the entry phase (2.5 %).
 * ``ACTIVATION_PCT``:    Minimum profit required to activate the trailing
-                         stop (2.5 %).  Once this threshold is reached the
+                         stop (2.0 %).  Once this threshold is reached the
                          active stop loss updates dynamically.
 * ``TRAILING_DISTANCE``: Gap maintained between the running peak price and
-                         the trailing stop level (1.5 %).
-
-Dynamic risk management
------------------------
-:func:`get_dynamic_thresholds` adjusts the trailing-stop parameters
-at position open time based on the absolute value of the AI sentiment
-score provided by :mod:`strategy.sentiment_llm`:
-
-* **Low sentiment** (abs < 0.30): multiplier 0.8 → *scalping* mode with
-  tighter SL and faster profit-taking.
-* **High sentiment** (abs > 0.60): multiplier 1.8 → *swing trading* mode
-  with wider thresholds to capture large directional moves.
-* Values in between are linearly interpolated.
-
-The multiplier is hard-clamped to [0.5, 2.5] and the resulting stop loss
-is additionally capped at 5 % to prevent dangerously wide stops.
-The activation threshold is additionally floored at 2 % (``_ACTIVATION_PCT_MIN``)
-so that the minimum dynamic profit always outpaces the 0.2 % round-trip
-exchange fees on a 5× leveraged position.
+                         the trailing stop level (2.0 %).
 
 Daily-loss safety break
 -----------------------
@@ -74,19 +56,19 @@ from datetime import datetime, timedelta, timezone
 logger = logging.getLogger(__name__)
 
 # ── Trade parameters ──────────────────────────────────────────────────────────
-INITIAL_SL: float = 0.015           # 1.5 % hard stop loss for initial protection
-ACTIVATION_PCT: float = 0.025      # 2.5 % profit required to activate trailing stop
-TRAILING_DISTANCE: float = 0.015   # 1.5 % trailing distance from the highest peak
+INITIAL_SL: float = 0.025          # 2.5 % hard stop loss for initial protection
+ACTIVATION_PCT: float = 0.02       # 2.0 % profit to activate trailing stop (module-level legacy)
+TRAILING_DISTANCE: float = 0.02    # 2.0 % trailing gap from peak once active
 
 # ── Futures / leverage parameters ─────────────────────────────────────────────
-LEVERAGE: int = 5                   # 5× futures leverage (Elite Sniper)
-RISK_PER_TRADE: float = 0.15        # 15 % of balance risked per trade
+LEVERAGE: int = 5                   # 5× futures leverage
+RISK_PER_TRADE: float = 0.01        # 1 % of balance risked per trade (cap 2 % in config reviews)
 
 # ── Daily-loss safety break ───────────────────────────────────────────────────
 MAX_DAILY_LOSS_PCT: float = 0.03    # 3 % maximum daily loss before halting
 _HALT_DURATION: timedelta = timedelta(hours=24)
 
-MAX_POSITIONS: int = 3          # Maximum simultaneous open positions
+MAX_POSITIONS: int = 2          # Maximum simultaneous open positions
 
 # ── Portfolio drawdown circuit-breaker ───────────────────────────────────────
 MAX_PORTFOLIO_DD_PCT: float = 0.15  # 15 % max peak-to-trough loss from initial balance
@@ -123,9 +105,9 @@ def get_sector(symbol: str) -> str:
 
 
 # ── Dynamic risk management – base thresholds (neutral market) ────────────────
-BASE_SL: float = 0.015                      # 1.5 % base stop loss
-BASE_ACTIVATION_PCT: float = 0.010          # 1.0 % profit to activate trailing stop
-BASE_TRAILING_DISTANCE: float = 0.015       # 1.5 % trailing distance
+BASE_SL: float = 0.025                      # 2.5 % base stop loss
+BASE_ACTIVATION_PCT: float = 0.020          # 2.0 % profit to activate trailing stop
+BASE_TRAILING_DISTANCE: float = 0.020       # 2.0 % trailing distance
 
 # ── Dynamic risk management – sentiment multiplier bounds ─────────────────────
 _SENTIMENT_LOW_THRESHOLD: float = 0.30      # below this → scalping regime
@@ -148,75 +130,19 @@ class DynamicThresholds:
     multiplier: float
 
 
-def get_dynamic_thresholds(sentiment_score: float) -> DynamicThresholds:
-    """Return sentiment-adjusted risk thresholds.
+def get_execution_thresholds() -> DynamicThresholds:
+    """Fixed execution thresholds without LLM sentiment (simplified live path).
 
-    The *sentiment_score* is expected in **[-1.0, +1.0]** (as returned by
-    :func:`~strategy.sentiment_llm.get_gemini_sentiment`).  Only the
-    absolute magnitude is used so that both strong bearish and strong
-    bullish readings widen the thresholds.
-
-    Regime mapping
-    ~~~~~~~~~~~~~~
-    * ``abs(sentiment) < 0.30`` → *scalping* – tighter SL / activation / trailing
-      distance so the bot takes profits quickly.
-    * ``abs(sentiment) > 0.60`` → *swing trading* – wider thresholds so the bot
-      can capture large directional moves.
-    * In between → multiplier is linearly interpolated.
-
-    Safety net
-    ~~~~~~~~~~
-    * The multiplier is clamped to [``_MULTIPLIER_MIN``, ``_MULTIPLIER_MAX``]
-      so it is never zero or negative.
-    * The resulting SL is additionally capped at ``_SL_CAP`` (5 %) to prevent
-      dangerously wide stop losses.
-    * The resulting activation threshold is floored at ``_ACTIVATION_PCT_MIN``
-      (2 %) to ensure the minimum dynamic profit always outpaces the 0.2 %
-      round-trip exchange fees on a 5× leveraged position.
-
-    Parameters
-    ----------
-    sentiment_score:
-        LLM-generated sentiment score in [-1.0, +1.0].
-
-    Returns
-    -------
-    DynamicThresholds
-        Adjusted thresholds ready for use in position management.
+    Uses :data:`BASE_SL`, :data:`BASE_ACTIVATION_PCT`, and
+    :data:`BASE_TRAILING_DISTANCE` directly so stops are predictable and wide
+    enough to avoid structural noise exits.
     """
-    abs_sentiment = abs(sentiment_score)
-
-    if abs_sentiment < _SENTIMENT_LOW_THRESHOLD:
-        multiplier = _MULTIPLIER_LOW
-    elif abs_sentiment > _SENTIMENT_HIGH_THRESHOLD:
-        multiplier = _MULTIPLIER_HIGH
-    else:
-        # Linear interpolation between _MULTIPLIER_LOW and _MULTIPLIER_HIGH
-        span = _SENTIMENT_HIGH_THRESHOLD - _SENTIMENT_LOW_THRESHOLD
-        t = (abs_sentiment - _SENTIMENT_LOW_THRESHOLD) / span
-        multiplier = _MULTIPLIER_LOW + t * (_MULTIPLIER_HIGH - _MULTIPLIER_LOW)
-
-    # Apply safety bounds
-    multiplier = max(_MULTIPLIER_MIN, min(_MULTIPLIER_MAX, multiplier))
-
-    sl_pct = min(BASE_SL * multiplier, _SL_CAP)
-    activation_pct = max(BASE_ACTIVATION_PCT * multiplier, _ACTIVATION_PCT_MIN)
-    trailing_distance_pct = BASE_TRAILING_DISTANCE * multiplier
-
-    logger.debug(
-        "dynamic_thresholds  abs_sentiment=%.4f  multiplier=%.4f  "
-        "sl=%.4f  activation=%.4f  trailing_dist=%.4f",
-        abs_sentiment,
-        multiplier,
-        sl_pct,
-        activation_pct,
-        trailing_distance_pct,
-    )
+    activation_pct = max(BASE_ACTIVATION_PCT, _ACTIVATION_PCT_MIN)
     return DynamicThresholds(
-        sl_pct=sl_pct,
+        sl_pct=min(BASE_SL, _SL_CAP),
         activation_pct=activation_pct,
-        trailing_distance_pct=trailing_distance_pct,
-        multiplier=multiplier,
+        trailing_distance_pct=BASE_TRAILING_DISTANCE,
+        multiplier=1.0,
     )
 
 

@@ -71,6 +71,7 @@ except ImportError:
     pd = None  # type: ignore[assignment]
     _PANDAS_AVAILABLE = False
 
+from execution.journal_symbols import journal_symbol
 from execution.paper_executor import (
     _TAKER_FEE_RATE,
     ATR_SL_MULTIPLIER,
@@ -84,7 +85,7 @@ from execution.paper_executor import (
 from risk.risk_manager import (
     LEVERAGE,
     DynamicThresholds,
-    get_dynamic_thresholds,
+    get_execution_thresholds,
     get_sector,
 )
 from utils.telegram_notifier import send_telegram_alert
@@ -1531,7 +1532,7 @@ class MT5Executor(PaperExecutor):
             self._pending_symbols.add(sym)
 
         # ── Dynamic risk thresholds from sentiment ─────────────────────────
-        thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
+        thresholds: DynamicThresholds = get_execution_thresholds()
         
         # ── ATR-based dynamic SL logging ──────────────────────────────────
         if current_atr is not None and current_atr > 0.0:
@@ -1707,15 +1708,16 @@ class MT5Executor(PaperExecutor):
             pos_ref = self.open_positions[sym]
             self._pending_symbols.discard(sym)
 
+        js = journal_symbol(sym)
         record_trade(
             timestamp=ts,
-            symbol=sym,
+            symbol=js,
             action="BUY",
             execution_price=entry_price,
             quantity=position_size / entry_price,
             ml_confidence_at_entry=win_probability,
             sentiment_score_at_entry=sentiment_score,
-            idempotency_key=f"BUY:{sym}:ticket:{mt5_ticket or trade_id}",
+            idempotency_key=f"BUY:{js}:ticket:{mt5_ticket or trade_id}",
         )
         self._save_state()
 
@@ -1830,9 +1832,10 @@ class MT5Executor(PaperExecutor):
 
         margin_used = pos.position_size / LEVERAGE
         pnl_pct = (pnl_net / margin_used * 100) if margin_used > 0 else 0.0
+        js = journal_symbol(sym_ref)
         record_trade(
             timestamp=exit_time,
-            symbol=sym_ref,
+            symbol=js,
             action="SELL",
             execution_price=exit_price,
             quantity=pos.position_size / exit_price,
@@ -1841,7 +1844,9 @@ class MT5Executor(PaperExecutor):
             exit_reason=exit_reason_code,
             pnl_usdt=pnl_net,
             pnl_percent=pnl_pct,
-            idempotency_key=f"SELL:{sym_ref}:ticket:{mt5_ticket or pos.trade_id}:{exit_reason_code}",
+            idempotency_key=f"SELL:{js}:ticket:{mt5_ticket or pos.trade_id}:{exit_reason_code}",
+            journal_entry_price=pos.entry_price,
+            journal_exit_price=exit_price,
         )
         self._save_state()
 
@@ -1973,7 +1978,7 @@ class MT5Executor(PaperExecutor):
         position_size = volume * contract_size * entry
 
         sl_raw = float(p.sl or 0.0)
-        thresholds = get_dynamic_thresholds(0.0)
+        thresholds = get_execution_thresholds()
         if sl_raw > 0.0:
             stop_loss_price = self._normalize_price(sl_raw, digits)
         else:
@@ -2030,15 +2035,16 @@ class MT5Executor(PaperExecutor):
             self.open_positions[sym] = op
             self._risk.register_open()
 
+        js = journal_symbol(sym)
         record_trade(
             timestamp=ts,
-            symbol=sym,
+            symbol=js,
             action="BUY",
             execution_price=entry,
             quantity=position_size / entry if entry > 0 else 0.0,
             ml_confidence_at_entry=0.0,
             sentiment_score_at_entry=0.0,
-            idempotency_key=f"BUY:{sym}:ticket:{int(p.ticket)}",
+            idempotency_key=f"BUY:{js}:ticket:{int(p.ticket)}",
         )
         self._save_state()
 

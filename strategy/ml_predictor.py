@@ -2,50 +2,16 @@
 strategy.ml_predictor
 ~~~~~~~~~~~~~~~~~~~~~~
 
-XGBoost-based predictor for the probability of a BTC price increase in the
-next 5 price ticks (order-book snapshots).
+Dedicated **INJ/USDT** XGBoost classifier (six OHLC-derived features).
 
-Signal generation rules
------------------------
-* probability >= 0.62 AND sentiment_score >= -0.1 → **BUY**
-* probability < 0.3 AND sentiment_score < -0.3   → **SELL**
-* otherwise                                      → **HOLD**
+Entry rule
+----------
+* ``symbol`` must be in ``ALLOWED_SYMBOLS`` (otherwise **HOLD**).
+* ``probability >= BUY_PROB_THRESHOLD`` (0.70) → **BUY**, else **HOLD**.
 
-Elite Quant additions
-----------------------
-* **Order Book Imbalance (OBI)**: ``obi_ratio`` = total bid volume / total ask
-  volume across the top-5 depth levels.  Values > 1 indicate buy-side
-  pressure; values < 1 indicate sell-side pressure.
-
-* **Market Regime Classifier** (ADX-based):
-
-  - ADX > 25 (trending market): Trend-Following mode – BUY requires RSI > 50
-    AND positive momentum; SELL requires RSI < 50 AND negative momentum.
-  - ADX < 20 (range-bound market): Mean-Reversion mode – BUY triggered by RSI
-    oversold (< 35); SELL triggered by RSI overbought (> 65).
-  - 20 ≤ ADX ≤ 25: standard ML signal is used without regime adjustment.
-
-* **Funding Rate Bias**:
-
-  - lastFundingRate > +0.0003 (> +0.03 %, extreme greed): Short-Bias penalty –
-    a BUY signal is demoted to HOLD.
-  - lastFundingRate < -0.0003 (< -0.03 %, extreme fear): Long-Bias bonus – the
-    BUY signal is retained and flagged as ``[ELITE]``.
-
-When any of the Elite factors influences the final signal, the log line is
-prefixed with ``[ELITE]``.
-
-The model supports "warm-starting" from historical price data already stored
-in TimescaleDB via :meth:`MLPredictor.warm_start`.
-
-Usage
------
-    from strategy.ml_predictor import MLPredictor
-
-    predictor = MLPredictor()
-    predictor.warm_start(prices=[...])
-    signal = predictor.generate_signal(prices=[...], sentiment_score=0.4)
-    # → "BUY"
+No sentiment, HTF, funding, or regime overrides — the loaded model is the only
+entry gate.  :meth:`MLPredictor.warm_start` still retrains from history when no
+artifact is present; weekly retrainer may refresh ``models/INJ_USDT.json``.
 """
 
 from __future__ import annotations
@@ -59,19 +25,26 @@ from xgboost import XGBClassifier
 
 logger = logging.getLogger(__name__)
 
-# Signal thresholds
-# Raised from 0.55 → 0.62 to filter marginal signals that inflated trade count
-# and dragged down the win rate in back-tests (was briefly documented as 0.68
-# in the module docstring; 0.62 is the current calibrated value).
-_BUY_PROB_THRESHOLD = 0.62
-_BUY_SENTIMENT_THRESHOLD = -0.1   # allow sentiment down to -0.1 (values above -0.1 pass)
-_SELL_PROB_THRESHOLD = 0.3
+ALLOWED_SYMBOLS: tuple[str, ...] = ("INJ/USDT",)
+BUY_PROB_THRESHOLD: float = 0.70
+_INJ_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "INJ_USDT.json"
+_inj_xgb_singleton: XGBClassifier | None = None
+
+# Back-test / warm_start labelling only (not used for live entry)
+_SELL_PROB_THRESHOLD = 0.35
 _SELL_SENTIMENT_THRESHOLD = -0.3
 
-# Public aliases used by callers that need to synchronise their thresholds
-# with the predictor (e.g. smart exits, dashboard display).
-BUY_PROB_THRESHOLD: float = _BUY_PROB_THRESHOLD
-BUY_SENTIMENT_THRESHOLD: float = _BUY_SENTIMENT_THRESHOLD
+
+def load_model() -> XGBClassifier:
+    """Load ``models/INJ_USDT.json`` once per process (cached)."""
+    global _inj_xgb_singleton
+    if _inj_xgb_singleton is None:
+        if not _INJ_MODEL_PATH.is_file():
+            raise FileNotFoundError(str(_INJ_MODEL_PATH))
+        booster = XGBClassifier()
+        booster.load_model(str(_INJ_MODEL_PATH))
+        _inj_xgb_singleton = booster
+    return _inj_xgb_singleton
 
 # Default prediction horizon (price-tick steps)
 _PREDICTION_HORIZON = 5
@@ -107,14 +80,12 @@ HTF_TREND_NEUTRAL = "neutral"
 # Minimum number of HTF candles required to compute a trend
 _HTF_MIN_CANDLES = 3
 
-# Feature column order expected by the model
+# Feature column order expected by the model (OHLC-derived only; no sentiment/OBI)
 _FEATURE_COLS = [
-    "sentiment",
     "rsi",
     "sma_ratio",
     "volatility",
     "momentum",
-    "obi_ratio",
     "adx",
     "atr",
 ]
@@ -182,9 +153,9 @@ def compute_htf_trend(
 class MLPredictor:
     """Predicts price-direction probability and generates trading signals.
 
-    The underlying model is an XGBoost binary classifier trained on an
-    eight-element feature vector:
-    [sentiment, rsi, sma_ratio, volatility, momentum, obi_ratio, adx, atr].
+    The underlying model is an XGBoost binary classifier trained on a
+    six-element feature vector:
+    [rsi, sma_ratio, volatility, momentum, adx, atr].
     """
 
     def __init__(self) -> None:
@@ -290,20 +261,20 @@ class MLPredictor:
         Parameters
         ----------
         prices:    Recent mid-prices in chronological order.
-        sentiment: Current VADER compound score in [-1, +1].
+        sentiment: Ignored for the feature vector (kept for API compatibility).
         highs:     Optional high prices (same length as *prices*); used for
                    ADX / ATR calculation.  Defaults to ``None`` (ADX=25, ATR=0).
         lows:      Optional low prices (same length as *prices*); used for
                    ADX / ATR calculation.  Defaults to ``None`` (ADX=25, ATR=0).
-        obi_ratio: Order Book Imbalance ratio (bid_vol / ask_vol, top-5 depth).
-                   Defaults to ``1.0`` (perfectly balanced book).
+        obi_ratio: Ignored (kept for API compatibility).
 
         Returns
         -------
-        An eight-element list
-        ``[sentiment, rsi, sma_ratio, volatility, momentum, obi_ratio, adx, atr]``
+        A six-element list
+        ``[rsi, sma_ratio, volatility, momentum, adx, atr]``
         where NaN values are replaced with ``0.0``.
         """
+        del sentiment, obi_ratio
         series = pd.Series(prices, dtype=float)
 
         # SMA_20 ratio: current_price / SMA_20 (normalised)
@@ -343,7 +314,7 @@ class MLPredictor:
         else:
             adx, atr = _ADX_NEUTRAL_DEFAULT, 0.0  # neutral defaults when OHLCV unavailable
 
-        return [float(sentiment), rsi, sma_ratio, volatility, momentum, float(obi_ratio), adx, atr]
+        return [rsi, sma_ratio, volatility, momentum, adx, atr]
 
     # ------------------------------------------------------------------
     # Training / warm-start
@@ -366,13 +337,12 @@ class MLPredictor:
         Parameters
         ----------
         prices:           Historical mid/close-prices in chronological order.
-        sentiment_scores: Optional per-tick sentiment scores (same length as
-                          *prices*).  Defaults to ``0.0`` for all ticks.
+        sentiment_scores: Ignored (API compatibility).
         highs:            Optional high prices per tick (for ADX/ATR features).
                           When ``None``, ADX defaults to 25.0 and ATR to 0.0.
         lows:             Optional low prices per tick (for ADX/ATR features).
                           When ``None``, ADX defaults to 25.0 and ATR to 0.0.
-        obi_ratios:       Optional per-tick OBI ratios.  Defaults to ``1.0``.
+        obi_ratios:       Ignored (API compatibility).
         horizon:          Number of ticks ahead to use as the prediction target.
 
         Returns
@@ -380,6 +350,7 @@ class MLPredictor:
         ``True`` on success, ``False`` when there is insufficient data to
         produce at least 10 labelled training samples.
         """
+        del sentiment_scores, obi_ratios
         series = pd.Series(prices, dtype=float)
 
         # Compute all indicators across the full price history
@@ -396,18 +367,6 @@ class MLPredictor:
 
         mom_series = series.pct_change(_MOMENTUM_PERIOD) * 100
         sma_ratio_series = series / sma_20
-
-        sentiment_series = (
-            pd.Series(sentiment_scores, dtype=float)
-            if sentiment_scores is not None
-            else pd.Series(0.0, index=series.index)
-        )
-
-        obi_series = (
-            pd.Series(obi_ratios, dtype=float)
-            if obi_ratios is not None
-            else pd.Series(1.0, index=series.index)
-        )
 
         # ADX / ATR series (row-by-row computation for the full history)
         if highs is not None and lows is not None and len(highs) == len(prices):
@@ -444,12 +403,10 @@ class MLPredictor:
 
         df = pd.DataFrame(
             {
-                "sentiment": sentiment_series,
                 "rsi": rsi_series,
                 "sma_ratio": sma_ratio_series,
                 "volatility": vol_series,
                 "momentum": mom_series,
-                "obi_ratio": obi_series,
                 "adx": adx_series,
                 "atr": atr_series,
                 "price": series,
@@ -490,32 +447,19 @@ class MLPredictor:
     # Model persistence
     # ------------------------------------------------------------------
 
-    def load_model(self, filepath: str | Path) -> bool:
-        """Load a previously saved XGBoost model from *filepath*.
-
-        The model file must have been created by XGBoost's native
-        ``save_model`` (JSON or binary format).
-
-        Parameters
-        ----------
-        filepath: Path to the saved model file (e.g. ``models/xgb_live.json``).
-
-        Returns
-        -------
-        ``True`` on success, ``False`` if the file does not exist or cannot
-        be loaded.
-        """
-        path = Path(filepath)
-        if not path.exists():
-            logger.info("load_model: file not found at %s.", path)
-            return False
+    def load_model(self, filepath: str | Path | None = None) -> bool:
+        """Attach the dedicated INJ/USDT artefact (cached). *filepath* is ignored."""
+        _ = filepath
         try:
-            self._model.load_model(str(path))
+            self._model = load_model()
             self._is_trained = True
-            logger.info("MLPredictor loaded pre-trained model from %s.", path)
+            logger.info("MLPredictor loaded dedicated model from %s.", _INJ_MODEL_PATH)
             return True
+        except FileNotFoundError:
+            logger.info("load_model: file not found at %s.", _INJ_MODEL_PATH)
+            return False
         except Exception as exc:  # noqa: BLE001
-            logger.warning("load_model failed (%s): %s", path, exc)
+            logger.warning("load_model failed (%s): %s", _INJ_MODEL_PATH, exc)
             return False
 
     def save_model(self, filepath: str | Path) -> bool:
@@ -554,6 +498,8 @@ class MLPredictor:
         highs: list[float] | None = None,
         lows: list[float] | None = None,
         obi_ratio: float = 1.0,
+        *,
+        symbol: str | None = None,
     ) -> float | None:
         """Return the probability of an upward price move.
 
@@ -562,16 +508,19 @@ class MLPredictor:
         prices:          Recent mid-prices in chronological order.
                          At least ``_MIN_PRICES_FOR_INFERENCE`` (20) values are
                          required.
-        sentiment_score: Current VADER compound score in [-1, +1].
+        sentiment_score: Ignored (API compatibility).
         highs:           Optional high prices for ADX/ATR computation.
         lows:            Optional low prices for ADX/ATR computation.
-        obi_ratio:       Order Book Imbalance ratio (bid_vol / ask_vol, top-5).
+        obi_ratio:       Ignored (API compatibility).
+        symbol:          When set and not in ``ALLOWED_SYMBOLS``, returns ``None``.
 
         Returns
         -------
         A float in [0, 1] representing the predicted probability, or
         ``None`` when the model is untrained or there is insufficient history.
         """
+        if symbol is not None and symbol not in ALLOWED_SYMBOLS:
+            return None
         if not self._is_trained:
             logger.debug("predict_proba called before model is trained.")
             return None
@@ -596,19 +545,17 @@ class MLPredictor:
             )
             return None
 
-        rsi = features[1]
-        volatility = features[3]
-        momentum = features[4]
-        obi = features[5]
-        adx = features[6]
-        atr = features[7]
+        rsi = features[0]
+        volatility = features[2]
+        momentum = features[3]
+        adx = features[4]
+        atr = features[5]
         logger.debug(
             "[INDICATORS] RSI: %.1f | Volatility: %.4f | Momentum: %.1f%% | "
-            "OBI: %.4f | ADX: %.1f | ATR: %.4f",
+            "ADX: %.1f | ATR: %.4f",
             rsi,
             volatility,
             momentum,
-            obi,
             adx,
             atr,
         )
@@ -625,157 +572,30 @@ class MLPredictor:
         funding_rate: float = 0.0,
         htf_trend_4h: TrendStatus = HTF_TREND_NEUTRAL,
         htf_trend_1h: TrendStatus = HTF_TREND_NEUTRAL,
+        *,
+        symbol: str = "INJ/USDT",
     ) -> Signal:
-        """Generate a trading signal (BUY / SELL / HOLD).
+        """BUY only when *symbol* is allowed and model probability ≥ ``BUY_PROB_THRESHOLD``."""
+        del funding_rate, htf_trend_4h, htf_trend_1h
+        if symbol not in ALLOWED_SYMBOLS:
+            logger.debug("Signal=HOLD (symbol %s not in ALLOWED_SYMBOLS)", symbol)
+            return "HOLD"
 
-        Parameters
-        ----------
-        prices:          Recent mid-prices in chronological order.
-        sentiment_score: Current VADER compound score in [-1, +1].
-        highs:           Optional high prices for ADX/ATR computation.
-        lows:            Optional low prices for ADX/ATR computation.
-        obi_ratio:       Order Book Imbalance ratio (bid_vol / ask_vol, top-5).
-        funding_rate:    Current perpetual-futures funding rate as a decimal
-                         (e.g. 0.0001 = 0.01 % per 8-hour window).
-        htf_trend_4h:    4-hour trend status (``"bullish"``, ``"bearish"``, or
-                         ``"neutral"``).  Only a ``"bearish"`` value mutes a BUY
-                         signal to HOLD ("General" filter); ``"neutral"`` is
-                         permitted alongside ``"bullish"``.
-        htf_trend_1h:    1-hour trend status (same values).  BUY requires
-                         ``"bullish"`` ("Colonel" filter); ``"bearish"`` or
-                         ``"neutral"`` mutes BUY to HOLD.
-        Returns
-        -------
-        ``"BUY"``, ``"SELL"``, or ``"HOLD"`` with the following logic:
-
-        Base ML signal:
-          * probability >= 0.62 AND sentiment >= -0.1  → BUY
-          * probability < 0.3  AND sentiment < -0.3   → SELL
-          * otherwise                                  → HOLD
-
-        HTF Filter ("General" + "Colonel"):
-          * 4H trend bearish                           → BUY → HOLD
-          * 1H trend not bullish                       → BUY → HOLD
-
-        Market Regime override (ADX-based):
-          * ADX > 25 (trending): BUY only when RSI > 50 AND momentum > 0;
-            SELL only when RSI < 50 AND momentum < 0.
-          * ADX < 20 (range-bound): BUY when RSI < 35; SELL when RSI > 65.
-
-        Funding Rate bias:
-          * rate > +0.03 % (extreme greed): BUY → HOLD (Short-Bias penalty).
-          * rate < -0.03 % (extreme fear):  BUY retained + Long-Bias bonus.
-
-        ``[ELITE]`` is logged whenever the regime or funding-rate logic alters
-        the base ML signal.
-        """
-        probability = self.predict_proba(prices, sentiment_score, highs, lows, obi_ratio)
+        probability = self.predict_proba(
+            prices, sentiment_score, highs, lows, obi_ratio, symbol=symbol
+        )
 
         if probability is None:
             logger.debug("Signal=HOLD (model not ready or insufficient data)")
             return "HOLD"
 
-        # ── Base ML signal ────────────────────────────────────────────────
-        if probability >= _BUY_PROB_THRESHOLD and sentiment_score >= _BUY_SENTIMENT_THRESHOLD:
-            base_signal: Signal = "BUY"
-        elif probability < _SELL_PROB_THRESHOLD and sentiment_score < _SELL_SENTIMENT_THRESHOLD:
-            base_signal = "SELL"
-        else:
-            base_signal = "HOLD"
-
-        # Retrieve the just-computed features so we can inspect regime inputs
-        features = self._compute_features(prices, sentiment_score, highs, lows, obi_ratio)
-        rsi = features[1]
-        momentum = features[4]
-        adx = features[6]
-
-        # ── Market Regime Classifier ──────────────────────────────────────
-        elite_factors: list[str] = []
-        signal: Signal = base_signal
-
-        if adx > _ADX_TREND_THRESHOLD:
-            # Trend-Following mode: trust RSI and Momentum
-            if base_signal == "BUY" and not (rsi > 45 and momentum > 0):
-                signal = "HOLD"
-                elite_factors.append(f"ADX={adx:.1f}>25 trend-following: RSI/momentum not aligned")
-            elif base_signal == "SELL" and not (rsi < 50 and momentum < 0):
-                signal = "HOLD"
-                elite_factors.append(f"ADX={adx:.1f}>25 trend-following: RSI/momentum not aligned")
-            elif base_signal != "HOLD":
-                elite_factors.append(f"ADX={adx:.1f}>25 trend-following confirmed")
-
-        elif adx < _ADX_RANGE_THRESHOLD:
-            # Mean-Reversion mode: oversold/overbought bounces
-            if rsi < _RSI_OVERSOLD and sentiment_score >= _BUY_SENTIMENT_THRESHOLD:
-                if signal != "BUY":
-                    signal = "BUY"
-                    elite_factors.append(
-                        f"ADX={adx:.1f}<20 mean-reversion: RSI oversold ({rsi:.1f})"
-                    )
-                else:
-                    elite_factors.append(
-                        f"ADX={adx:.1f}<20 mean-reversion: RSI oversold ({rsi:.1f}) confirmed"
-                    )
-            elif rsi > _RSI_OVERBOUGHT and sentiment_score <= 0:
-                if signal != "SELL":
-                    signal = "SELL"
-                    elite_factors.append(
-                        f"ADX={adx:.1f}<20 mean-reversion: RSI overbought ({rsi:.1f})"
-                    )
-                else:
-                    elite_factors.append(
-                        f"ADX={adx:.1f}<20 mean-reversion: RSI overbought ({rsi:.1f}) confirmed"
-                    )
-
-        # ── Funding Rate Bias ─────────────────────────────────────────────
-        if signal == "BUY" and funding_rate > _FUNDING_RATE_EXTREME_GREED:
-            signal = "HOLD"
-            elite_factors.append(
-                f"Funding rate={funding_rate:.6f} > +0.03% extreme greed: Short-Bias penalty"
-            )
-        elif signal == "BUY" and funding_rate < _FUNDING_RATE_EXTREME_FEAR:
-            elite_factors.append(
-                f"Funding rate={funding_rate:.6f} < -0.03% extreme fear: Long-Bias bonus"
-            )
-
-        # ── HTF Trend Filter ("General" 4H + "Colonel" 1H) ───────────────
-        # 4H bearish → mute BUY; 4H neutral/bullish OK. 1H must be bullish.
-        if signal == "BUY" and htf_trend_4h == HTF_TREND_BEARISH:
-            signal = "HOLD"
-            elite_factors.append(
-                "[MTA] General filter: 4H trend is bearish – BUY muted to HOLD"
-            )
-        elif signal == "BUY" and htf_trend_1h != HTF_TREND_BULLISH:
-            signal = "HOLD"
-            _1h_desc = (
-                "bearish"
-                if htf_trend_1h == HTF_TREND_BEARISH
-                else "neutral"
-            )
-            elite_factors.append(
-                f"[MTA] Colonel filter: 1H trend is {_1h_desc} – BUY muted to HOLD"
-            )
-
-        # ── Logging ───────────────────────────────────────────────────────
-        if elite_factors:
+        if probability >= BUY_PROB_THRESHOLD:
             logger.debug(
-                "[ELITE] Signal=%s (base=%s)  probability=%.4f  sentiment=%.4f  "
-                "4H=%s  1H=%s  factors=[%s]",
-                signal,
-                base_signal,
+                "Signal=BUY  probability=%.4f  symbol=%s",
                 probability,
-                sentiment_score,
-                htf_trend_4h,
-                htf_trend_1h,
-                " | ".join(elite_factors),
+                symbol,
             )
-        else:
-            logger.debug(
-                "Signal=%s  probability=%.4f  sentiment=%.4f  4H=%s  1H=%s",
-                signal,
-                probability,
-                sentiment_score,
-                htf_trend_4h,
-                htf_trend_1h,
-            )
-        return signal
+            return "BUY"
+
+        logger.debug("Signal=HOLD  probability=%.4f  symbol=%s", probability, symbol)
+        return "HOLD"

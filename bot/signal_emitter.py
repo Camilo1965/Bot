@@ -4,19 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
-from bot.constants import (
-    DEBUG_LOG_HINT,
-    NEWS_FILTER_HOLD_MINUTES,
-    NEWS_FILTER_VOLATILITY_THRESHOLD,
-)
+from bot.constants import DEBUG_LOG_HINT
 from database.db_manager import db
 from execution.paper_executor import PaperExecutor
 from strategy.feature_engineer import FeatureEngineer
-from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, compute_htf_trend
+from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor
 
 
 async def signal_emitter(
@@ -29,68 +24,10 @@ async def signal_emitter(
     logger = logging.getLogger("clawdbot.signal")
     while True:
         await asyncio.sleep(interval)
-        sentiment: float | None = state.get("sentiment")
-
-        # ------------------------------------------------------------------
-        # [PRO] Advanced News Filter
-        # ------------------------------------------------------------------
-        # Record the current sentiment reading with its timestamp.
         now = datetime.now(tz=timezone.utc)
-        sentiment_history: deque[tuple[datetime, float]] = state["sentiment_history"]
-        # Only append to history once a real Gemini score is available.
-        # When sentiment is None (first boot, before first Gemini call) we skip
-        # the append so the deque stays empty and no artificial swing is triggered.
-        if sentiment is not None:
-            sentiment_history.append((now, sentiment))
-
-            # Prune entries older than the 10-minute observation window.
-            cutoff = now - timedelta(minutes=10)
-            while sentiment_history and sentiment_history[0][0] < cutoff:
-                sentiment_history.popleft()
-
-            # Check for high-volatility sentiment fluctuation.
-            hold_until: datetime | None = state.get("news_hold_until")
-            if len(sentiment_history) >= 2:
-                scores = [s for _, s in sentiment_history]
-                if max(scores) - min(scores) > NEWS_FILTER_VOLATILITY_THRESHOLD:
-                    new_hold_until = now + timedelta(minutes=NEWS_FILTER_HOLD_MINUTES)
-                    # Do not keep extending HOLD forever while volatility remains high.
-                    # Only open a new HOLD window when there is no active one.
-                    if hold_until is None or now >= hold_until:
-                        state["news_hold_until"] = new_hold_until
-                        logger.info(
-                            "[PRO] News Filter triggered – sentiment swing %.4f > %.2f "
-                            "in the last 10 min. Global HOLD until %s.",
-                            max(scores) - min(scores),
-                            NEWS_FILTER_VOLATILITY_THRESHOLD,
-                            new_hold_until.isoformat(),
-                        )
-                    else:
-                        logger.debug(
-                            "[PRO] News Filter volatility still high (swing=%.4f) but HOLD already active until %s.",
-                            max(scores) - min(scores),
-                            hold_until.isoformat(),
-                        )
-
-        # Honour the active HOLD period: skip all signal evaluation.
-        hold_until = state.get("news_hold_until")
-        if hold_until is not None and now < hold_until:
-            remaining = int((hold_until - now).total_seconds() / 60)
-            logger.debug(
-                "[PRO] News Filter active – global HOLD in effect (%d min remaining).",
-                remaining,
-            )
-            continue
-        elif hold_until is not None and now >= hold_until:
-            # Clear the expired HOLD.
-            state["news_hold_until"] = None
 
         for symbol in watchlist:
             prices: list[float] = list(state["prices"].get(symbol, []))
-
-            # Resolve the effective sentiment score for signal generation.
-            # Use neutral 0.0 until the first real Gemini reading is available.
-            effective_sentiment: float = sentiment if sentiment is not None else 0.0
 
             if len(prices) < 50:
                 logger.debug(
@@ -116,71 +53,34 @@ async def signal_emitter(
             else:
                 current_atr = state.get("atrs", {}).get(symbol)
 
-            # [MTA] Compute higher-timeframe trend statuses
-            closes_4h: list[float] = list(
-                state.get("htf_closes", {}).get(symbol, {}).get("4h", [])
-            )
-            opens_4h: list[float] = list(
-                state.get("htf_opens", {}).get(symbol, {}).get("4h", [])
-            )
-            closes_1h: list[float] = list(
-                state.get("htf_closes", {}).get(symbol, {}).get("1h", [])
-            )
-            opens_1h: list[float] = list(
-                state.get("htf_opens", {}).get(symbol, {}).get("1h", [])
-            )
-
-            trend_4h = compute_htf_trend(closes_4h, opens_4h or None)
-            trend_1h = compute_htf_trend(closes_1h, opens_1h or None)
-            trend_15m = compute_htf_trend(prices, None)
-
-            # Update shared state and persist to DB
-            state.setdefault("htf_trend", {}).setdefault(symbol, {})
-            state["htf_trend"][symbol] = {
-                "4h": trend_4h,
-                "1h": trend_1h,
-                "15m": trend_15m,
-            }
-            for tf, trend in (("4h", trend_4h), ("1h", trend_1h), ("15m", trend_15m)):
-                try:
-                    await db.upsert_htf_trend(symbol, tf, trend)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[MTA] DB upsert_htf_trend failed for %s/%s: %s", symbol, tf, exc)
-
-            logger.debug(
-                "🔭 [MTA RADAR] %s – 4H=%s | 1H=%s | 15M=%s",
-                symbol, trend_4h, trend_1h, trend_15m,
-            )
-
             signal = predictor.generate_signal(
                 prices,
-                effective_sentiment,
+                0.0,
                 highs=highs or None,
                 lows=lows or None,
                 obi_ratio=obi_ratio,
                 funding_rate=funding_rate,
-                htf_trend_4h=trend_4h,
-                htf_trend_1h=trend_1h,
+                symbol=symbol,
             )
             state["ml_signals"][symbol] = signal
             win_prob: float = predictor.predict_proba(
                 prices,
-                effective_sentiment,
+                0.0,
                 highs=highs or None,
                 lows=lows or None,
                 obi_ratio=obi_ratio,
+                symbol=symbol,
             ) or 0.0
 
             # Store the latest ML confidence so dashboard_logger can display it.
             state["ml_probs"][symbol] = win_prob
 
             logger.debug(
-                "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d | Sentiment: %.4f",
+                "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d",
                 symbol,
                 signal,
                 win_prob * 100,
                 len(prices),
-                effective_sentiment,
             )
 
             # ------------------------------------------------------------------
@@ -232,7 +132,7 @@ async def signal_emitter(
                         entry_price=entry_price,
                         win_probability=win_prob,
                         symbol=symbol,
-                        sentiment_score=effective_sentiment,
+                        sentiment_score=0.0,
                         current_atr=current_atr,
                     )
                     if not opened:

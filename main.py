@@ -2,13 +2,11 @@
 ClawdBot – entry point.
 
 Sets up a structured JSON logger and starts the asyncio event loop.
-Runs an MT5 market-data poller (ticks + multi-timeframe candles) and a
-Gemini-powered sentiment refresher concurrently; each incoming trade is
-logged together with the latest sentiment score.  Every synthetic top-of-book
-snapshot and scored headline is persisted to TimescaleDB.
+Runs an MT5 market-data poller (ticks + multi-timeframe candles).  OHLC
+snapshots are persisted to TimescaleDB.
 
-An ML predictor (XGBoost) is warm-started from historical market data at
-startup and emits a BUY / SELL / HOLD signal for each symbol independently.
+A dedicated INJ/USDT XGBoost model emits BUY / HOLD from probability ≥ 0.70
+(symbol-filtered); no external sentiment or news gates.
 
 When the signal is BUY the :class:`~risk.risk_manager.RiskManager` sizes the
 position using a **fixed fractional** rule (``balance × RISK_PER_TRADE ×
@@ -20,9 +18,6 @@ per symbol.
 **Long-only execution:** shorts are not opened. A model **SELL** means “bearish
 guidance”; exits for open LONGs are handled by :meth:`~execution.paper_executor.PaperExecutor.check_ml_exit`
 (smart reversal / TTL) and by mechanical stops in :meth:`~execution.paper_executor.PaperExecutor.check_and_close`.
-
-Before first live run, execute ``preflight.py`` (same venv as ``main.py``) to
-verify PostgreSQL/TimescaleDB, MT5 login, and Telegram.
 """
 
 from __future__ import annotations
@@ -48,12 +43,6 @@ from rich.live import Live
 from rich.logging import RichHandler
 
 from bot import state as dash_state
-from bot.constants import (
-    NEWS_FILTER_HOLD_MINUTES as _NEWS_FILTER_HOLD_MINUTES,
-)
-from bot.constants import (
-    NEWS_FILTER_VOLATILITY_THRESHOLD as _NEWS_FILTER_VOLATILITY_THRESHOLD,
-)
 from bot.dashboard import generate_dashboard
 from bot.dashboard_helpers import display_timezone
 from bot.loops import (
@@ -70,7 +59,6 @@ from bot.signal_emitter import signal_emitter
 from bot.web_server import start_web_dashboard
 from bot.weekly_retrainer import weekly_retrainer
 from data_ingestion.mt5_market_client import MT5MarketDataClient
-from data_ingestion.news_scraper import fetch_crypto_headlines
 from database.db_manager import close_db, db, init_db
 from execution.mt5_executor import (
     MT5Executor,
@@ -81,8 +69,7 @@ from execution.mt5_executor import (
 )
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
-from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD, MLPredictor
-from strategy.sentiment_llm import get_gemini_sentiment
+from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor
 from utils.diagnostic_bundle import write_diagnostic_bundle
 from utils.runtime_snapshot import runtime_metrics_loop, write_startup_snapshot
 from utils.telegram_notifier import (
@@ -105,7 +92,6 @@ _RESET  = "\033[0m"
 
 
 # Dashboard event buffer and start time live in :mod:`bot.state`.
-_GEMINI_ENABLED: bool = False
 
 
 def _apply_safe_env_defaults() -> None:
@@ -125,20 +111,14 @@ def _apply_safe_env_defaults() -> None:
         )
     if not os.environ.get("BUY_PROB_THRESHOLD", "").strip():
         print(
-            "[ENV] BUY_PROB_THRESHOLD not set; using model default 0.62 "
+            "[ENV] BUY_PROB_THRESHOLD not set; using model default 0.70 "
             "(strategy/ml_predictor.py).",
             file=sys.stderr,
         )
 
 
 def _check_env() -> None:
-    """Validate environment variables before the bot starts.
-
-    * Verifies that a ``.env`` file exists next to this module.
-    * Detects whether ``GEMINI_API_KEY`` is set and non-empty.
-    * Runs in degraded mode when Gemini credentials are missing.
-    """
-    global _GEMINI_ENABLED  # noqa: PLW0603
+    """Warn if ``.env`` is missing (process env still used)."""
     env_path = Path(__file__).parent / ".env"
     if not env_path.exists():
         print(
@@ -150,35 +130,14 @@ def _check_env() -> None:
             file=sys.stderr,
         )
 
-    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    _GEMINI_ENABLED = bool(gemini_key)
-    if not _GEMINI_ENABLED:
-        print(
-            f"\n{_BOLD}{_YELLOW}⚠️  WARNING:{_RESET}{_YELLOW} GEMINI_API_KEY is missing or empty.{_RESET}\n"
-            f"  Open your {_YELLOW}.env{_RESET} file and add:\n"
-            f"    {_BOLD}GEMINI_API_KEY=your_gemini_api_key_here{_RESET}\n"
-            f"  You can obtain a free key at "
-            f"{_YELLOW}https://aistudio.google.com/app/apikey{_RESET}\n"
-            "  Bot will run in degraded mode with neutral sentiment.\n",
-            file=sys.stderr,
-        )
-
 
 _check_env()
 _apply_safe_env_defaults()
 
-# ── Multi-asset watchlist ─────────────────────────────────────────────────────
-# Keep this aligned with symbols that exist in *Market Watch* on your MT5 broker
-# (see SYMBOL_MAP in execution/mt5_executor.py). Many brokers only offer majors.
-WATCHLIST: list[str] = [
-    "BTC/USDT",
-    "ETH/USDT",
-    "SOL/USDT",
-]
+# INJ/USDT only — must exist in MT5 Market Watch (see SYMBOL_MAP).
+WATCHLIST: list[str] = ["INJ/USDT"]
 
-# News filter constants: :mod:`bot.constants` (imported as _NEWS_FILTER_* for audit logs).
-
-_MODEL_PATH = Path(__file__).parent / "models" / "xgb_live.json"
+_MODEL_PATH = Path(__file__).parent / "models" / "INJ_USDT.json"
 _REPO_ROOT = Path(__file__).resolve().parent
 
 # Set once per process in :func:`setup_logging` — also embedded in JSON lines.
@@ -379,73 +338,6 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     return boot
 
 
-async def gemini_sentiment_refresher(
-    state: dict[str, Any],
-    interval: int = 900,
-) -> None:
-    """[LLM] Background task – refreshes the sentiment score every 15 minutes.
-
-    Fetches the latest crypto headlines from CoinTelegraph and CoinDesk via RSS
-    (using :func:`~data_ingestion.news_scraper.fetch_crypto_headlines`) and
-    passes them to :func:`~strategy.sentiment_llm.get_gemini_sentiment` to
-    obtain a single aggregated score.  The result is cached in
-    ``state["sentiment"]`` and persisted to TimescaleDB so the GUI Dashboard's
-    Sentiment Gauge always reflects the most recent value.
-    """
-    log = logging.getLogger("clawdbot.gemini")
-    while True:
-        try:
-            loop = asyncio.get_event_loop()
-            # Run blocking I/O in a thread executor to avoid stalling the loop.
-            headlines: list[str] = await loop.run_in_executor(
-                None, fetch_crypto_headlines
-            )
-            if headlines:
-                score: float = await loop.run_in_executor(
-                    None, get_gemini_sentiment, headlines
-                )
-                is_first_reading = state.get("sentiment") is None
-                state["sentiment"] = score
-                if is_first_reading:
-                    log.info(
-                        "[LLM] Primera lectura de sentimiento: %.2f (Ignorando cálculo de swing por inicio de sistema).",
-                        score,
-                    )
-                else:
-                    log.info(
-                        "[LLM] Gemini sentiment updated – headlines=%d  score=%.4f",
-                        len(headlines),
-                        score,
-                    )
-                ts = datetime.now(tz=timezone.utc)
-                try:
-                    # Store one aggregated DB row per refresh cycle rather than
-                    # one row per headline.  This keeps the news_sentiment table
-                    # lean while still making the latest Gemini score visible to
-                    # the GUI Dashboard's Sentiment Gauge.
-                    await db.insert_sentiment(
-                        headline=f"[Gemini batch: {len(headlines)} headlines]",
-                        sentiment_score=score,
-                        source="gemini-2.5-flash",
-                        timestamp=ts,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("[LLM] DB insert_sentiment failed: %s", exc)
-            else:
-                log.warning("[LLM] No headlines fetched – sentiment unchanged.")
-        except asyncio.CancelledError:
-            log.info("gemini_sentiment_refresher cancelled – shutting down.")
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "[LLM] Gemini refresher error (%s): %s – retrying in %ds",
-                type(exc).__name__,
-                exc,
-                interval,
-            )
-        await asyncio.sleep(interval)
-
-
 async def diagnostic_bundle_refresh_loop(repo_root: Path, interval_s: float) -> None:
     """Escribe ``DIAGNOSTIC_FOR_REVIEW.md`` en la raíz del repo de forma periódica."""
     log = logging.getLogger("clawdbot")
@@ -506,7 +398,6 @@ async def main() -> None:
 
     market_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     shared_state: dict[str, Any] = {
-        "sentiment": None if _GEMINI_ENABLED else 0.0,
         "prices": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         # [ELITE] OHLCV buffers for ADX / ATR computation
         "highs": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
@@ -517,9 +408,6 @@ async def main() -> None:
         "obi_ratios": {symbol: 1.0 for symbol in WATCHLIST},
         # [ELITE] Latest perpetual-futures funding rate per symbol
         "funding_rates": {symbol: 0.0 for symbol in WATCHLIST},
-        # [PRO] News Filter state
-        "sentiment_history": deque(maxlen=500),  # pruned in signal_emitter; maxlen caps memory
-        "news_hold_until": None,       # datetime | None
         # Per-symbol last seen kline timestamp for deduplication
         "last_kline_ts": {symbol: None for symbol in WATCHLIST},
         # Live bid/ask/mid from MT5 ticks (dashboard + mark PnL); not the ML candle buffer.
@@ -695,13 +583,12 @@ async def main() -> None:
 
     logger.info(
         "SESSION_CONFIG session_id=%s execution_mode=%s mt5_initialized=%s "
-        "market_feed=%s initial_balance=%.2f gemini_enabled=%s watchlist=%s",
+        "market_feed=%s initial_balance=%.2f watchlist=%s",
         _LOG_SESSION_ID,
         execution_mode,
         _mt5_initialized,
         mt5_market_client is not None,
         initial_balance,
-        _GEMINI_ENABLED,
         WATCHLIST,
     )
     if execution_mode == "mt5" and not isinstance(paper_executor, MT5Executor):
@@ -812,25 +699,17 @@ async def main() -> None:
     # confirm that session state was cleanly initialised on this startup.
     # ------------------------------------------------------------------
     logger.info(
-        "🔍 [AUDIT] Decision pipeline thresholds: "
-        "ML_BUY_PROB≥%.2f | SENTIMENT_BUY≥%.2f | "
-        "NEWS_FILTER_SWING>%.2f → HOLD_%dmin",
+        "🔍 [AUDIT] Decision pipeline: ML_BUY_PROB≥%.2f | symbols=%s (ML-only entries).",
         BUY_PROB_THRESHOLD,
-        BUY_SENTIMENT_THRESHOLD,
-        _NEWS_FILTER_VOLATILITY_THRESHOLD,
-        _NEWS_FILTER_HOLD_MINUTES,
+        WATCHLIST,
     )
     logger.info(
-        "🔍 [AUDIT] Session state reset: "
-        "sentiment=%s  news_hold_until=None  max_drawdown=0.0  "
-        "trading_halted=%s",
-        shared_state.get("sentiment"),
+        "🔍 [AUDIT] Session state reset: max_drawdown=0.0  trading_halted=%s",
         risk_manager.is_trading_halted(),
     )
     logger.info(
         "🔍 [AUDIT] UI coherence: COMPRAR/BUY only when "
-        "ml_signals[symbol]==BUY from generate_signal, prob≥%.2f, "
-        "and not global_hold (sentiment/news pause). Raw prob bar alone never opens.",
+        "ml_signals[symbol]==BUY and prob≥%.2f.",
         BUY_PROB_THRESHOLD,
     )
 
@@ -948,13 +827,6 @@ async def main() -> None:
         logger.warning(
             "DIAGNOSTIC_BUNDLE_INTERVAL_S=%.1f < 60s — bundle automático desactivado.",
             _bundle_iv,
-        )
-    if _GEMINI_ENABLED:
-        run_tasks.append(gemini_sentiment_refresher(shared_state))
-    else:
-        logger.warning(
-            "[LLM] Gemini sentiment refresher disabled (GEMINI_API_KEY missing). "
-            "Using neutral sentiment baseline."
         )
     running_tasks: list[asyncio.Task[Any]] = [asyncio.create_task(task) for task in run_tasks]
 

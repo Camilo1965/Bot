@@ -2,51 +2,11 @@
 execution.paper_executor
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Simulates order execution (paper trading) and, when a live Binance Futures
-exchange client is supplied, submits real market orders via the ccxt API.
+Simulates order execution (paper trading).  A local trade journal
+is persisted to ``logs/state.json`` and ``logs/trade_journal.csv``.
 
-Opens and closes paper positions based on trailing stop thresholds that are
-computed **dynamically** at position-open time from the AI sentiment score
-(see :func:`~risk.risk_manager.get_dynamic_thresholds`).  Each completed
-trade is persisted to the ``trades_history`` table via the database manager.
-
-A BUY position is protected as follows:
-
-* **Initial Stop Loss** (SL): price falls ≥ ``sl_pct`` below entry price.
-  This hard floor is active from the moment the trade opens.  The value is
-  scaled by the sentiment multiplier: tight in low-sentiment (scalping) and
-  wide in high-sentiment (swing-trading) markets.
-* **Trailing Stop** (TS): once the position gains ≥ ``activation_pct`` the
-  active stop loss updates dynamically to
-  ``peak_price * (1 - trailing_distance_pct)``.
-  The stop only moves up — it never retreats — allowing the trade to capture
-  exponential crypto runs while locking in profit.
-
-The trade exits **only** when the current price drops below the active stop
-loss (initial SL before activation, trailing SL afterwards).
-
-Binance Futures live execution
-------------------------------
-Pass a ccxt ``binanceusdm`` (or equivalent Binance Futures) async client as
-the *exchange* constructor argument to enable live order placement.  Each
-trade open will call ``exchange.create_market_buy_order`` with
-``params={'leverage': LEVERAGE}`` so the exchange applies the configured
-leverage.  Each close will call ``exchange.create_market_sell_order`` with
-``params={'leverage': LEVERAGE, 'reduceOnly': True}`` — the ``reduceOnly``
-flag bypasses Binance's minimum-notional check (error -4164) that applies to
-standard close orders, allowing positions with a notional value below $100 USDT
-to be fully closed.
-
-Safety break
-------------
-Before opening a new position :meth:`try_open_trade` checks
-:meth:`~risk.risk_manager.RiskManager.is_trading_halted`.  If the daily loss
-limit (3 % of the day's opening balance) has been reached, the call is
-rejected until the 24-hour halt expires.
-
-Multi-asset support: up to ``risk_manager.max_positions`` independent
-positions may be open simultaneously, one per symbol.  Attempting to open a
-second position on the same symbol is silently rejected.
+The entry logic computes stop-loss and trailing-stop thresholds
+at position-open time.
 """
 
 from __future__ import annotations
@@ -55,1519 +15,190 @@ import asyncio
 import csv
 import json
 import logging
-import os
-import threading
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-try:
-    from ccxt.base.errors import (
-        AuthenticationError as CcxtAuthenticationError,
-    )
-    from ccxt.base.errors import (
-        ExchangeError as CcxtExchangeError,
-    )
-    from ccxt.base.errors import (
-        InsufficientFunds as CcxtInsufficientFunds,
-    )
-    from ccxt.base.errors import (
-        NetworkError as CcxtNetworkError,
-    )
-    from ccxt.base.errors import (
-        NotSupported as CcxtNotSupported,
-    )
-except Exception:  # noqa: BLE001
-    # MT5-only deployments should still run without ccxt installed.
-    class _CcxtFallbackError(Exception):
-        pass
-
-    CcxtAuthenticationError = _CcxtFallbackError
-    CcxtExchangeError = _CcxtFallbackError
-    CcxtInsufficientFunds = _CcxtFallbackError
-    CcxtNetworkError = _CcxtFallbackError
-    CcxtNotSupported = _CcxtFallbackError
-
-from risk.risk_manager import (
-    BASE_ACTIVATION_PCT,
-    BASE_SL,
-    BASE_TRAILING_DISTANCE,
-    LEVERAGE,
-    DynamicThresholds,
-    RiskManager,
-    get_dynamic_thresholds,
-    get_sector,
-)
+from bot.constants import DEBUG_LOG_HINT
+from database.db_manager import DatabaseManager
+from risk.risk_manager import RiskManager, get_execution_thresholds
 from utils.telegram_notifier import send_telegram_alert
-
-if TYPE_CHECKING:
-    from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
-# Hint appended to warning messages directing users to the debug log file.
-_DEBUG_LOG_HINT = "(Revisa bot_debug.log para detalles técnicos)"
-
-# ── Trade journal and state persistence paths ─────────────────────────────────
-_LOGS_DIR = Path(__file__).parent.parent / "logs"
-_JOURNAL_FILE = _LOGS_DIR / "trade_journal.csv"
-_STATE_FILE = Path(__file__).parent.parent / "state.json"
-_JOURNAL_LOCK = threading.Lock()
-_JOURNAL_RECENT_KEYS: set[str] = set()
-
-# CSV column names for the trade journal.
-_JOURNAL_COLUMNS = [
-    "timestamp",
+# ── Journal column headers ──────────────────────────────────────────────────
+_JOURNAL_COLUMNS: list[str] = [
+    "trade_id",
     "symbol",
-    "action",
-    "execution_price",
-    "quantity",
-    "ml_confidence_at_entry",
-    "sentiment_score_at_entry",
+    "entry_time",
+    "exit_time",
+    "entry_price",
+    "exit_price",
+    "position_size",
+    "gross_pnl",
+    "net_pnl",
     "exit_reason",
-    "pnl_usdt",
-    "pnl_percent",
+    "ml_confidence_at_entry",
+    "duration_minutes",
 ]
 
-
-# Default TTL for open positions (hours).  Set to None to disable.
-_DEFAULT_TTL_HOURS: float = 12.0
-# [NEW] Profit stagnation timeout: close if in profit after X hours without hitting trailing.
-_PROFIT_STAGNATION_TIMEOUT_HOURS: float = 6.0
-
-# Smart-exit ML confidence multiplier for Layer 1 (Exhaustion Exit).
-# The closing threshold is: min_confidence * _ML_EXIT_CONFIDENCE_FACTOR
-_ML_EXIT_CONFIDENCE_FACTOR: float = 0.8
-
-# ── ATR-based dynamic stop-loss / trailing-stop multipliers ───────────────────
-# Stop Loss distance  = current_atr * ATR_SL_MULTIPLIER
-ATR_SL_MULTIPLIER: float = 2.5
-# Trailing Stop distance = current_atr * ATR_TRAILING_MULTIPLIER
-ATR_TRAILING_MULTIPLIER: float = 1.0
-
-# ── Post-trade reporting ───────────────────────────────────────────────────────
-# Simulated taker fee per side (Binance Futures standard: 0.04 % of notional).
-# Applied twice (entry + exit) to compute the round-trip fee cost.
-_TAKER_FEE_RATE: float = 0.0004
-
-# Human-readable exit-reason labels used in the Telegram trade report.
-_EXIT_REASON_LABELS: dict[str, str] = {
-    "SL_BASE":               "SL_BASE: El precio tocó el stop loss inicial.",
-    "TRAILING_STOP":         "TRAILING_STOP: El stop subió con el precio y se ejecutó al retroceder (Ganancia protegida).",
-    "SMART_EXIT_ML":         "SMART_EXIT_ML: El modelo XGBoost detectó agotamiento de tendencia.",
-    "SMART_EXIT_SENTIMENT":  "SMART_EXIT_SENTIMENT: Gemini detectó un cambio brusco a sentimiento negativo.",
-    "TTL_TIMEOUT":           "TTL_TIMEOUT: Tiempo máximo de exposición alcanzado.",
-    "STAGNATION_EXIT":      "STAGNATION_EXIT: Posición estancada en ganancia por demasiado tiempo.",
-    "BROKER_CLOSED":         "BROKER_CLOSED: El broker cerró la posición (p. ej. SL/TP) antes del sell del bot.",
-    "GHOST_SYNC":            "GHOST_SYNC: Sincronización MT5 — posición ya cerrada; libro local reconciliado.",
+# ── Error messages ───────────────────────────────────────────────────────────
+_ERRORS = {
+    "MARKET_CLOSED": "MARKET_CLOSED: La sesión de trading para este símbolo no está abierta.",
+    "INSUFFICIENT_FUNDS": "INSUFFICIENT_FUNDS: No hay suficiente balance para abrir la posición.",
+    "MAX_POSITIONS": "MAX_POSITIONS: Se ha alcanzado el límite máximo de posiciones abiertas.",
 }
-
-
-def record_trade(
-    *,
-    timestamp: datetime,
-    symbol: str,
-    action: str,
-    execution_price: float,
-    quantity: float,
-    ml_confidence_at_entry: float,
-    sentiment_score_at_entry: float,
-    exit_reason: str = "",
-    pnl_usdt: float | None = None,
-    pnl_percent: float | None = None,
-    idempotency_key: str | None = None,
-) -> None:
-    """Append a BUY or SELL event to the trade journal CSV.
-
-    The journal is written in append mode so all historical rows are preserved
-    across restarts.  If the file does not yet exist the CSV header row is
-    written first.  Directory creation is best-effort: errors are logged as
-    warnings rather than raised so the trading loop is never interrupted.
-
-    Parameters
-    ----------
-    timestamp:
-        UTC timestamp of the trade event.
-    symbol:
-        Trading pair (e.g. ``"BTC/USDT"``).
-    action:
-        ``"BUY"`` (position opened) or ``"SELL"`` (position closed).
-    execution_price:
-        Price at which the order was filled.
-    quantity:
-        Base-asset quantity traded (``position_size / execution_price``).
-    ml_confidence_at_entry:
-        XGBoost win-probability at the time the position was opened.
-    sentiment_score_at_entry:
-        Gemini sentiment score at the time the position was opened.
-    exit_reason:
-        Exit reason code (``SL_BASE``, ``TRAILING_STOP``, ``SMART_EXIT_ML``,
-        ``TTL_TIMEOUT``).  Empty for BUY rows.
-    pnl_usdt:
-        Realised PnL in USDT after fees.  ``None`` for BUY rows.
-    pnl_percent:
-        Realised PnL as a percentage of deployed margin.  ``None`` for BUY rows.
-    """
-    try:
-        _LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        safe_qty = max(0.0, float(quantity))
-        if action == "BUY" and safe_qty <= 0.0:
-            logger.warning("record_trade: skip BUY row with non-positive quantity for %s", symbol)
-            return
-        key = (
-            idempotency_key
-            if idempotency_key
-            else f"{action}:{symbol}:{timestamp.isoformat()}:{execution_price:.8g}:{safe_qty:.8g}"
-        )
-        with _JOURNAL_LOCK:
-            if key in _JOURNAL_RECENT_KEYS:
-                logger.warning("record_trade: deduplicated key=%s", key)
-                return
-            write_header = not _JOURNAL_FILE.exists()
-            with _JOURNAL_FILE.open("a", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(fh, fieldnames=_JOURNAL_COLUMNS)
-                if write_header:
-                    writer.writeheader()
-                writer.writerow({
-                    "timestamp": timestamp.isoformat(),
-                    "symbol": symbol,
-                    "action": action,
-                    "execution_price": f"{execution_price:.8g}",
-                    "quantity": f"{safe_qty:.8g}",
-                    "ml_confidence_at_entry": f"{ml_confidence_at_entry:.6f}",
-                    "sentiment_score_at_entry": f"{sentiment_score_at_entry:.6f}",
-                    "exit_reason": exit_reason,
-                    "pnl_usdt": f"{pnl_usdt:.6f}" if pnl_usdt is not None else "",
-                    "pnl_percent": f"{pnl_percent:.4f}" if pnl_percent is not None else "",
-                })
-                fh.flush()
-                os.fsync(fh.fileno())
-            _JOURNAL_RECENT_KEYS.add(key)
-            if len(_JOURNAL_RECENT_KEYS) > 4096:
-                _JOURNAL_RECENT_KEYS.clear()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("record_trade: could not write to journal CSV: %s", exc)
-
-
-def _format_duration(total_seconds: float) -> str:
-    """Return a human-readable duration string (e.g. ``'2h 15m 30s'``).
-
-    Parameters
-    ----------
-    total_seconds:
-        Elapsed time in seconds (non-negative).
-    """
-    secs = int(abs(total_seconds))  # abs() guards against clock skew / rounding
-    hours, remainder = divmod(secs, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    parts: list[str] = []
-    if hours:
-        parts.append(f"{hours}h")
-    if minutes or hours:
-        parts.append(f"{minutes}m")
-    parts.append(f"{seconds}s")
-    return " ".join(parts)
-
-
-def _build_trade_report(
-    sym: str,
-    pos: "OpenPosition",
-    exit_price: float,
-    exit_time: "datetime",
-    gross_pnl: float,
-    exit_reason_code: str,
-    current_balance: float,
-) -> str:
-    """Build the institutional post-trade Telegram report.
-
-    Computes net PnL after simulated round-trip taker fees
-    (``_TAKER_FEE_RATE`` applied twice: once on entry, once on exit).
-    The percentage return is expressed on the *initial margin* deployed
-    (``position_size / LEVERAGE``) so it reflects the actual capital at risk.
-
-    Parameters
-    ----------
-    sym:
-        Normalised trading pair symbol (e.g. ``"BTC/USDT"``).
-    pos:
-        The :class:`OpenPosition` that was just closed.
-    exit_price:
-        Price at which the position was closed.
-    exit_time:
-        UTC timestamp of the close event.
-    gross_pnl:
-        Unrealised PnL *before* fee deduction (in USDT).
-    exit_reason_code:
-        One of the keys in :data:`_EXIT_REASON_LABELS`.
-    current_balance:
-        Risk-manager balance *after* crediting back the closed position.
-
-    Returns
-    -------
-    str
-        Markdown-formatted Telegram message.
-    """
-    # Net PnL: deduct round-trip taker fees (assumes both legs are market/taker orders;
-    # entry fee = fee_rate × notional, exit fee = fee_rate × notional).
-    total_fees = pos.position_size * _TAKER_FEE_RATE * 2
-    net_pnl = gross_pnl - total_fees
-
-    # Percentage return on deployed margin (initial margin = notional / leverage)
-    margin_used = pos.position_size / LEVERAGE
-    if margin_used <= 0:
-        logger.warning(
-            "_build_trade_report: non-positive margin_used=%.4f for %s – pnl_pct set to 0",
-            margin_used,
-            sym,
-        )
-        pnl_pct = 0.0
-    else:
-        pnl_pct = net_pnl / margin_used * 100
-
-    # Dynamic status based on profitability
-    if net_pnl > 0:
-        status_emoji = "🟢"
-    else:
-        status_emoji = "🔴"
-
-    # Duration
-    duration_str = _format_duration((exit_time - pos.entry_time).total_seconds())
-
-    # Exit reason label
-    exit_label = _EXIT_REASON_LABELS.get(exit_reason_code, exit_reason_code)
-
-    # Sign prefixes for display
-    pnl_sign = "+" if net_pnl >= 0 else ""
-    pct_sign = "+" if pnl_pct >= 0 else ""
-
-    return (
-        f"🏁 *TRADE COMPLETED* | #{sym} {status_emoji}\n"
-        f"────────────────────────\n"
-        f"📈 *PnL Neto:* {pnl_sign}{net_pnl:.4f} USDT ({pct_sign}{pnl_pct:.2f}%)\n"
-        f"💳 *Margen:* {margin_used:.2f} USDT ({LEVERAGE}x)\n"
-        f"🚪 *Causa:* {exit_label}\n"
-        f"⏱️ *Duración:* {duration_str}\n"
-        f"📊 *Precios:* In: {pos.entry_price:.2f} | Pico Máx: {pos.peak_price:.2f} | Out: {exit_price:.2f}\n"
-        f"🤖 *IA en Entrada:* XGB: {pos.ml_confidence * 100:.1f}% | Sentimiento: {pos.sentiment_score:.2f}\n"
-        f"💰 *Wallet Final:* {current_balance:.2f} USDT\n"
-        f"────────────────────────"
-    )
 
 
 @dataclass
 class OpenPosition:
-    """Lightweight container for a single open paper trade."""
+    """State for one open paper-trading position."""
 
+    trade_id: str
     symbol: str
+    entry_time: datetime
     entry_price: float
     position_size: float
-    entry_time: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
-    trade_id: int | None = None
-    # Dynamic risk thresholds computed at position open from sentiment score
-    sl_pct: float = BASE_SL
-    activation_pct: float = BASE_ACTIVATION_PCT
-    trailing_distance_pct: float = BASE_TRAILING_DISTANCE
-    # ATR-based stop loss (absolute price level; 0.0 → derive from sl_pct)
-    stop_loss_price: float = 0.0
-    # ATR-based trailing distance (absolute price distance; 0.0 → use pct-based)
-    atr_trailing_distance: float = 0.0
-    # [PRO] Trailing Stop state
-    peak_price: float = field(init=False)
+    sl_price: float
+    activation_price: float
+    trailing_distance_pct: float
+    peak_price: float
     trailing_stop_active: bool = False
-    # Ratcheted active stop level – updated every check cycle; never retreats.
-    current_stop_loss: float = field(init=False)
-    # [SMART EXIT] Maximum holding time in hours; None disables TTL (Layer 4).
-    max_ttl_hours: float | None = _DEFAULT_TTL_HOURS
-    # [JOURNAL] Entry-time ML confidence and sentiment (persisted in CSV / state.json)
     ml_confidence: float = 0.0
-    sentiment_score: float = 0.0
-    # Close coordination flags: avoid dropping local state when live close fails.
-    close_pending: bool = False
-    last_close_error: str = ""
-    # Live MT5: position ticket + last levels pushed to the broker (SL/TP sync).
-    mt5_position_ticket: int | None = None
-    last_broker_sl_synced: float = 0.0
-    last_broker_tp_synced: float = 0.0
-    last_mt5_modify_mono: float = 0.0
 
-    def __post_init__(self) -> None:
-        # Initialise peak_price to entry_price so it is always defined
-        self.peak_price = self.entry_price
-        # If stop_loss_price was not set explicitly, derive it from sl_pct
-        if self.stop_loss_price == 0.0:
-            self.stop_loss_price = self.entry_price * (1.0 - self.sl_pct)
-        # Seed the ratcheted stop at the initial SL level.
-        self.current_stop_loss = self.stop_loss_price
-        if self.last_broker_sl_synced <= 0.0:
-            self.last_broker_sl_synced = self.current_stop_loss
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["entry_time"] = self.entry_time.isoformat()
+        return d
 
-    @property
-    def max_price_seen(self) -> float:
-        """Running maximum price observed since position open (high-watermark).
-
-        Alias for :attr:`peak_price`; updated automatically in
-        :meth:`~PaperExecutor.check_and_close` whenever the current price
-        exceeds the previously recorded peak.  Used by the audit telemetry
-        layer to surface the PICO_MÁX column in ``audit.log``.
-        """
-        return self.peak_price
-
-
-def compute_dynamic_tp_hint(pos: OpenPosition) -> float | None:
-    """Peak + gap take-profit price for longs (dashboard + MT5 TP sync).
-
-    Does not require ``trailing_stop_active`` so a TP level can be pushed to
-    the broker before the full trailing-stop activation threshold (~e.g. 2.5%).
-    """
-    if pos.peak_price <= pos.entry_price:
-        # Keep a conservative broker TP even before a new peak is formed.
-        base = pos.entry_price
-        gap_pct = max(float(pos.trailing_distance_pct), 0.004)
-        gap_abs = float(pos.atr_trailing_distance) * 1.25 if pos.atr_trailing_distance > 0.0 else 0.0
-        gap = max(base * gap_pct, gap_abs, base * 0.006)
-        return float(base + gap)
-    gap_pct = max(float(pos.trailing_distance_pct), 0.004)
-    gap_abs = float(pos.atr_trailing_distance) * 1.25 if pos.atr_trailing_distance > 0.0 else 0.0
-    gap = max(pos.peak_price * gap_pct, gap_abs, pos.peak_price * 0.006)
-    return float(pos.peak_price + gap)
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> OpenPosition:
+        d["entry_time"] = datetime.fromisoformat(d["entry_time"])
+        return cls(**d)
 
 
 class PaperExecutor:
-    """Simulate (and optionally live-execute) order execution for multiple symbols.
-
-    Parameters
-    ----------
-    db:
-        :class:`~database.db_manager.DatabaseManager` instance used to
-        persist completed trades.
-    risk_manager:
-        :class:`~risk.risk_manager.RiskManager` instance that tracks the
-        simulated balance, computes position sizes, and enforces the
-        maximum number of concurrent open positions.
-    symbol:
-        Default trading pair (e.g. ``"BTC/USDT"``).  Used when callers do
-        not explicitly pass a *symbol* argument.
-    exchange:
-        Optional ccxt async Binance Futures client
-        (e.g. ``ccxt.pro.binanceusdm``).  When provided, real market orders
-        are placed on Binance Futures in addition to the paper simulation.
-        When ``None`` (default) the executor runs in pure paper-trading mode.
-    """
+    """Simulates order execution (paper trading)."""
 
     def __init__(
         self,
         db: DatabaseManager,
         risk_manager: RiskManager,
-        symbol: str = "BTC/USDT",
         exchange: Any | None = None,
     ) -> None:
         self._db = db
         self._risk = risk_manager
-        self.symbol = symbol
-        self._exchange = exchange
         self.open_positions: dict[str, OpenPosition] = {}
         self.total_pnl: float = 0.0
-        # Serialises open_positions mutations across async tasks.
-        self._positions_lock = asyncio.Lock()
-        # Symbols with register_open() applied but not yet in open_positions (in-flight open).
-        # Prevents duplicate symbol / max-slot races between await points.
-        self._pending_symbols: set[str] = set()
+        self._state_file = Path("logs/state.json")
+        self._journal_file = Path("logs/trade_journal.csv")
 
-    # ------------------------------------------------------------------
-    # State persistence (paper-trading disaster recovery)
-    # ------------------------------------------------------------------
-
-    def _save_state(self) -> None:
-        """Persist open positions and session PnL to ``state.json``.
-
-        Called automatically whenever a position is opened or closed.  The
-        file is written atomically (write to a temp file, then rename) so a
-        crash mid-write never leaves a corrupted file.  Errors are logged as
-        warnings rather than raised so the trading loop is never interrupted.
-        """
+    def save_state(self) -> None:
+        state = {
+            "total_pnl": self.total_pnl,
+            "positions": {s: p.to_dict() for s, p in self.open_positions.items()},
+        }
         try:
-            payload: dict[str, Any] = {
-                "saved_at": datetime.now(tz=timezone.utc).isoformat(),
-                "total_pnl": self.total_pnl,
-                "positions": [],
-            }
-            for sym, pos in self.open_positions.items():
-                payload["positions"].append({
-                    "symbol": sym,
-                    "entry_price": pos.entry_price,
-                    "position_size": pos.position_size,
-                    "entry_time": pos.entry_time.isoformat(),
-                    "trade_id": pos.trade_id,
-                    "sl_pct": pos.sl_pct,
-                    "activation_pct": pos.activation_pct,
-                    "trailing_distance_pct": pos.trailing_distance_pct,
-                    "stop_loss_price": pos.stop_loss_price,
-                    "atr_trailing_distance": pos.atr_trailing_distance,
-                    "peak_price": pos.peak_price,
-                    "trailing_stop_active": pos.trailing_stop_active,
-                    "current_stop_loss": pos.current_stop_loss,
-                    "max_ttl_hours": pos.max_ttl_hours,
-                    "ml_confidence": pos.ml_confidence,
-                    "sentiment_score": pos.sentiment_score,
-                    "close_pending": pos.close_pending,
-                    "last_close_error": pos.last_close_error,
-                    "mt5_position_ticket": pos.mt5_position_ticket,
-                    "last_broker_sl_synced": pos.last_broker_sl_synced,
-                    "last_broker_tp_synced": pos.last_broker_tp_synced,
-                    "last_mt5_modify_mono": pos.last_mt5_modify_mono,
-                })
-            tmp = _STATE_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            try:
-                tmp.replace(_STATE_FILE)
-            except OSError as e:
-                logger.warning("_save_state: atomic replace failed: %s. Trying direct write.", e)
-                _STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            self._state_file.parent.mkdir(exist_ok=True)
+            with self._state_file.open("w") as f:
+                json.dump(state, f, indent=2)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("_save_state: could not write state.json: %s", exc)
+            logger.warning("Failed to save state: %s", exc)
 
     def load_state(self) -> int:
-        """Restore open positions from ``state.json`` at startup (paper trading).
-
-        Reads the persisted state file and re-creates :class:`OpenPosition`
-        objects for every position that was open when the bot last shut down.
-        The risk manager's open-position counter is incremented for each
-        restored position.  The saved ``total_pnl`` is also restored.
-
-        This method is only meaningful in pure paper-trading mode; when a live
-        exchange client is present the authoritative state comes from Binance
-        via :meth:`restore_position` and this method should not be called.
-
-        Returns
-        -------
-        int
-            Number of positions successfully restored (0 if the file is
-            absent, empty, or cannot be parsed).
-        """
-        if not _STATE_FILE.exists():
+        if not self._state_file.exists():
             return 0
         try:
-            data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+            with self._state_file.open() as f:
+                state = json.load(f)
+            self.total_pnl = state.get("total_pnl", 0.0)
+            raw_pos = state.get("positions", {})
+            for s, d in raw_pos.items():
+                self.open_positions[s] = OpenPosition.from_dict(d)
+            self._risk.sync_open_count(len(self.open_positions))
+            return len(self.open_positions)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("load_state: could not read state.json: %s", exc)
+            logger.warning("Failed to load state: %s", exc)
             return 0
 
-        restored = 0
-        for raw in data.get("positions", []):
-            sym = raw.get("symbol", "")
-            if not sym or sym in self.open_positions:
-                continue
-            try:
-                entry_time = datetime.fromisoformat(raw["entry_time"])
-                pos = OpenPosition(
-                    symbol=sym,
-                    entry_price=float(raw["entry_price"]),
-                    position_size=float(raw["position_size"]),
-                    entry_time=entry_time,
-                    trade_id=raw.get("trade_id"),
-                    sl_pct=float(raw.get("sl_pct", BASE_SL)),
-                    activation_pct=float(raw.get("activation_pct", BASE_ACTIVATION_PCT)),
-                    trailing_distance_pct=float(raw.get("trailing_distance_pct", BASE_TRAILING_DISTANCE)),
-                    stop_loss_price=float(raw.get("stop_loss_price", 0.0)),
-                    atr_trailing_distance=float(raw.get("atr_trailing_distance", 0.0)),
-                    max_ttl_hours=raw["max_ttl_hours"] if "max_ttl_hours" in raw else _DEFAULT_TTL_HOURS,
-                    ml_confidence=float(raw.get("ml_confidence", 0.0)),
-                    sentiment_score=float(raw.get("sentiment_score", 0.0)),
-                    close_pending=bool(raw.get("close_pending", False)),
-                    last_close_error=str(raw.get("last_close_error", "")),
-                    mt5_position_ticket=(
-                        int(raw["mt5_position_ticket"])
-                        if raw.get("mt5_position_ticket") is not None
-                        else None
-                    ),
-                    last_broker_sl_synced=float(raw.get("last_broker_sl_synced", 0.0)),
-                    last_broker_tp_synced=float(raw.get("last_broker_tp_synced", 0.0)),
-                    last_mt5_modify_mono=float(raw.get("last_mt5_modify_mono", 0.0)),
-                )
-                # Restore mutable trailing-stop state that __post_init__ would overwrite
-                pos.peak_price = float(raw.get("peak_price", pos.entry_price))
-                pos.trailing_stop_active = raw.get("trailing_stop_active", False) is True
-                pos.current_stop_loss = float(raw.get("current_stop_loss", pos.stop_loss_price))
-                self.open_positions[sym] = pos
-                self._risk.register_open()
-                restored += 1
-                logger.info(
-                    "STATE RESTORED  symbol=%s  entry_price=%.2f  size=%.2f  "
-                    "peak=%.2f  trailing_active=%s",
-                    sym,
-                    pos.entry_price,
-                    pos.position_size,
-                    pos.peak_price,
-                    pos.trailing_stop_active,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("load_state: could not restore position %s: %s", sym, exc)
+    def _append_to_journal(self, pos: OpenPosition, exit_price: float, exit_time: datetime, reason: str) -> None:
+        gross_pnl = (exit_price - pos.entry_price) / pos.entry_price * pos.position_size
+        net_pnl = gross_pnl
+        duration = (exit_time - pos.entry_time).total_seconds() / 60.0
+        row = [pos.trade_id, pos.symbol, pos.entry_time.isoformat(), exit_time.isoformat(), f"{pos.entry_price:.8f}", f"{exit_price:.8f}", f"{pos.position_size:.2f}", f"{gross_pnl:.4f}", f"{net_pnl:.4f}", reason, f"{pos.ml_confidence:.4f}", f"{duration:.1f}"]
+        try:
+            write_header = not self._journal_file.exists()
+            with self._journal_file.open("a", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(_JOURNAL_COLUMNS)
+                writer.writerow(row)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to append to journal: %s", exc)
 
-        saved_pnl = data.get("total_pnl", 0.0)
-        self.total_pnl = float(saved_pnl)
-        if restored:
-            logger.info(
-                "✅ [STATE RECOVERY] Restored %d position(s) from state.json "
-                "(session PnL: %.4f USDT).",
-                restored,
-                self.total_pnl,
-            )
-        return restored
-
-    def restore_position(
-        self,
-        symbol: str,
-        entry_price: float,
-        position_size: float,
-    ) -> bool:
-        """Restore a single open position from exchange state at startup.
-
-        This method is used during bot initialisation to re-sync local state with
-        positions that were already open on Binance when the bot was restarted.
-        Unlike :meth:`try_open_trade`, this method:
-
-        * Does **not** deduct *position_size* from the risk manager balance
-          (the balance fetched from Binance already reflects open positions).
-        * Does **not** place a live order (the position exists on the exchange).
-        * Calls :meth:`~risk.risk_manager.RiskManager.register_open` so that the
-          concurrent-position counter is correctly incremented.
-
-        Parameters
-        ----------
-        symbol:
-            Trading pair of the existing position (e.g. ``"BTC/USDT"``).
-        entry_price:
-            Average entry price of the existing position.
-        position_size:
-            Absolute notional value in USDT of the existing position.
-
-        Returns
-        -------
-        bool
-            *True* if the position was successfully restored, *False* if a
-            position for *symbol* was already being tracked (no-op).
-        """
-        if symbol in self.open_positions:
-            logger.debug(
-                "restore_position: %s is already tracked – skipping.",
-                symbol,
-            )
-            return False
-
-        self.open_positions[symbol] = OpenPosition(
-            symbol=symbol,
-            entry_price=entry_price,
-            position_size=position_size,
-        )
+    async def try_open_trade(self, entry_price: float, win_probability: float, symbol: str, sentiment_score: float = 0.0, current_atr: float | None = None) -> bool:
+        if symbol in self.open_positions: return False
+        if not self._risk.can_open_position(): return False
+        pos_size_quote = self._risk.calculate_position_size(win_probability)
+        if not self._risk.has_sufficient_balance(pos_size_quote): return False
+        thresh = get_execution_thresholds()
+        sl_price = entry_price * (1.0 - thresh.sl_pct)
+        act_price = entry_price * (1.0 + thresh.activation_pct)
+        pos = OpenPosition(trade_id=uuid.uuid4().hex[:8], symbol=symbol, entry_time=datetime.now(tz=timezone.utc), entry_price=entry_price, position_size=pos_size_quote, sl_price=sl_price, activation_price=act_price, trailing_distance_pct=thresh.trailing_distance_pct, peak_price=entry_price, ml_confidence=win_probability)
+        self.open_positions[symbol] = pos
         self._risk.register_open()
-        logger.info(
-            "POSITION RESTORED  symbol=%s  entry_price=%.2f  size=%.2f",
-            symbol,
-            entry_price,
-            position_size,
-        )
+        self._risk.deduct(pos_size_quote)
+        self.save_state()
+        logger.info("🚀 [BUY] %s entry=%.4f size=%.2f SL=%.4f ACT=%.4f (ML=%.2f%%)", symbol, entry_price, pos_size_quote, sl_price, act_price, win_probability * 100)
         return True
 
-    async def try_open_trade(
-        self,
-        entry_price: float,
-        win_probability: float,
-        symbol: str | None = None,
-        timestamp: datetime | None = None,
-        sentiment_score: float = 0.0,
-        current_atr: float | None = None,
-    ) -> bool:
-        """Size and open a new trade using the leverage-based position formula.
-
-        Returns *False* (and does nothing) if:
-
-        * Trading is currently halted due to the daily loss limit.
-        * The portfolio drawdown circuit-breaker has been triggered.
-        * A position for *symbol* is already open.
-        * The maximum number of concurrent positions has been reached.
-        * The simulated balance is insufficient.
-
-        When an *exchange* client was provided at construction time a real
-        market buy order is placed on Binance Futures
-        (``create_market_buy_order`` with ``params={'leverage': LEVERAGE}``).
-
-        Parameters
-        ----------
-        entry_price:
-            Current market price at which the trade is entered.
-        win_probability:
-            ML-predicted probability of a profitable outcome (0–1).
-        symbol:
-            Trading pair to open.  Defaults to ``self.symbol``.
-        timestamp:
-            Trade entry time (UTC).  Defaults to *now*.
-        sentiment_score:
-            AI sentiment score in [-1.0, +1.0] used to compute dynamic
-            risk thresholds.  Defaults to ``0.0`` (neutral / base thresholds).
-        current_atr:
-            Current ATR value for *symbol* (e.g. ATR_14 on the 15m chart).
-            When provided, the initial stop loss and trailing stop distance
-            are derived from this value instead of fixed percentages.
-        """
-        sym = symbol or self.symbol
-
-        async with self._positions_lock:
-            if self._risk.is_trading_halted():
-                logger.warning(
-                    "⚠️ [ALERTA] Trading detenido por límite de pérdida diaria (symbol=%s) %s",
-                    sym,
-                    _DEBUG_LOG_HINT,
-                )
-                return False
-
-            if self._risk.is_portfolio_dd_exceeded():
-                logger.warning(
-                    "🚨 [CIRCUIT BREAKER] Todas las nuevas posiciones bloqueadas – "
-                    "límite de drawdown de cartera alcanzado (symbol=%s) %s",
-                    sym,
-                    _DEBUG_LOG_HINT,
-                )
-                return False
-
-            if sym in self.open_positions or sym in self._pending_symbols:
-                logger.debug("Trade skipped – a position for %s is already open.", sym)
-                return False
-
-            if not self._risk.can_open_position():
-                logger.debug(
-                    "Trade skipped – max open positions (%d) reached.",
-                    self._risk.max_positions,
-                )
-                return False
-
-            # ── Sector / correlation-group exposure check ──────────────────────
-            occupied_syms = set(self.open_positions.keys()) | self._pending_symbols
-            if self._risk.is_sector_exposed(sym, list(occupied_syms)):
-                sector = get_sector(sym)
-                logger.warning(
-                    "🛡️ [RISK CONTROL] Señal de BUY para %s ignorada. "
-                    "Exposición máxima alcanzada para el sector: %s.",
-                    sym,
-                    sector,
-                )
-                return False
-
-            position_size = self._risk.calculate_position_size(win_probability)
-            if not self._risk.has_sufficient_balance(position_size):
-                logger.warning(
-                    "⚠️ [ALERTA] Balance insuficiente (%.2f) para tamaño de posición %.2f %s",
-                    self._risk.balance,
-                    position_size,
-                    _DEBUG_LOG_HINT,
-                )
-                return False
-
-            ts = timestamp or datetime.now(tz=timezone.utc)
-            self._risk.register_open()
-            self._pending_symbols.add(sym)
-
-            # ── Compute dynamic risk thresholds from sentiment ─────────────
-            thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
-            
-            # ── ATR-based dynamic SL logging ──────────────────────────────────
-            if current_atr is not None and current_atr > 0.0:
-                sl_dist = current_atr * ATR_SL_MULTIPLIER * thresholds.multiplier
-                logger.info(
-                    "🛡️ [RIESGO] SL configurado a distancia ATR: %.2f (Sentimiento: %.2f, Multiplicador: %.2f)",
-                    sl_dist,
-                    sentiment_score,
-                    thresholds.multiplier
-                )
-            
-            logger.debug(
-                "DYNAMIC THRESHOLDS  symbol=%s  sentiment=%.4f  multiplier=%.2f  "
-                "sl=%.4f  activation=%.4f  trailing_dist=%.4f",
-                sym,
-                sentiment_score,
-                thresholds.multiplier,
-                thresholds.sl_pct,
-                thresholds.activation_pct,
-                thresholds.trailing_distance_pct,
-            )
-
-        # ── Live Binance Futures order ─────────────────────────────────────
-        if self._exchange is not None:
-            try:
-                try:
-                    await self._exchange.set_leverage(LEVERAGE, sym)
-                except CcxtNotSupported:
-                    logger.warning(
-                        "set_leverage not supported for %s (testnet?) – "
-                        "proceeding with existing leverage setting.",
-                        sym,
-                    )
-                amount = position_size / entry_price
-                try:
-                    await self._exchange.create_market_buy_order(
-                        sym,
-                        amount,
-                        params={"leverage": LEVERAGE},
-                    )
-                except CcxtNotSupported:
-                    logger.warning(
-                        "create_market_buy_order raised NotSupported for %s "
-                        "(testnet sapi metadata unavailable). "
-                        "If 'fetchCurrencies' is False the fapi order likely "
-                        "succeeded – verify via the Binance Testnet UI or "
-                        "fetch_open_orders().",
-                        sym,
-                    )
-                else:
-                    logger.info(
-                        "FUTURES BUY ORDER PLACED  symbol=%s  amount=%.6f  leverage=%d",
-                        sym,
-                        amount,
-                        LEVERAGE,
-                    )
-            except (CcxtAuthenticationError, CcxtExchangeError, CcxtInsufficientFunds, CcxtNetworkError):
-                logger.exception(
-                    "Failed to place Binance Futures buy order for %s – "
-                    "rolling back balance deduction and aborting trade.",
-                    sym,
-                )
-                async with self._positions_lock:
-                    self._pending_symbols.discard(sym)
-                    self._risk.credit(position_size)
-                    self._risk.register_close()
-                return False
-
-        try:
-            trade_id = await self._db.insert_open_trade(
-                symbol=sym,
-                entry_price=entry_price,
-                position_size=position_size,
-                entry_time=ts,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("[DB] insert_open_trade failed for %s — rolling back: %s", sym, exc)
-            async with self._positions_lock:
-                self._pending_symbols.discard(sym)
-                self._risk.register_close()
-            return False
-
-        # ── ATR-based dynamic SL / trailing distance ───────────────────────
-        sl_distance: float | None = None
-        stop_loss_price: float = 0.0
-        atr_trailing_distance: float = 0.0
-        if current_atr is not None and current_atr > 0.0:
-            sl_distance = current_atr * ATR_SL_MULTIPLIER
-            stop_loss_price = entry_price - sl_distance
-            atr_trailing_distance = current_atr * ATR_TRAILING_MULTIPLIER
-
-        async with self._positions_lock:
-            self.open_positions[sym] = OpenPosition(
-                symbol=sym,
-                entry_price=entry_price,
-                position_size=position_size,
-                entry_time=ts,
-                trade_id=trade_id,
-                sl_pct=thresholds.sl_pct,
-                activation_pct=thresholds.activation_pct,
-                trailing_distance_pct=thresholds.trailing_distance_pct,
-                stop_loss_price=stop_loss_price,
-                atr_trailing_distance=atr_trailing_distance,
-                ml_confidence=win_probability,
-                sentiment_score=sentiment_score,
-            )
-            self._pending_symbols.discard(sym)
-        # ── Trade journal CSV (BUY row) ────────────────────────────────────
-        record_trade(
-            timestamp=ts,
-            symbol=sym,
-            action="BUY",
-            execution_price=entry_price,
-            quantity=position_size / entry_price,
-            ml_confidence_at_entry=win_probability,
-            sentiment_score_at_entry=sentiment_score,
-            idempotency_key=f"BUY:{sym}:trade_id:{trade_id}",
-        )
-        # ── Persist state so the position survives a restart ───────────────
-        self._save_state()
-        # Operational console line – visible on the terminal at INFO level.
-        if sl_distance is not None:
-            logger.info(
-                "✅ [OPEN LONG] %s a %.2f. SL Dinámico (ATR): %.2f (Distancia: %.2f)",
-                sym,
-                entry_price,
-                self.open_positions[sym].stop_loss_price,
-                sl_distance,
-            )
-        else:
-            logger.info(
-                "🚀 [ENTRADA] %s | Lado: BUY | Confianza: %.1f%% | SL: %.2f%% | TP: %.2f%%",
-                sym,
-                win_probability * 100,
-                thresholds.sl_pct * 100,
-                thresholds.activation_pct * 100,
-            )
-        asyncio.create_task(
-            send_telegram_alert(
-                f"🚀 *OPEN BUY* | #{sym}\n"
-                f"Precio: {entry_price:.2f}\n"
-                f"SL Dinámico (ATR): {self.open_positions[sym].stop_loss_price:.2f}"
-            )
-        )
-        # Full technical details go to the debug log file only.
-        logger.debug(
-            "TRADE OPENED  symbol=%s  entry_price=%.2f  size=%.2f  id=%s  balance=%.2f  "
-            "sl_price=%.2f  atr=%.4f",
-            sym,
-            entry_price,
-            position_size,
-            trade_id,
-            self._risk.balance,
-            self.open_positions[sym].stop_loss_price,
-            current_atr if current_atr is not None else 0.0,
-        )
-        return True
-
-    async def _sync_exchange_stops(
-        self,
-        sym: str,
-        pos: OpenPosition,
-        current_price: float,
-        current_atr: float | None,
-    ) -> None:
-        """Push ratcheted SL / dynamic TP to a live exchange (MT5 override).
-
-        Default paper implementation is a no-op.
-        """
-        return
-
-    async def check_and_close(
-        self,
-        current_price: float,
-        symbol: str | None = None,
-        timestamp: datetime | None = None,
-        current_atr: float | None = None,
-    ) -> float | None:
-        """Check whether *current_price* triggers the stop loss for *symbol*.
-
-        The active stop loss starts as the hard initial SL (``sl_pct`` below
-        entry price – set dynamically at position open from the AI sentiment
-        score).  Once the position profit reaches ``activation_pct`` the
-        active SL updates dynamically to
-        ``peak_price * (1 - trailing_distance_pct)``, never retreating below
-        the previously set level.
-
-        If the current price drops at or below the active stop loss the
-        position is closed and the realised PnL is returned.
-
-        Returns ``None`` when no position for *symbol* is open or the active
-        stop loss has not been reached yet.
-
-        Parameters
-        ----------
-        current_price:
-            Latest market price to evaluate against open positions.
-        symbol:
-            Trading pair to check.  Defaults to ``self.symbol``.
-        timestamp:
-            Evaluation time (UTC).  Defaults to *now*.
-        current_atr:
-            Latest ATR_14 value for *symbol*.  When provided and the trailing
-            stop is active, the stored ``atr_trailing_distance`` is refreshed
-            so the stop adapts to changing volatility.
-        """
-        sym = symbol or self.symbol
-        async with self._positions_lock:
-            if sym not in self.open_positions:
-                return None
-
-            pos = self.open_positions[sym]
-            price_change_pct = (current_price - pos.entry_price) / pos.entry_price
-
-            # ------------------------------------------------------------------
-            # Trailing Stop logic
-            # ------------------------------------------------------------------
-            if current_price > pos.peak_price:
-                pos.peak_price = current_price
-
-            if not pos.trailing_stop_active and price_change_pct >= pos.activation_pct:
-                pos.trailing_stop_active = True
-                logger.debug(
-                    "Trailing Stop ACTIVATED  symbol=%s  entry=%.2f  current=%.2f  profit=%.2f%%",
-                    sym,
-                    pos.entry_price,
-                    current_price,
-                    price_change_pct * 100,
-                )
-
-            initial_sl_price = pos.stop_loss_price
-            if pos.trailing_stop_active:
-                if current_atr is not None and current_atr > 0.0:
-                    pos.atr_trailing_distance = current_atr * ATR_TRAILING_MULTIPLIER
-                if pos.atr_trailing_distance > 0.0:
-                    trailing_sl = pos.peak_price - pos.atr_trailing_distance
-                else:
-                    trailing_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
-                active_sl = max(trailing_sl, initial_sl_price)
-            else:
-                active_sl = initial_sl_price
-
-            pos.current_stop_loss = max(active_sl, pos.current_stop_loss)
-            logger.debug(
-                "[DEBUG] Precio: %.4f | Stop Activo: %.4f | Distancia al Stop: %.4f",
-                current_price,
-                pos.current_stop_loss,
-                current_price - pos.current_stop_loss,
-            )
-
-            if current_price > pos.current_stop_loss:
-                await self._sync_exchange_stops(sym, pos, current_price, current_atr)
-                return None
-
-            pnl = price_change_pct * pos.position_size
-            ts = timestamp or datetime.now(tz=timezone.utc)
-            reason = "TSL" if pos.trailing_stop_active else "SL"
-            reason_code = "TRAILING_STOP" if pos.trailing_stop_active else "SL_BASE"
-            closed = await self._close_position(
-                symbol=sym,
-                exit_price=current_price,
-                exit_time=ts,
-                pnl=pnl,
-                exit_reason_code=reason_code,
-            )
-            if not closed:
-                return None
-
-            logger.info(
-                "💰 [CIERRE] %s | PnL: %.4f USDT | Motivo: %s",
-                sym,
-                pnl,
-                reason,
-            )
-            asyncio.create_task(
-                send_telegram_alert(
-                    _build_trade_report(
-                        sym=sym,
-                        pos=pos,
-                        exit_price=current_price,
-                        exit_time=ts,
-                        gross_pnl=pnl,
-                        exit_reason_code=reason_code,
-                        current_balance=self._risk.balance,
-                    )
-                )
-            )
-            logger.debug(
-                "TRADE CLOSED [%s]  symbol=%s  entry=%.2f  peak=%.2f  exit=%.2f  pnl=%.4f",
-                reason,
-                pos.symbol,
-                pos.entry_price,
-                pos.peak_price,
-                current_price,
-                pnl,
-            )
-            return pnl
-
-    async def check_ml_exit(
-        self,
-        current_price: float,
-        ml_signal: str,
-        ml_probability: float | None = None,
-        symbol: str | None = None,
-        timestamp: datetime | None = None,
-        min_confidence: float = 0.55,
-    ) -> float | None:
-        """Apply smart-exit logic driven by ML signals and TTL (Layers 1 and 4).
-
-        This method is called from the signal-emitter loop (typically every 15 s)
-        after the ML predictor has already generated a fresh signal.  It
-        complements the mechanical stop-loss in :meth:`check_and_close` (Layer 3)
-        with two higher-level exit conditions:
-
-        Layer 1 – ML Exhaustion / Reversal Exit
-            For a LONG position: if *ml_signal* is ``"SELL"`` **and** the
-            predicted probability of a downward move
-            (``1 - ml_probability``) is at least ``min_confidence *
-            _ML_EXIT_CONFIDENCE_FACTOR`` (default 80 % of *min_confidence*),
-            the position is closed immediately at *current_price*, ahead of any
-            SL level.  This handles the scenario where the model detects trend
-            exhaustion before the price reaches the trailing stop.
-
-        Layer 4 – Time-To-Live (TTL) Exit
-            If the position has been open for longer than its
-            :attr:`~OpenPosition.max_ttl_hours` limit (default 12 h), and neither
-            Layer 1 nor Layer 3 has yet closed it, the position is force-closed
-            to free up margin in a sideways market.
-
-        Parameters
-        ----------
-        current_price:
-            Latest market price.
-        ml_signal:
-            Output of :meth:`~strategy.ml_predictor.MLPredictor.generate_signal`
-            for *symbol* – ``"BUY"``, ``"SELL"``, or ``"HOLD"``.
-        ml_probability:
-            Output of :meth:`~strategy.ml_predictor.MLPredictor.predict_proba`
-            for *symbol* – probability in ``[0, 1]`` that price will move up.
-            When ``None`` Layer 1 is skipped entirely so that an untrained or
-            unavailable model never triggers an early exit.
-        symbol:
-            Trading pair to evaluate.  Defaults to ``self.symbol``.
-        timestamp:
-            Evaluation time (UTC).  Defaults to *now*.
-        min_confidence:
-            Base ML confidence threshold used to compute the Layer-1 gate
-            (``min_confidence * _ML_EXIT_CONFIDENCE_FACTOR``).  Pass the same
-            value as ``_BUY_PROB_THRESHOLD`` used in the predictor (default
-            0.55) to keep both thresholds in sync.
-
-        Returns
-        -------
-        Realised PnL if the position was closed, ``None`` otherwise.
-        """
-        sym = symbol or self.symbol
-        async with self._positions_lock:
-            if sym not in self.open_positions:
-                return None
-
-            pos = self.open_positions[sym]
-            price_change_pct = (current_price - pos.entry_price) / pos.entry_price
-            pnl = price_change_pct * pos.position_size
-            ts = timestamp or datetime.now(tz=timezone.utc)
-            age_hours = (ts - pos.entry_time).total_seconds() / 3600.0
-
-            if ml_signal == "SELL" and ml_probability is not None:
-                sell_confidence = 1.0 - ml_probability
-                confidence_gate = min_confidence * _ML_EXIT_CONFIDENCE_FACTOR
-                if sell_confidence >= confidence_gate:
-                    closed = await self._close_position(
-                        symbol=sym,
-                        exit_price=current_price,
-                        exit_time=ts,
-                        pnl=pnl,
-                        exit_reason_code="SMART_EXIT_ML",
-                    )
-                    if not closed:
-                        return None
-                    logger.info(
-                        "🤖💰 [SMART EXIT] %s cerrado por Reversión de Tendencia "
-                        "(ML Exhaustion). PnL estimado: %.4f",
-                        sym,
-                        pnl,
-                    )
-                    asyncio.create_task(
-                        send_telegram_alert(
-                            _build_trade_report(
-                                sym=sym,
-                                pos=pos,
-                                exit_price=current_price,
-                                exit_time=ts,
-                                gross_pnl=pnl,
-                                exit_reason_code="SMART_EXIT_ML",
-                                current_balance=self._risk.balance,
-                            )
-                        )
-                    )
-                    logger.debug(
-                        "TRADE CLOSED [ML_EXHAUSTION]  symbol=%s  entry=%.2f  "
-                        "exit=%.2f  sell_confidence=%.4f  gate=%.4f  pnl=%.4f",
-                        sym,
-                        pos.entry_price,
-                        current_price,
-                        sell_confidence,
-                        confidence_gate,
-                        pnl,
-                    )
-                    return pnl
-
-            # [NEW] Layer 5 – Stagnation Exit
-            # If the position has been open for longer than _PROFIT_STAGNATION_TIMEOUT_HOURS
-            # (default 6 h) and is currently in profit (pnl > 0), close it to take
-            # whatever gains are on the table and free up margin.
-            if age_hours >= _PROFIT_STAGNATION_TIMEOUT_HOURS and pnl > 0:
-                closed = await self._close_position(
-                    symbol=sym,
-                    exit_price=current_price,
-                    exit_time=ts,
-                    pnl=pnl,
-                    exit_reason_code="STAGNATION_EXIT",
-                )
-                if not closed:
-                    return None
-                logger.info(
-                    "⌛ [STAGNATION EXIT] %s cerrado por estancamiento en ganancia (>%.1fh). PnL: %.4f",
-                    sym,
-                    _PROFIT_STAGNATION_TIMEOUT_HOURS,
-                    pnl,
-                )
-                asyncio.create_task(
-                    send_telegram_alert(
-                        _build_trade_report(
-                            sym=sym,
-                            pos=pos,
-                            exit_price=current_price,
-                            exit_time=ts,
-                            gross_pnl=pnl,
-                            exit_reason_code="STAGNATION_EXIT",
-                            current_balance=self._risk.balance,
-                        )
-                    )
-                )
-                logger.debug(
-                    "TRADE CLOSED [STAGNATION]  symbol=%s  entry=%.2f  exit=%.2f  "
-                    "age_hours=%.2f  timeout=%.2f  pnl=%.4f",
-                    sym,
-                    pos.entry_price,
-                    current_price,
-                    age_hours,
-                    _PROFIT_STAGNATION_TIMEOUT_HOURS,
-                    pnl,
-                )
-                return pnl
-
-            if pos.max_ttl_hours is not None:
-                age_hours = (ts - pos.entry_time).total_seconds() / 3600.0
-                if age_hours >= pos.max_ttl_hours:
-                    closed = await self._close_position(
-                        symbol=sym,
-                        exit_price=current_price,
-                        exit_time=ts,
-                        pnl=pnl,
-                        exit_reason_code="TTL_TIMEOUT",
-                    )
-                    if not closed:
-                        return None
-                    logger.info(
-                        "⏳ [TTL EXIT] %s cerrado por tiempo máximo de exposición "
-                        "alcanzado. PnL: %.4f",
-                        sym,
-                        pnl,
-                    )
-                    asyncio.create_task(
-                        send_telegram_alert(
-                            _build_trade_report(
-                                sym=sym,
-                                pos=pos,
-                                exit_price=current_price,
-                                exit_time=ts,
-                                gross_pnl=pnl,
-                                exit_reason_code="TTL_TIMEOUT",
-                                current_balance=self._risk.balance,
-                            )
-                        )
-                    )
-                    logger.debug(
-                        "TRADE CLOSED [TTL]  symbol=%s  entry=%.2f  exit=%.2f  "
-                        "age_hours=%.2f  max_ttl=%.2f  pnl=%.4f",
-                        sym,
-                        pos.entry_price,
-                        current_price,
-                        age_hours,
-                        pos.max_ttl_hours,
-                        pnl,
-                    )
-                    return pnl
-
-            return None
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    async def _close_position(
-        self,
-        symbol: str,
-        exit_price: float,
-        exit_time: datetime,
-        pnl: float,
-        exit_reason_code: str = "",
-    ) -> bool:
-        """Persist the closed trade, update balance, and remove the open position."""
+    async def check_and_close(self, symbol: str, current_price: float) -> str | None:
         pos = self.open_positions.get(symbol)
-        if pos is None:
-            logger.warning(
-                "_close_position called for %s but no open position found – skipping.",
-                symbol,
-            )
-            return False
+        if not pos: return None
+        if current_price > pos.peak_price:
+            pos.peak_price = current_price
+            if current_price >= pos.activation_price:
+                if not pos.trailing_stop_active:
+                    pos.trailing_stop_active = True
+                    logger.info("📈 [TS] %s trailing stop ACTIVATED at %.4f", symbol, current_price)
+                new_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
+                if new_sl > pos.sl_price: pos.sl_price = new_sl
+        exit_reason = None
+        if current_price <= pos.sl_price: exit_reason = "trailing_stop" if pos.trailing_stop_active else "stop_loss"
+        if exit_reason:
+            await self._close_position(symbol, current_price, exit_reason)
+            return exit_reason
+        return None
 
-        # ── Live Binance Futures order ─────────────────────────────────────
-        close_error: str | None = None
-        if self._exchange is not None:
-            try:
-                # position_size is the leveraged notional value; convert to base
-                # currency quantity by dividing by the exit price.
-                amount = pos.position_size / exit_price
-                try:
-                    await self._exchange.create_market_sell_order(
-                        symbol,
-                        amount,
-                        params={"leverage": LEVERAGE, "reduceOnly": True},
-                    )
-                except CcxtNotSupported:
-                    # Testnet sapi endpoints are not available; the fapi order
-                    # may still have been routed correctly.  Log a warning and
-                    # continue rather than treating this as a hard failure.
-                    logger.warning(
-                        "create_market_sell_order raised NotSupported for %s "
-                        "(testnet sapi metadata unavailable). "
-                        "If 'fetchCurrencies' is False the fapi order likely "
-                        "succeeded – verify via the Binance Testnet UI or "
-                        "fetch_open_orders().",
-                        symbol,
-                    )
-                else:
-                    logger.info(
-                        "FUTURES SELL ORDER PLACED  symbol=%s  amount=%.6f  leverage=%d",
-                        symbol,
-                        amount,
-                        LEVERAGE,
-                    )
-            except (CcxtAuthenticationError, CcxtExchangeError, CcxtInsufficientFunds, CcxtNetworkError):
-                logger.exception(
-                    "Failed to place Binance Futures sell order for %s – "
-                    "position kept local with close_pending for retry.",
-                    symbol,
-                )
-                close_error = "binance_close_failed"
+    async def check_ml_exit(self, current_price: float, ml_signal: str, ml_probability: float | None, symbol: str, min_confidence: float = 0.70) -> float | None:
+        pos = self.open_positions.get(symbol)
+        if not pos: return None
+        now = datetime.now(tz=timezone.utc)
+        duration_h = (now - pos.entry_time).total_seconds() / 3600.0
+        if ml_signal == "SELL" and (ml_probability is None or ml_probability >= min_confidence):
+            logger.info("📉 [SELL] %s ML Reversal triggered early exit.", symbol)
+            return await self._close_position(symbol, current_price, "ml_reversal")
+        if duration_h >= 12.0:
+            logger.info("⏱️ [TTL] %s position reached max age (12h).", symbol)
+            return await self._close_position(symbol, current_price, "ttl_expiry")
+        return None
 
-        # Keep local state in sync with the broker truth:
-        # if live close failed, do not remove the position locally.
-        if close_error is not None:
-            pos.close_pending = True
-            pos.last_close_error = close_error
-            self._save_state()
-            return False
-
-        if pos.trade_id is not None:
-            total_fees = pos.position_size * _TAKER_FEE_RATE * 2
-            net_pnl = pnl - total_fees
-            try:
-                await self._db.close_trade(
-                    trade_id=pos.trade_id,
-                    exit_price=exit_price,
-                    exit_time=exit_time,
-                    pnl=pnl,
-                    pnl_net=net_pnl,
-                    fee=total_fees,
-                    exit_reason=exit_reason_code,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "[DB] close_trade failed trade_id=%s — revisar Postgres. Error: %s",
-                    pos.trade_id,
-                    exc,
-                )
-
-        # Credit back any PnL (positive or negative)
-        # Note: We no longer deduct position_size on entry, so we only credit the PnL here.
-        self._risk.credit(pnl)
+    async def _close_position(self, symbol: str, exit_price: float, reason: str) -> float:
+        pos = self.open_positions.pop(symbol)
+        exit_time = datetime.now(tz=timezone.utc)
+        gross_pnl = (exit_price - pos.entry_price) / pos.entry_price * pos.position_size
+        self.total_pnl += gross_pnl
+        self._risk.credit(pos.position_size + gross_pnl)
         self._risk.register_close()
-        # Record realised losses so the safety break can trigger if needed
-        if pnl < 0.0:
-            self._risk.record_daily_loss(-pnl)
-        self.total_pnl += pnl
-        from bot import state as _dash_state
-        if pnl >= 0:
-            _dash_state.session_wins += 1
-        else:
-            _dash_state.session_losses += 1
-        del self.open_positions[symbol]
+        if gross_pnl < 0: self._risk.record_daily_loss(abs(gross_pnl))
+        self._append_to_journal(pos, exit_price, exit_time, reason)
+        self.save_state()
+        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
+        logger.info("🏁 [CLOSE] %s exit=%.4f pnl=%.2f (%.2f%%) reason=%s", symbol, exit_price, gross_pnl, pnl_pct, reason)
+        await send_telegram_alert(f"🏁 *CLOSE* {symbol}\nExit: {exit_price:.4f}\nPnL: {gross_pnl:+.2f} ({pnl_pct:+.2f}%)\nReason: {reason}")
+        return gross_pnl
 
-        # ── Trade journal CSV (SELL row) ───────────────────────────────────
-        total_fees = pos.position_size * _TAKER_FEE_RATE * 2
-        net_pnl = pnl - total_fees
-        margin_used = pos.position_size / LEVERAGE
-        pnl_pct = (net_pnl / margin_used * 100) if margin_used > 0 else 0.0
-        record_trade(
-            timestamp=exit_time,
-            symbol=symbol,
-            action="SELL",
-            execution_price=exit_price,
-            quantity=pos.position_size / exit_price,
-            ml_confidence_at_entry=pos.ml_confidence,
-            sentiment_score_at_entry=pos.sentiment_score,
-            exit_reason=exit_reason_code,
-            pnl_usdt=net_pnl,
-            pnl_percent=pnl_pct,
-            idempotency_key=f"SELL:{symbol}:trade_id:{pos.trade_id}:{exit_reason_code}",
-        )
-        # ── Persist updated state (position removed) ───────────────────────
-        self._save_state()
-        return True
-
-    async def sync_positions_with_exchange(self) -> int:
-        """Re-sync local open-position state against live Binance Futures positions.
-
-        Detects *ghost* positions — entries that exist in local memory but have
-        already been closed on the exchange (e.g. via manual close on the Binance
-        UI or an external stop-loss trigger) — and removes them from
-        :attr:`open_positions`.  For each ghost position any lingering open orders
-        on Binance are also cancelled to avoid orphan TP/SL orders.
-
-        In pure paper-trading mode (``self._exchange is None``) the method is a
-        no-op and returns the current local position count unchanged.
-
-        Returns
-        -------
-        int
-            Number of positions currently open on Binance (0 in paper mode).
-        """
-        if self._exchange is None:
-            return len(self.open_positions)
-
-        live_positions: list[dict[str, Any]] = []
-        try:
-            # Generic CCXT fallback for non-MT5 live exchange integrations.
-            raw_positions: list[dict[str, Any]] = await self._exchange.fetch_positions()
-            for pos in raw_positions:
-                contracts = float(pos.get("contracts") or 0.0)
-                if contracts <= 0.0:
-                    continue
-                symbol = str(pos.get("symbol") or "")
-                if not symbol:
-                    continue
-                live_positions.append({"symbol": symbol})
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[SYNC] Could not fetch live positions: %s", exc)
-            return len(self.open_positions)
-
-        # Normalise symbols: strip settle suffix (e.g. "BTC/USDT:USDT" -> "BTC/USDT")
-        live_symbols: set[str] = {p["symbol"].split(":")[0] for p in live_positions}
-
-        # ── Ghost detection: in memory but gone on exchange ────────────────
-        async with self._positions_lock:
-            ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
-            for sym in ghost_symbols:
-                logger.info(
-                    "[SYNC] 👻 Ghost position detected: %s exists in bot memory but is "
-                    "no longer open on Binance. Removing from local state.",
-                    sym,
-                )
-                await self._cancel_open_orders(sym)
-                pos = self.open_positions.pop(sym, None)
-                if pos is not None:
-                    self._risk.register_close()
-                    logger.info(
-                        "[SYNC] ✅ Ghost position %s removed. Local positions now: %d.",
-                        sym,
-                        len(self.open_positions),
-                    )
-
-        # ── Discrepancy detection: on exchange but not tracked locally ─────
-            untracked_symbols = [sym for sym in live_symbols if sym not in self.open_positions]
-            for sym in untracked_symbols:
-                logger.warning(
-                    "[SYNC] ⚠️ Discrepancy detected: position for %s is open on Binance "
-                    "but is NOT tracked in local bot state. "
-                    "Consider restarting the bot or manually reconciling. "
-                    "Local positions: %d, Binance positions: %d.",
-                    sym,
-                    len(self.open_positions),
-                    len(live_symbols),
-                )
-
-            # Enforce counter invariant after sync
-            actual = len(self.open_positions)
-            if self._risk.open_count != actual:
-                logger.warning(
-                    "[SYNC] Counter drift detected: risk.open_count=%d actual=%d — correcting.",
-                    self._risk.open_count,
-                    actual,
-                )
-                self._risk.sync_open_count(actual)
-
-        return len(live_symbols)
-
-    async def _cancel_open_orders(self, symbol: str) -> None:
-        """Cancel all open orders for *symbol* on Binance Futures.
-
-        Called when a ghost position is detected so that any orphan Stop-Loss or
-        Take-Profit orders left on the exchange are cleaned up automatically.
-        Errors are logged as warnings rather than raised so they never interrupt
-        the main sync loop.
-        """
-        if self._exchange is None:
-            return
-        try:
-            open_orders: list[dict] = await self._exchange.fetch_open_orders(symbol)
-        except (CcxtNetworkError, CcxtAuthenticationError, CcxtNotSupported, CcxtExchangeError) as exc:
-            logger.warning(
-                "[SYNC] Could not fetch open orders for %s: %s – orphan orders may remain.",
-                symbol,
-                exc,
-            )
-            return
-
-        if not open_orders:
-            return
-
-        for order in open_orders:
-            order_id = order.get("id")
-            if order_id is None:
-                continue
-            try:
-                await self._exchange.cancel_order(order_id, symbol)
-                logger.info(
-                    "[SYNC] 🗑️ Cancelled orphan order %s for %s.",
-                    order_id,
-                    symbol,
-                )
-            except (CcxtNetworkError, CcxtAuthenticationError, CcxtNotSupported, CcxtExchangeError) as exc:
-                logger.warning(
-                    "[SYNC] Could not cancel order %s for %s: %s",
-                    order_id,
-                    symbol,
-                    exc,
-                )
-
-    async def retry_close_pending_positions(
-        self,
-        latest_prices: dict[str, float],
-        timestamp: datetime | None = None,
-    ) -> int:
-        """Retry force-closing positions flagged as ``close_pending``.
-
-        Parameters
-        ----------
-        latest_prices:
-            Mapping ``symbol -> latest tradable price`` used as exit price.
-        timestamp:
-            Optional close timestamp. Defaults to current UTC time.
-
-        Returns
-        -------
-        int
-            Number of positions successfully closed in this retry cycle.
-        """
-        closed_count = 0
-        ts = timestamp or datetime.now(tz=timezone.utc)
-        async with self._positions_lock:
-            pending_symbols = [
-                sym for sym, pos in self.open_positions.items() if pos.close_pending
-            ]
-            for sym in pending_symbols:
-                pos = self.open_positions.get(sym)
-                if pos is None:
-                    continue
-                px = latest_prices.get(sym)
-                if px is None or px <= 0:
-                    continue
-                pnl = ((px - pos.entry_price) / pos.entry_price) * pos.position_size
-                closed = await self._close_position(
-                    symbol=sym,
-                    exit_price=px,
-                    exit_time=ts,
-                    pnl=pnl,
-                    exit_reason_code="CLOSE_RETRY",
-                )
-                if closed:
-                    closed_count += 1
-                else:
-                    # Keep the flag set for future retries.
-                    pos.close_pending = True
-                    if not pos.last_close_error:
-                        pos.last_close_error = "retry_failed"
-            if pending_symbols:
-                self._save_state()
-        return closed_count
-
+    async def sync_positions_with_exchange(self, confirmations_required: int = 1) -> int:
+        return len(self.open_positions)

@@ -14,7 +14,7 @@ from database.db_manager import db
 from execution.mt5_executor import MT5Executor
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
 from risk.risk_manager import RiskManager
-from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD
+from strategy.ml_predictor import BUY_PROB_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -160,9 +160,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             <div class="mt-6 md:mt-0 flex gap-3 w-full md:w-auto">
                 <div class="bg-black/20 p-4 rounded-2xl border border-white/5 flex-1 md:w-48">
-                    <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-1">Lectura IA</div>
-                    <div class="text-lg font-bold" id="sentiment">--</div>
-                    <div class="text-xs text-slate-400 mt-1" id="sentiment-detail">--</div>
+                    <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-1">Estrategia</div>
+                    <div class="text-lg font-bold text-sky-300" id="sentiment">INJ/USDT</div>
+                    <div class="text-xs text-slate-400 mt-1" id="sentiment-detail">Solo modelo XGB · umbral 70%</div>
                 </div>
                 <div class="bg-black/20 p-4 rounded-2xl border border-white/5 flex-1 md:w-40">
                     <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-1">Estado Bot</div>
@@ -216,9 +216,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="text-2xl font-bold text-sky-400" id="api-latency">--</div>
             </div>
             <div class="glass-card rounded-2xl p-5 text-center">
-                <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-2">Sentimiento IA</div>
-                <div class="text-2xl font-bold" id="sent-num">--</div>
-                <div class="progress-bar-bg mt-2"><div class="progress-bar-fill bg-sky-400" id="sent-bar" style="width:50%"></div></div>
+                <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-2">Umbral compra</div>
+                <div class="text-2xl font-bold text-slate-200" id="sent-num">70%</div>
+                <div class="progress-bar-bg mt-2"><div class="progress-bar-fill bg-emerald-500/60" id="sent-bar" style="width:70%"></div></div>
             </div>
         </div>
 
@@ -270,7 +270,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <h2 class="text-lg font-medium text-slate-300 tracking-wide">MERCADO EN VIVO</h2>
         </div>
         
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6" id="market-cards">
+        <div class="grid grid-cols-1 md:grid-cols-1 gap-6 max-w-xl mx-auto" id="market-cards">
             <!-- JS Renders Here -->
         </div>
 
@@ -358,9 +358,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('uptime').innerText = data.uptime;
             
             const sentEl = document.getElementById('sentiment');
-            sentEl.innerText = data.sentiment_label;
-            sentEl.className = `text-lg font-bold ${data.sentiment_num >= 0.60 ? 'text-glow-green' : data.sentiment_num >= 0.45 ? 'text-yellow-400' : 'text-glow-red'}`;
-            document.getElementById('sentiment-detail').innerText = data.sentiment_detail;
+            sentEl.innerText = 'INJ/USDT';
+            sentEl.className = 'text-lg font-bold text-sky-300';
+            document.getElementById('sentiment-detail').innerText = 'Solo modelo XGB · umbral 70%';
 
             const botStatusEl = document.getElementById('bot-status');
             if (data.global_hold) {
@@ -376,14 +376,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             updateValue('s-losses', data.session_losses || 0);
             updateValue('s-winrate', data.session_winrate || '--%');
 
-            const sentNum = data.sentiment_num || 0;
             const sentEl2 = document.getElementById('sent-num');
             if (sentEl2) {
-                sentEl2.innerText = sentNum.toFixed(4);
-                sentEl2.className = `text-2xl font-bold ${sentNum >= 0.55 ? 'text-glow-green' : sentNum >= 0.35 ? 'text-yellow-400' : 'text-glow-red'}`;
+                sentEl2.innerText = '70%';
+                sentEl2.className = 'text-2xl font-bold text-slate-200';
             }
             const sentBar = document.getElementById('sent-bar');
-            if (sentBar) sentBar.style.width = `${Math.max(0, Math.min(100, (sentNum + 1) / 2 * 100))}%`;
+            if (sentBar) sentBar.style.width = '70%';
 
             updateValue('balance', data.balance);
             updateValue('margin', data.available_margin);
@@ -455,7 +454,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 let priceClass = item.has_position ? 'text-white' : 'text-slate-200';
                 
-                let mlColor = item.ml_conf.replace('%','') > 55 ? 'bg-emerald-400' : 'bg-sky-400';
+                let mlColor = item.ml_conf.replace('%','') >= 70 ? 'bg-emerald-400' : 'bg-sky-400';
                 let rsiNum = parseFloat(item.rsi);
                 let rsiColor = rsiNum > 70 ? 'bg-red-400' : (rsiNum < 30 ? 'bg-emerald-400' : 'bg-slate-400');
                 
@@ -721,35 +720,10 @@ async def start_web_dashboard(
         else:
             uptime_str = "00:00:00"
 
-        # Sentiment
         sentiment = state.get("sentiment")
-        news_hold_until = state.get("news_hold_until")
-        news_hold_active = news_hold_until is not None and now_utc < news_hold_until
-        global_hold = (
-            (sentiment is not None and sentiment < BUY_SENTIMENT_THRESHOLD)
-            or news_hold_active
-        )
-        
-        # Sentiment label — mismo criterio que el Mega Dashboard (umbral de estrategia),
-        # no bandas fijas 0.45/0.60 (0.40 quedaba "riesgo alto" siendo válido para BUY).
-        if sentiment is None:
-            sentiment_label = "Sin datos"
-            sentiment_detail = "Esperando lectura IA"
-        elif news_hold_active:
-            sentiment_label = "⛔ Filtro noticias"
-            sentiment_detail = "Pausa por volatilidad de titulares / swing"
-        elif sentiment < BUY_SENTIMENT_THRESHOLD:
-            sentiment_label = "🔴 Bajo umbral de estrategia"
-            sentiment_detail = f"Mínimo sentimiento para señales: {BUY_SENTIMENT_THRESHOLD:.2f}"
-        elif sentiment >= 0.55:
-            sentiment_label = "🟢 Sesgo positivo"
-            sentiment_detail = "Alineado con umbral de compra"
-        elif sentiment >= 0.35:
-            sentiment_label = "🟡 Neutral"
-            sentiment_detail = "Operativo si ML y riesgo lo permiten"
-        else:
-            sentiment_label = "🟠 Lectura débil"
-            sentiment_detail = "Por encima del mínimo; prudencia en nuevas entradas"
+        global_hold = False
+        sentiment_label = "INJ/USDT ML-only"
+        sentiment_detail = "Sin Gemini / noticias — solo XGB ≥ 70%"
 
         # Wallet
         mt5_wallet = state.get("mt5_wallet")
@@ -895,13 +869,11 @@ async def start_web_dashboard(
                 )
                 action = "Comprar" if can_buy else "Esperar"
                 if global_hold:
-                    entry_hint = "Pausa global (sentimiento / filtro noticias) — no se abren entradas."
+                    entry_hint = "Pausa global — no se abren entradas."
                 elif prob >= BUY_PROB_THRESHOLD and strategy_signal != "BUY":
-                    entry_hint = (
-                        "Prob. ≥ umbral; señal final HOLD (ADX/HTF/funding u otros filtros)."
-                    )
+                    entry_hint = "Prob. ≥ umbral pero símbolo no operable o modelo en HOLD."
                 elif prob < BUY_PROB_THRESHOLD:
-                    entry_hint = "Prob. modelo por debajo del umbral de compra."
+                    entry_hint = "Prob. modelo por debajo del umbral de compra (70%)."
                 else:
                     entry_hint = ""
 
@@ -952,10 +924,6 @@ async def start_web_dashboard(
             ceo = _fallback_ceo_payload(report_tz)
         resp = {
             "uptime": uptime_str,
-            "sentiment": f"{sentiment:.4f}" if sentiment is not None else "--",
-            "sentiment_label": sentiment_label,
-            "sentiment_detail": sentiment_detail,
-            "sentiment_num": sentiment if sentiment is not None else 0,
             "global_hold": global_hold,
             "balance": f"{balance:,.2f}",
             "available_margin": f"{avail:,.2f}",
@@ -998,6 +966,10 @@ async def start_web_dashboard(
         logger.info("🌐 Web dashboard server listening on http://%s:%d", host, port)
         await site.start()
         while True:
+            await asyncio.sleep(3600)
+    finally:
+        await runner.cleanup()
+rue:
             await asyncio.sleep(3600)
     finally:
         await runner.cleanup()

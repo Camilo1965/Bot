@@ -17,7 +17,7 @@ from bot.dashboard_helpers import compute_rsi, display_timezone, mt5_dashboard_m
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
 from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE
 from risk.risk_manager import RiskManager
-from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD
+from strategy.ml_predictor import BUY_PROB_THRESHOLD
 
 
 def _bar(value: float, max_val: float, width: int = 12, color: str = "cyan") -> str:
@@ -55,13 +55,8 @@ def generate_dashboard(
     now_str = (
         f"{now_utc.astimezone(_tz).strftime('%Y-%m-%d %H:%M:%S')} ({tz_name})"
     )
-    sentiment: float | None = state.get("sentiment")
     ml_probs: dict[str, float] = state.get("ml_probs", {})
-    news_hold_until: datetime | None = state.get("news_hold_until")
-    global_hold = (
-        (sentiment is not None and sentiment < BUY_SENTIMENT_THRESHOLD)
-        or (news_hold_until is not None and now_utc < news_hold_until)
-    )
+    global_hold = False
 
     # ── Header Panel ──────────────────────────────────────────────────────────
     if dash_state.bot_start_time is not None:
@@ -73,10 +68,6 @@ def generate_dashboard(
     latency_ms: float = state.get("api_latency_ms", 0.0)
     lat_color = "bright_green" if latency_ms < 100 else "yellow" if latency_ms < 500 else "bright_red"
     lat_str = f"{latency_ms:.0f}ms" if latency_ms > 0 else "—"
-
-    sentiment_val = sentiment if sentiment is not None else 0.0
-    sentiment_str = f"{sentiment_val:.4f}" if sentiment is not None else "—"
-    s_color = "bright_green" if sentiment_val >= 0.55 else "yellow" if sentiment_val >= 0.35 else "bright_red"
 
     broker_positions_any: list[dict[str, Any]] = []
     broker_open_symbols: set[str] = set()
@@ -126,13 +117,13 @@ def generate_dashboard(
     col1.append(lat_str, style=f"bold {lat_color}")
 
     col2 = Text()
-    col2.append("🔮 Sentimiento: ", style="dim")
-    col2.append(sentiment_str, style=f"bold {s_color}")
-    col2.append("\n")
-    col2.append("🧠 Modelo: ", style="dim")
-    col2.append("XGBoost + Gemini\n", style="bold magenta")
+    col2.append("🧠 Modelo Central: ", style="dim")
+    col2.append("XGBoost INJ/USDT\n", style="bold magenta")
     col2.append("📡 Estado: ", style="dim")
     col2.append_text(Text.from_markup(status_icon))
+    col2.append("\n")
+    col2.append("🎯 Umbral: ", style="dim")
+    col2.append(f"{BUY_PROB_THRESHOLD*100:.0f}% Prob.", style="bold white")
 
     col3 = Text()
     pnl_s, pnl_c = _pnl_str(total_pnl)
@@ -218,13 +209,15 @@ def generate_dashboard(
         # ML confidence with bar
         prob = ml_probs.get(sym, 0.0)
         prob_pct = prob * 100
-        if prob_pct >= 62:
+        th_pct = BUY_PROB_THRESHOLD * 100
+        if prob_pct >= th_pct:
             ml_color = "bright_green"
-        elif prob_pct >= 50:
+        elif prob_pct >= th_pct - 10:
             ml_color = "yellow"
         else:
             ml_color = "dim"
-        ml_str = f"[{ml_color}]{prob_pct:.0f}%[/{ml_color}] {_bar(prob_pct, 100, 8, 'green' if prob_pct >= 62 else 'yellow' if prob_pct >= 50 else 'white')}"
+        bar_c = "green" if prob_pct >= th_pct else "yellow" if prob_pct >= th_pct - 10 else "white"
+        ml_str = f"[{ml_color}]{prob_pct:.0f}%[/{ml_color}] {_bar(prob_pct, 100, 8, bar_c)}"
 
         # HTF trend tags (15m/1h/4h): B=bullish, S=bearish, N=neutral.
         htf = state.get("htf_trend", {}).get(sym, {})
