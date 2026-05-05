@@ -55,6 +55,7 @@ Usage example::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -154,6 +155,37 @@ SYMBOL_MAP: dict[str, str] = {
     "DOGEUSD":     "DOGEUSD-T",
     "PEPEUSD":     "PEPEUSD-T",
 }
+
+
+def _apply_mt5_symbol_env_overrides() -> None:
+    """Merge ``MT5_SYMBOL_OVERRIDES`` JSON object into :data:`SYMBOL_MAP`.
+
+    Example::
+
+        MT5_SYMBOL_OVERRIDES={"SOL/USDT":"SOLUSDT","SOLUSD":"SOLUSDT"}
+
+    Use exact names from *Market Watch* in MT5 if defaults (e.g. ``SOLUSD-T``)
+    do not exist on your broker.
+    """
+    raw = os.environ.get("MT5_SYMBOL_OVERRIDES", "").strip()
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("MT5_SYMBOL_OVERRIDES is not valid JSON — ignoring.")
+        return
+    if not isinstance(data, dict):
+        logger.warning("MT5_SYMBOL_OVERRIDES must be a JSON object — ignoring.")
+        return
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, str) and v.strip():
+            vv = v.strip()
+            SYMBOL_MAP[k] = vv
+            logger.info("MT5 symbol override: %s → %s", k, vv)
+
+
+_apply_mt5_symbol_env_overrides()
 
 # ── MT5 return-code catalogue ─────────────────────────────────────────────────
 # Human-readable descriptions for every known MT5 trade retcode.  Used by

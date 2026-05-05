@@ -303,6 +303,7 @@ class DatabaseManager:
 
     def __init__(self) -> None:
         self._pool: asyncpg.Pool | None = None
+        self._closing: bool = False
         # Background batching for market data
         self._market_tick_buffer: list[tuple] = []
         self._batch_size_threshold: int = 100
@@ -316,6 +317,7 @@ class DatabaseManager:
 
     async def connect(self) -> None:
         """Open the connection pool and initialise the schema."""
+        self._closing = False
         dsn = self._build_dsn()
         logger.info("Connecting to TimescaleDB at %s", self._redacted_dsn())
         raw_to = os.environ.get("DB_COMMAND_TIMEOUT_S", "90").strip()
@@ -339,6 +341,7 @@ class DatabaseManager:
 
     async def close(self) -> None:
         """Close the connection pool gracefully."""
+        self._closing = True
         if self._batcher_task:
             self._batcher_task.cancel()
             try:
@@ -507,21 +510,40 @@ class DatabaseManager:
         exit_reason: Exit reason code (e.g. SL_BASE, TRAILING_STOP, SMART_EXIT_ML).
         """
         if self._pool is None:
+            if self._closing:
+                logger.debug(
+                    "close_trade skipped (database shutting down) trade_id=%s",
+                    trade_id,
+                )
+                return
             raise RuntimeError("DatabaseManager is not connected. Call connect() first.")
+        if self._closing:
+            logger.debug("close_trade skipped (database shutting down) trade_id=%s", trade_id)
+            return
         ts = exit_time or datetime.now(tz=timezone.utc)
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                _CLOSE_TRADE,
-                trade_id,
-                exit_price,
-                ts,
-                pnl,
-                pnl if pnl_net is None else pnl_net,
-                commission,
-                swap,
-                fee,
-                exit_reason,
-            )
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    _CLOSE_TRADE,
+                    trade_id,
+                    exit_price,
+                    ts,
+                    pnl,
+                    pnl if pnl_net is None else pnl_net,
+                    commission,
+                    swap,
+                    fee,
+                    exit_reason,
+                )
+        except asyncpg.InterfaceError as exc:
+            if self._closing or "closing" in str(exc).lower():
+                logger.debug(
+                    "close_trade skipped (pool closed) trade_id=%s — %s",
+                    trade_id,
+                    exc,
+                )
+                return
+            raise
 
     async def upsert_htf_trend(
         self,
