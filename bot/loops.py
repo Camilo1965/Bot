@@ -15,7 +15,7 @@ from rich.live import Live
 
 from bot.constants import DEBUG_LOG_HINT
 from bot.dashboard import generate_dashboard
-from bot.dashboard_helpers import mt5_dashboard_mark
+from bot.dashboard_helpers import display_timezone, mt5_dashboard_mark
 from database.db_manager import db
 from execution.mt5_executor import MT5Executor, fetch_mt5_wallet_snapshot
 from execution.paper_executor import PaperExecutor
@@ -99,7 +99,8 @@ async def dashboard_logger(
         )
 
         # ── Audit telemetry: per-position risk data → audit.log only ─────────
-        hora = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
+        _tz_log, _ = display_timezone()
+        hora = datetime.now(tz=_tz_log).strftime("%H:%M:%S")
         for sym, pos in paper_executor.open_positions.items():
             prices_buf = state["prices"].get(sym, [])
             if not prices_buf:

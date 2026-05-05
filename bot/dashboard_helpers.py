@@ -4,6 +4,24 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from zoneinfo import ZoneInfo
+
+
+def display_timezone() -> tuple[ZoneInfo, str]:
+    """Clock/report timezone (IANA). Defaults to Colombia (UTC−5, no DST).
+
+    ``DASHBOARD_TIMEZONE`` overrides ``REPORT_TIMEZONE`` when set.
+    """
+    raw = (
+        os.environ.get("DASHBOARD_TIMEZONE")
+        or os.environ.get("REPORT_TIMEZONE")
+        or "America/Bogota"
+    ).strip()
+    name = raw or "America/Bogota"
+    try:
+        return ZoneInfo(name), name
+    except Exception:
+        return ZoneInfo("America/Bogota"), "America/Bogota"
 
 
 def mt5_dashboard_mark(

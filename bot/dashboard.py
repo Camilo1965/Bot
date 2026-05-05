@@ -13,7 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from bot import state as dash_state
-from bot.dashboard_helpers import compute_rsi, mt5_dashboard_mark
+from bot.dashboard_helpers import compute_rsi, display_timezone, mt5_dashboard_mark
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
 from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE
 from risk.risk_manager import RiskManager
@@ -51,7 +51,10 @@ def generate_dashboard(
 ) -> Group:
     """Build and return a Rich mega-dashboard."""
     now_utc = datetime.now(tz=timezone.utc)
-    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    _tz, tz_name = display_timezone()
+    now_str = (
+        f"{now_utc.astimezone(_tz).strftime('%Y-%m-%d %H:%M:%S')} ({tz_name})"
+    )
     sentiment: float | None = state.get("sentiment")
     ml_probs: dict[str, float] = state.get("ml_probs", {})
     news_hold_until: datetime | None = state.get("news_hold_until")

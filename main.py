@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -47,6 +48,7 @@ from rich.live import Live
 from rich.logging import RichHandler
 
 from bot import state as dash_state
+from bot.dashboard_helpers import display_timezone
 from bot.constants import (
     NEWS_FILTER_HOLD_MINUTES as _NEWS_FILTER_HOLD_MINUTES,
 )
@@ -195,6 +197,8 @@ class _ConsoleFormatter(logging.Formatter):
     * WARNING  → yellow
     * ERROR / CRITICAL → bold red
     * INFO / DEBUG → default terminal colour
+
+    Timestamps use ``REPORT_TIMEZONE`` / ``DASHBOARD_TIMEZONE`` (default Bogota).
     """
 
     _LEVEL_COLORS: dict[int, str] = {
@@ -205,9 +209,17 @@ class _ConsoleFormatter(logging.Formatter):
         logging.CRITICAL: _RED + _BOLD,
     }
 
+    def __init__(self, display_tz: ZoneInfo | None = None) -> None:
+        super().__init__()
+        self._tz = display_tz if display_tz is not None else ZoneInfo("America/Bogota")
+
     def format(self, record: logging.LogRecord) -> str:
         color = self._LEVEL_COLORS.get(record.levelno, _RESET)
-        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
+        ts = (
+            datetime.fromtimestamp(record.created, tz=timezone.utc)
+            .astimezone(self._tz)
+            .strftime("%H:%M:%S")
+        )
         msg = record.getMessage()
         if record.exc_info:
             msg += "\n" + self.formatException(record.exc_info)
@@ -221,6 +233,10 @@ class _DashboardEventHandler(logging.Handler):
     the mega-dashboard can display
     the last few operational events without interfering with other handlers.
     """
+
+    def __init__(self, display_tz: ZoneInfo | None = None) -> None:
+        super().__init__()
+        self._tz = display_tz if display_tz is not None else ZoneInfo("America/Bogota")
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -236,7 +252,11 @@ class _DashboardEventHandler(logging.Handler):
             if record.name == "aiohttp.access" or "GET /api/state" in msg:
                 return
 
-            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
+            ts = (
+                datetime.fromtimestamp(record.created, tz=timezone.utc)
+                .astimezone(self._tz)
+                .strftime("%H:%M:%S")
+            )
             if len(msg) > 78:
                 msg = msg[:75] + "..."
             level_markup = {
@@ -302,11 +322,12 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     # ── Console handler: filtered INFO + WARNING/ERROR ────────────────────────
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(_ConsoleFormatter())
+    _tz_disp, _ = display_timezone()
+    console_handler.setFormatter(_ConsoleFormatter(_tz_disp))
     root.addHandler(console_handler)
 
     # ── Dashboard event handler: capture INFO+ events for TUI panel ───────────
-    dashboard_event_handler = _DashboardEventHandler()
+    dashboard_event_handler = _DashboardEventHandler(_tz_disp)
     dashboard_event_handler.setLevel(logging.INFO)
     root.addHandler(dashboard_event_handler)
 
