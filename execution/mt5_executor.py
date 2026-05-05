@@ -2072,6 +2072,57 @@ class MT5Executor(PaperExecutor):
         self,
         symbol: str,
         exit_price: float,
+        arg3: Any = None,
+        arg4: Any = None,
+        arg5: str = "",
+    ) -> Any:
+        """Dispatch broker close + bookkeeping.
+
+        * **PaperExecutor API** — ``(symbol, exit_price, reason: str)`` from
+          :meth:`~execution.paper_executor.PaperExecutor.check_and_close` and
+          :meth:`~execution.paper_executor.PaperExecutor.check_ml_exit`.
+        * **Internal API** — ``(symbol, exit_price, exit_time, pnl, exit_reason_code)``.
+        """
+        if isinstance(arg3, str) and arg4 is None:
+            exit_time = datetime.now(tz=timezone.utc)
+            pos = self.open_positions.get(symbol)
+            if pos is None:
+                logger.warning(
+                    "_close_position (paper API): no open position for %s — skipping.",
+                    symbol,
+                )
+                return None
+            gross_est = (
+                (exit_price - float(pos.entry_price))
+                / float(pos.entry_price)
+                * float(pos.position_size)
+            )
+            ok = await self._close_position_live(
+                symbol, exit_price, exit_time, gross_est, arg3
+            )
+            return gross_est if ok else None
+
+        if isinstance(arg3, datetime):
+            return await self._close_position_live(
+                symbol,
+                exit_price,
+                arg3,
+                float(arg4 or 0.0),
+                arg5,
+            )
+
+        logger.error(
+            "_close_position: invalid signature for %s (arg3=%r arg4=%r).",
+            symbol,
+            arg3,
+            arg4,
+        )
+        return False
+
+    async def _close_position_live(
+        self,
+        symbol: str,
+        exit_price: float,
         exit_time: datetime,
         pnl: float,
         exit_reason_code: str = "",

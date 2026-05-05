@@ -408,6 +408,8 @@ async def main() -> None:
     market_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     shared_state: dict[str, Any] = {
         "prices": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
+        # Homogeneous closes for dashboard RSI (single TF; see DASHBOARD_RSI_TF, default 15m).
+        "dashboard_rsi_closes": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
         # [ELITE] OHLCV buffers for ADX / ATR computation
         "highs": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         "lows": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},

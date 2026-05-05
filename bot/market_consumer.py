@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from bot.dashboard_helpers import dashboard_rsi_timeframe
 from database.db_manager import db
 from execution.paper_executor import PaperExecutor
 
@@ -48,6 +49,16 @@ async def market_consumer(
         # Update last price in state
         state["prices"][sym].append(price)
         state["last_market_message_at"] = datetime.now(tz=timezone.utc)
+
+        _rsi_tf = dashboard_rsi_timeframe()
+        if (
+            mtype == "kline"
+            and msg.get("timeframe") == _rsi_tf
+            and float(msg.get("close") or 0.0) > 0.0
+        ):
+            rsi_buf = state.get("dashboard_rsi_closes", {}).get(sym)
+            if rsi_buf is not None:
+                rsi_buf.append(float(msg["close"]))
 
         # [MT5] Last quote update for dashboard/PnL
         if "bid" in msg and "ask" in msg:

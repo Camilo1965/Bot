@@ -24,6 +24,28 @@ def display_timezone() -> tuple[ZoneInfo, str]:
         return ZoneInfo("America/Bogota"), "America/Bogota"
 
 
+def dashboard_rsi_label() -> str:
+    """Human label for RSI row (e.g. RSI 14 · 15m)."""
+    tf = dashboard_rsi_timeframe()
+    return f"RSI (14, velas {tf})"
+
+
+def dashboard_rsi_timeframe() -> str:
+    """Kline timeframe label used for dashboard RSI only (single homogeneous series)."""
+    raw = os.environ.get("DASHBOARD_RSI_TF", "15m").strip().lower()
+    return raw or "15m"
+
+
+def pct_change_24h_vs_h1(h1_closes: list[float], mark_price: float) -> float | None:
+    """Approximate 24h % vs H1 close ~24 bars ago (needs ≥24 hourly closes)."""
+    if len(h1_closes) < 24 or mark_price <= 0:
+        return None
+    ref = h1_closes[-24]
+    if ref <= 0:
+        return None
+    return (mark_price - ref) / ref * 100.0
+
+
 def mt5_dashboard_mark(
     state: dict[str, Any], sym: str, candle_close: float | None
 ) -> float | None:

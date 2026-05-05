@@ -13,7 +13,12 @@ from rich.table import Table
 from rich.text import Text
 
 from bot import state as dash_state
-from bot.dashboard_helpers import compute_rsi, display_timezone, mt5_dashboard_mark
+from bot.dashboard_helpers import (
+    compute_rsi,
+    display_timezone,
+    mt5_dashboard_mark,
+    pct_change_24h_vs_h1,
+)
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
 from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE
 from risk.risk_manager import RiskManager
@@ -118,7 +123,8 @@ def generate_dashboard(
 
     col2 = Text()
     col2.append("🧠 Modelo Central: ", style="dim")
-    col2.append("XGBoost INJ/USDT\n", style="bold magenta")
+    _wl0 = watchlist[0] if watchlist else "—"
+    col2.append(f"XGBoost {_wl0}\n", style="bold magenta")
     col2.append("📡 Estado: ", style="dim")
     col2.append_text(Text.from_markup(status_icon))
     col2.append("\n")
@@ -183,22 +189,23 @@ def generate_dashboard(
         price: float | None = mt5_dashboard_mark(state, sym, candle_last)
         price_str = f"{price:,.2f}" if price is not None else "[dim]N/A[/dim]"
 
-        # 24h % change
+        # ~24h % vs H1 close ~24 bars ago (same basis as web dashboard).
         change_str = "[dim]—[/dim]"
-        if price is not None and len(prices) >= 96:
-            price_24h = prices[-96]
-            if price_24h > 0:
-                pct = (price - price_24h) / price_24h * 100
-                ch_color = "bright_green" if pct >= 0 else "bright_red"
-                sign = "+" if pct >= 0 else ""
-                change_str = f"[{ch_color}]{sign}{pct:.1f}%[/{ch_color}]"
+        h1_hist = list(state.get("htf_closes", {}).get(sym, {}).get("1h", []) or [])
+        if price is not None:
+            pct24 = pct_change_24h_vs_h1(h1_hist, float(price))
+            if pct24 is not None:
+                ch_color = "bright_green" if pct24 >= 0 else "bright_red"
+                sign = "+" if pct24 >= 0 else ""
+                change_str = f"[{ch_color}]{sign}{pct24:.1f}% (≈24h)[/{ch_color}]"
 
         # ATR
         atr_val: float | None = state.get("atrs", {}).get(sym)
         atr_str = f"{atr_val:.1f}" if atr_val is not None else "[dim]—[/dim]"
 
+        rsi_series = list(state.get("dashboard_rsi_closes", {}).get(sym, []) or [])
         # RSI with bar
-        rsi_val = compute_rsi(prices) if len(prices) >= 15 else None
+        rsi_val = compute_rsi(rsi_series) if len(rsi_series) >= 15 else None
         if rsi_val is not None:
             rsi_color = "bright_red" if rsi_val >= 70 else "bright_green" if rsi_val <= 30 else "white"
             rsi_bar_color = "red" if rsi_val >= 70 else "green" if rsi_val <= 30 else "cyan"

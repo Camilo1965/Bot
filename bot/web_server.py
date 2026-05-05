@@ -9,7 +9,13 @@ from aiohttp import web
 
 from bot import state as dash_state
 from bot.constants import DEBUG_LOG_HINT
-from bot.dashboard_helpers import compute_rsi, mt5_dashboard_mark
+from bot.dashboard_helpers import (
+    compute_rsi,
+    dashboard_rsi_label,
+    dashboard_rsi_timeframe,
+    mt5_dashboard_mark,
+    pct_change_24h_vs_h1,
+)
 from database.db_manager import db
 from execution.mt5_executor import MT5Executor
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
@@ -143,7 +149,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </style>
 </head>
 <body class="p-4 md:p-8">
-    <div class="max-w-5xl mx-auto space-y-6">
+    <div class="max-w-7xl mx-auto space-y-6">
         
         <!-- Header & System Health -->
         <header class="glass rounded-3xl p-6 flex flex-col md:flex-row justify-between items-start md:items-center">
@@ -161,8 +167,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="mt-6 md:mt-0 flex gap-3 w-full md:w-auto">
                 <div class="bg-black/20 p-4 rounded-2xl border border-white/5 flex-1 md:w-48">
                     <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-1">Estrategia</div>
-                    <div class="text-lg font-bold text-sky-300" id="sentiment">INJ/USDT</div>
-                    <div class="text-xs text-slate-400 mt-1" id="sentiment-detail">Solo modelo XGB · umbral 70%</div>
+                    <div class="text-lg font-bold text-sky-300" id="sentiment">—</div>
+                    <div class="text-xs text-slate-400 mt-1 leading-snug" id="sentiment-detail">—</div>
                 </div>
                 <div class="bg-black/20 p-4 rounded-2xl border border-white/5 flex-1 md:w-40">
                     <div class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold mb-1">Estado Bot</div>
@@ -270,7 +276,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <h2 class="text-lg font-medium text-slate-300 tracking-wide">MERCADO EN VIVO</h2>
         </div>
         
-        <div class="grid grid-cols-1 md:grid-cols-1 gap-6 max-w-xl mx-auto" id="market-cards">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 w-full" id="market-cards">
             <!-- JS Renders Here -->
         </div>
 
@@ -358,9 +364,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('uptime').innerText = data.uptime;
             
             const sentEl = document.getElementById('sentiment');
-            sentEl.innerText = 'INJ/USDT';
+            const pair = data.primary_pair || (Array.isArray(data.watchlist) && data.watchlist[0]) || '—';
+            sentEl.innerText = pair.replace('/', ' / ');
             sentEl.className = 'text-lg font-bold text-sky-300';
-            document.getElementById('sentiment-detail').innerText = 'Solo modelo XGB · umbral 70%';
+            document.getElementById('sentiment-detail').innerText = data.strategy_blurb || '';
 
             const botStatusEl = document.getElementById('bot-status');
             if (data.global_hold) {
@@ -376,13 +383,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             updateValue('s-losses', data.session_losses || 0);
             updateValue('s-winrate', data.session_winrate || '--%');
 
+            const th = Number.isFinite(data.buy_prob_threshold_pct) ? data.buy_prob_threshold_pct : 70;
             const sentEl2 = document.getElementById('sent-num');
             if (sentEl2) {
-                sentEl2.innerText = '70%';
+                sentEl2.innerText = th + '%';
                 sentEl2.className = 'text-2xl font-bold text-slate-200';
             }
             const sentBar = document.getElementById('sent-bar');
-            if (sentBar) sentBar.style.width = '70%';
+            if (sentBar) sentBar.style.width = Math.min(100, Math.max(0, th)) + '%';
+
+            const latEl = document.getElementById('api-latency');
+            if (latEl) {
+                const ms = Number(data.api_latency_ms || 0);
+                latEl.innerText = ms > 0 ? (Math.round(ms) + ' ms') : '—';
+            }
 
             updateValue('balance', data.balance);
             updateValue('margin', data.available_margin);
@@ -442,6 +456,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const marketContainer = document.getElementById('market-cards');
             let cardsHtml = '';
             
+            const buyTh = Number.isFinite(data.buy_prob_threshold_pct) ? data.buy_prob_threshold_pct : 70;
             data.market.forEach(item => {
                 let actionBadge = '';
                 if (item.action.includes('Gestionando')) {
@@ -454,23 +469,34 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 let priceClass = item.has_position ? 'text-white' : 'text-slate-200';
                 
-                let mlColor = item.ml_conf.replace('%','') >= 70 ? 'bg-emerald-400' : 'bg-sky-400';
-                let rsiNum = parseFloat(item.rsi);
-                let rsiColor = rsiNum > 70 ? 'bg-red-400' : (rsiNum < 30 ? 'bg-emerald-400' : 'bg-slate-400');
+                const mlPct = Math.min(100, Math.max(0, parseFloat(String(item.ml_conf).replace(/[%\\s]/g, '')) || 0));
+                let mlColor = mlPct >= buyTh ? 'bg-emerald-400' : 'bg-sky-400';
+                const rsiRaw = item.rsi;
+                const rsiNum = (rsiRaw === '--' || rsiRaw === undefined) ? NaN : parseFloat(rsiRaw);
+                let rsiColor = (!Number.isFinite(rsiNum)) ? 'bg-slate-600' : (rsiNum > 70 ? 'bg-red-400' : (rsiNum < 30 ? 'bg-emerald-400' : 'bg-slate-400'));
+                const rsiBarW = Number.isFinite(rsiNum) ? Math.min(100, Math.max(0, rsiNum)) : 0;
+                const symTitle = item.symbol_pair ? String(item.symbol_pair).replace('/', ' / ') : item.symbol;
+                const chOk = item.change_ok === true;
+                const chClass = !chOk ? 'text-slate-500' : (item.change_num >= 0 ? 'text-emerald-400' : 'text-red-400');
+                const chGlyph = !chOk ? '•' : (item.change_num >= 0 ? '↗' : '↘');
+                const rsiLbl = item.rsi_label || 'RSI (14)';
                 
                 cardsHtml += `
                     <div class="glass-card rounded-3xl p-6 transition-all relative overflow-hidden" style="border-color: ${item.has_position ? 'rgba(14,165,233,0.3)' : ''}">
                         ${item.has_position ? '<div class="absolute top-0 left-0 w-full h-1 bg-sky-500 shadow-[0_0_10px_rgba(14,165,233,0.8)]"></div>' : ''}
                         
-                        <div class="flex justify-between items-start mb-4">
-                            <h3 class="text-xl font-bold tracking-tight text-white">${item.symbol}</h3>
+                        <div class="flex justify-between items-start mb-4 gap-2">
+                            <div>
+                                <h3 class="text-xl font-bold tracking-tight text-white">${symTitle}</h3>
+                                <div class="text-[10px] text-slate-500 mt-0.5 font-mono">${item.symbol}</div>
+                            </div>
                             ${actionBadge}
                         </div>
                         
                         <div class="mb-6">
                             <div class="text-3xl font-light tracking-tight ${priceClass} font-mono">${item.price}</div>
-                            <div class="text-sm font-medium mt-1 ${item.change_num >= 0 ? 'text-emerald-400' : 'text-red-400'}">
-                                ${item.change_num >= 0 ? '↗' : '↘'} ${item.change} <span class="text-slate-500 font-normal text-xs ml-1">24h</span>
+                            <div class="text-sm font-medium mt-1 ${chClass}">
+                                ${chGlyph} ${item.change} <span class="text-slate-500 font-normal text-xs ml-1">${chOk ? '≈24h (vs H1)' : 'sin datos H1'}</span>
                             </div>
                         </div>
                         
@@ -481,17 +507,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                                     <span class="text-white font-medium">${item.ml_conf}</span>
                                 </div>
                                 <div class="progress-bar-bg">
-                                    <div class="progress-bar-fill ${mlColor}" style="width: ${item.ml_conf}"></div>
+                                    <div class="progress-bar-fill ${mlColor}" style="width: ${mlPct}%"></div>
                                 </div>
                             </div>
                             
                             <div>
                                 <div class="flex justify-between text-xs mb-1.5">
-                                    <span class="text-slate-400">RSI (Fuerza)</span>
+                                    <span class="text-slate-400">${rsiLbl}</span>
                                     <span class="text-white font-medium">${item.rsi}</span>
                                 </div>
                                 <div class="progress-bar-bg">
-                                    <div class="progress-bar-fill ${rsiColor}" style="width: ${rsiNum}%"></div>
+                                    <div class="progress-bar-fill ${rsiColor}" style="width: ${rsiBarW}%"></div>
                                 </div>
                             </div>
                             
@@ -778,14 +804,11 @@ async def start_web_dashboard(
             if price is None:
                 continue
 
-            # 24h change
-            pct = 0.0
-            if len(prices) >= 96:
-                p24 = prices[-96]
-                if p24 > 0:
-                    pct = (price - p24) / p24 * 100
-                    
-            rsi = compute_rsi(prices) if len(prices) >= 15 else None
+            h1_hist = list(state.get("htf_closes", {}).get(sym, {}).get("1h", []) or [])
+            pct = pct_change_24h_vs_h1(h1_hist, float(price))
+
+            rsi_series = list(state.get("dashboard_rsi_closes", {}).get(sym, []) or [])
+            rsi = compute_rsi(rsi_series) if len(rsi_series) >= 15 else None
             prob = ml_probs.get(sym, 0.0)
             t15 = htf_trend.get(sym, {}).get("15m", "neutral")
             t1h = htf_trend.get(sym, {}).get("1h", "neutral")
@@ -873,16 +896,27 @@ async def start_web_dashboard(
                 elif prob >= BUY_PROB_THRESHOLD and strategy_signal != "BUY":
                     entry_hint = "Prob. ≥ umbral pero símbolo no operable o modelo en HOLD."
                 elif prob < BUY_PROB_THRESHOLD:
-                    entry_hint = "Prob. modelo por debajo del umbral de compra (70%)."
+                    entry_hint = (
+                        f"Prob. modelo por debajo del umbral de compra "
+                        f"({int(BUY_PROB_THRESHOLD * 100)}%)."
+                    )
                 else:
                     entry_hint = ""
 
             market_data.append({
                 "symbol": sym.split("/")[0],
+                "symbol_pair": sym,
                 "price": f"{price:,.2f}",
-                "change": f"{'+' if pct >=0 else ''}{pct:.1f}%",
-                "change_num": pct,
+                "change": (
+                    f"{'+' if pct >= 0 else ''}{pct:.1f}%"
+                    if pct is not None
+                    else "—"
+                ),
+                "change_num": float(pct) if pct is not None else 0.0,
+                "change_ok": pct is not None,
                 "rsi": f"{rsi:.1f}" if rsi is not None else "--",
+                "rsi_num": rsi,
+                "rsi_label": dashboard_rsi_label(),
                 "ml_conf": f"{prob*100:.0f}%",
                 "trend": _htf_trend_letters(t15, t1h, t4h),
                 "trend_detail": {"15m": t15, "1h": t1h, "4h": t4h},
@@ -922,9 +956,20 @@ async def start_web_dashboard(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Web CEO snapshot failed unexpectedly: %s", exc)
             ceo = _fallback_ceo_payload(report_tz)
+        _th_pct = int(BUY_PROB_THRESHOLD * 100)
+        _pair = watchlist[0] if watchlist else ""
         resp = {
             "uptime": uptime_str,
             "global_hold": global_hold,
+            "api_latency_ms": float(state.get("api_latency_ms", 0.0)),
+            "watchlist": list(watchlist),
+            "primary_pair": _pair,
+            "buy_prob_threshold": BUY_PROB_THRESHOLD,
+            "buy_prob_threshold_pct": _th_pct,
+            "strategy_blurb": (
+                f"Modelo XGB · umbral {_th_pct}% · RSI en velas {dashboard_rsi_timeframe()}"
+            ),
+            "dashboard_rsi_tf": dashboard_rsi_timeframe(),
             "balance": f"{balance:,.2f}",
             "available_margin": f"{avail:,.2f}",
             "session_pnl": f"{paper_executor.total_pnl:+.2f}",

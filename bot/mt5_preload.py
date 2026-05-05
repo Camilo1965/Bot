@@ -5,7 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from bot.dashboard_helpers import dashboard_rsi_timeframe
 from execution.mt5_executor import TIMEFRAME_H1, TIMEFRAME_H4, TIMEFRAME_M15, MT5Executor
+
+_RSI_TF_TO_MT5 = {"15m": TIMEFRAME_M15, "1h": TIMEFRAME_H1, "4h": TIMEFRAME_H4}
 
 
 async def preload_historical_data_mt5(
@@ -40,6 +43,31 @@ async def preload_historical_data_mt5(
                 log.warning("[MT5] No 15m candles available for %s.", symbol)
         except Exception as exc:  # noqa: BLE001
             log.warning("[MT5] Could not preload 15m candles for %s: %s", symbol, exc)
+
+        rsi_tf_name = dashboard_rsi_timeframe()
+        rsi_mt5 = _RSI_TF_TO_MT5.get(rsi_tf_name, TIMEFRAME_M15)
+        try:
+            df_rsi = await executor.fetch_candles(
+                symbol=symbol,
+                timeframe=rsi_mt5,
+                count=limit,
+                start_pos=0,
+            )
+            rsi_d = state.get("dashboard_rsi_closes", {}).get(symbol)
+            if rsi_d is not None and df_rsi is not None and not df_rsi.empty:
+                rsi_d.clear()
+                for _, row in df_rsi.iterrows():
+                    c = row.get("close")
+                    if c is not None:
+                        rsi_d.append(float(c))
+                log.info(
+                    "[MT5] Preloaded %d %s closes for dashboard RSI (%s).",
+                    len(df_rsi),
+                    rsi_tf_name,
+                    symbol,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[MT5] Could not preload RSI series for %s: %s", symbol, exc)
 
         for tf_name, tf_value in (("1h", TIMEFRAME_H1), ("4h", TIMEFRAME_H4)):
             try:
