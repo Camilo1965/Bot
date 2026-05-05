@@ -55,6 +55,8 @@ import asyncio
 import csv
 import json
 import logging
+import os
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,6 +113,8 @@ _DEBUG_LOG_HINT = "(Revisa bot_debug.log para detalles técnicos)"
 _LOGS_DIR = Path(__file__).parent.parent / "logs"
 _JOURNAL_FILE = _LOGS_DIR / "trade_journal.csv"
 _STATE_FILE = Path(__file__).parent.parent / "state.json"
+_JOURNAL_LOCK = threading.Lock()
+_JOURNAL_RECENT_KEYS: set[str] = set()
 
 # CSV column names for the trade journal.
 _JOURNAL_COLUMNS = [
@@ -172,6 +176,7 @@ def record_trade(
     exit_reason: str = "",
     pnl_usdt: float | None = None,
     pnl_percent: float | None = None,
+    idempotency_key: str | None = None,
 ) -> None:
     """Append a BUY or SELL event to the trade journal CSV.
 
@@ -206,23 +211,41 @@ def record_trade(
     """
     try:
         _LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        write_header = not _JOURNAL_FILE.exists()
-        with _JOURNAL_FILE.open("a", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=_JOURNAL_COLUMNS)
-            if write_header:
-                writer.writeheader()
-            writer.writerow({
-                "timestamp": timestamp.isoformat(),
-                "symbol": symbol,
-                "action": action,
-                "execution_price": f"{execution_price:.8g}",
-                "quantity": f"{quantity:.8g}",
-                "ml_confidence_at_entry": f"{ml_confidence_at_entry:.6f}",
-                "sentiment_score_at_entry": f"{sentiment_score_at_entry:.6f}",
-                "exit_reason": exit_reason,
-                "pnl_usdt": f"{pnl_usdt:.6f}" if pnl_usdt is not None else "",
-                "pnl_percent": f"{pnl_percent:.4f}" if pnl_percent is not None else "",
-            })
+        safe_qty = max(0.0, float(quantity))
+        if action == "BUY" and safe_qty <= 0.0:
+            logger.warning("record_trade: skip BUY row with non-positive quantity for %s", symbol)
+            return
+        key = (
+            idempotency_key
+            if idempotency_key
+            else f"{action}:{symbol}:{timestamp.isoformat()}:{execution_price:.8g}:{safe_qty:.8g}"
+        )
+        with _JOURNAL_LOCK:
+            if key in _JOURNAL_RECENT_KEYS:
+                logger.warning("record_trade: deduplicated key=%s", key)
+                return
+            write_header = not _JOURNAL_FILE.exists()
+            with _JOURNAL_FILE.open("a", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=_JOURNAL_COLUMNS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({
+                    "timestamp": timestamp.isoformat(),
+                    "symbol": symbol,
+                    "action": action,
+                    "execution_price": f"{execution_price:.8g}",
+                    "quantity": f"{safe_qty:.8g}",
+                    "ml_confidence_at_entry": f"{ml_confidence_at_entry:.6f}",
+                    "sentiment_score_at_entry": f"{sentiment_score_at_entry:.6f}",
+                    "exit_reason": exit_reason,
+                    "pnl_usdt": f"{pnl_usdt:.6f}" if pnl_usdt is not None else "",
+                    "pnl_percent": f"{pnl_percent:.4f}" if pnl_percent is not None else "",
+                })
+                fh.flush()
+                os.fsync(fh.fileno())
+            _JOURNAL_RECENT_KEYS.add(key)
+            if len(_JOURNAL_RECENT_KEYS) > 4096:
+                _JOURNAL_RECENT_KEYS.clear()
     except Exception as exc:  # noqa: BLE001
         logger.warning("record_trade: could not write to journal CSV: %s", exc)
 
@@ -398,7 +421,12 @@ def compute_dynamic_tp_hint(pos: OpenPosition) -> float | None:
     the broker before the full trailing-stop activation threshold (~e.g. 2.5%).
     """
     if pos.peak_price <= pos.entry_price:
-        return None
+        # Keep a conservative broker TP even before a new peak is formed.
+        base = pos.entry_price
+        gap_pct = max(float(pos.trailing_distance_pct), 0.004)
+        gap_abs = float(pos.atr_trailing_distance) * 1.25 if pos.atr_trailing_distance > 0.0 else 0.0
+        gap = max(base * gap_pct, gap_abs, base * 0.006)
+        return float(base + gap)
     gap_pct = max(float(pos.trailing_distance_pct), 0.004)
     gap_abs = float(pos.atr_trailing_distance) * 1.25 if pos.atr_trailing_distance > 0.0 else 0.0
     gap = max(pos.peak_price * gap_pct, gap_abs, pos.peak_price * 0.006)
@@ -857,6 +885,7 @@ class PaperExecutor:
             quantity=position_size / entry_price,
             ml_confidence_at_entry=win_probability,
             sentiment_score_at_entry=sentiment_score,
+            idempotency_key=f"BUY:{sym}:trade_id:{trade_id}",
         )
         # ── Persist state so the position survives a restart ───────────────
         self._save_state()
@@ -1360,6 +1389,7 @@ class PaperExecutor:
             exit_reason=exit_reason_code,
             pnl_usdt=net_pnl,
             pnl_percent=pnl_pct,
+            idempotency_key=f"SELL:{symbol}:trade_id:{pos.trade_id}:{exit_reason_code}",
         )
         # ── Persist updated state (position removed) ───────────────────────
         self._save_state()

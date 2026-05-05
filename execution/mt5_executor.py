@@ -584,6 +584,45 @@ class MT5Executor(PaperExecutor):
         self._sl_widen_last_warn_mono: dict[str, float] = {}
         # 10016 on SLTP is often quote vs clamp edge — throttle; avoid ERROR every tick.
         self._sltp_10016_last_mono: dict[str, float] = {}
+        # Graceful-stop guard checked by sync/reconcile paths.
+        self._shutting_down: bool = False
+        # Ghost detection must be confirmed N times before closing local state.
+        self._ghost_missing_counts: dict[str, int] = {}
+        try:
+            self._ghost_min_confirmations = max(
+                1, int(os.environ.get("MT5_GHOST_MIN_CONFIRMATIONS", "3").strip() or "3")
+            )
+        except ValueError:
+            self._ghost_min_confirmations = 3
+
+    def begin_shutdown(self) -> None:
+        """Signal graceful shutdown to stop broker-sync side effects."""
+        self._shutting_down = True
+
+    def _mt5_terminal_connected(self) -> bool:
+        """Return True only when MT5 terminal is still alive/connected."""
+        if not _MT5_AVAILABLE:
+            return False
+        try:
+            tinfo = mt5.terminal_info()
+            ainfo = mt5.account_info()
+        except Exception:  # noqa: BLE001
+            return False
+        return tinfo is not None and ainfo is not None
+
+    def _ghost_key(self, sym: str, ticket: int | None) -> str:
+        if isinstance(ticket, int) and ticket > 0:
+            return f"ticket:{ticket}"
+        return f"symbol:{sym}"
+
+    def _ghost_mark_missing(self, key: str) -> bool:
+        """Increment miss counter. True when ghost is confirmed."""
+        count = self._ghost_missing_counts.get(key, 0) + 1
+        self._ghost_missing_counts[key] = count
+        return count >= self._ghost_min_confirmations
+
+    def _ghost_reset(self, key: str) -> None:
+        self._ghost_missing_counts.pop(key, None)
 
     def _tp_sync_trace(self, sym: str, reason: str, message: str) -> None:
         """Why TP/SLTP sync skipped or changed; throttled per (sym,reason).
@@ -767,6 +806,43 @@ class MT5Executor(PaperExecutor):
             logger.info("[MT5] Symbol '%s' added to Market Watch.", broker_sym)
 
         return broker_sym
+
+    def validate_symbol_mapping(self, watchlist: list[str]) -> list[str]:
+        """Validate/auto-heal watchlist symbol mapping against broker availability."""
+        if not _MT5_AVAILABLE:
+            return []
+        unresolved: list[str] = []
+        for internal in watchlist:
+            mapped = SYMBOL_MAP.get(internal)
+            if mapped is None:
+                unresolved.append(f"{internal} -> <missing-map>")
+                continue
+            if mt5.symbol_info(mapped) is not None:
+                continue
+            variants = [
+                mapped.replace("-T", ""),
+                mapped.replace("-T", "m"),
+                f"{mapped}.r",
+                mapped + "m",
+            ]
+            fixed: str | None = None
+            for v in variants:
+                if mt5.symbol_info(v) is not None:
+                    fixed = v
+                    break
+            if fixed is None:
+                unresolved.append(f"{internal} -> {mapped}")
+                continue
+            SYMBOL_MAP[internal] = fixed
+            base = internal.replace("/USDT", "USD")
+            SYMBOL_MAP[base] = fixed
+            logger.warning(
+                "[MT5] Auto-remapped %s from %s to broker symbol %s",
+                internal,
+                mapped,
+                fixed,
+            )
+        return unresolved
 
     @staticmethod
     def _local_symbol_from_broker(broker_symbol: str) -> str:
@@ -1627,6 +1703,7 @@ class MT5Executor(PaperExecutor):
                 sentiment_score=sentiment_score,
                 mt5_position_ticket=mt5_ticket,
             )
+            pos_ref = self.open_positions[sym]
             self._pending_symbols.discard(sym)
 
         record_trade(
@@ -1637,6 +1714,7 @@ class MT5Executor(PaperExecutor):
             quantity=position_size / entry_price,
             ml_confidence_at_entry=win_probability,
             sentiment_score_at_entry=sentiment_score,
+            idempotency_key=f"BUY:{sym}:ticket:{mt5_ticket or trade_id}",
         )
         self._save_state()
 
@@ -1665,6 +1743,8 @@ class MT5Executor(PaperExecutor):
                 f"SL Dinámico (ATR): {self.open_positions[sym].stop_loss_price:.2f}"
             )
         )
+        if self._live and isinstance(mt5_ticket, int):
+            await self._verify_initial_sl_synced(sym, pos_ref, mt5_ticket)
         return True
 
     # ------------------------------------------------------------------
@@ -1760,6 +1840,7 @@ class MT5Executor(PaperExecutor):
             exit_reason=exit_reason_code,
             pnl_usdt=pnl_net,
             pnl_percent=pnl_pct,
+            idempotency_key=f"SELL:{sym_ref}:ticket:{mt5_ticket or pos.trade_id}:{exit_reason_code}",
         )
         self._save_state()
 
@@ -1821,6 +1902,11 @@ class MT5Executor(PaperExecutor):
 
     async def _reconcile_ghost_position(self, sym: str) -> None:
         """Ghost = local open but MT5 has no position; close DB + notify."""
+        if self._shutting_down:
+            return
+        if not self._mt5_terminal_connected():
+            logger.warning("[MT5 SYNC] Terminal disconnected — skip ghost reconcile for %s.", sym)
+            return
         async with self._positions_lock:
             pos = self.open_positions.get(sym)
         if pos is None:
@@ -1951,6 +2037,7 @@ class MT5Executor(PaperExecutor):
             quantity=position_size / entry if entry > 0 else 0.0,
             ml_confidence_at_entry=0.0,
             sentiment_score_at_entry=0.0,
+            idempotency_key=f"BUY:{sym}:ticket:{int(p.ticket)}",
         )
         self._save_state()
 
@@ -2200,12 +2287,15 @@ class MT5Executor(PaperExecutor):
         """
         if not _MT5_AVAILABLE:
             return
+        if self._shutting_down or not self._mt5_terminal_connected():
+            return
         async with self._positions_lock:
             snapshot = [(s, p) for s, p in self.open_positions.items()]
         for sym, pos in snapshot:
             tid = getattr(pos, "mt5_position_ticket", None)
             if not isinstance(tid, int) or tid <= 0:
                 continue
+            gk = self._ghost_key(sym, tid)
             pins = await asyncio.to_thread(lambda t=tid: mt5.positions_get(ticket=t))
             if pins is None:
                 logger.warning(
@@ -2215,12 +2305,23 @@ class MT5Executor(PaperExecutor):
                 )
                 continue
             if len(pins) == 0:
+                if not self._ghost_mark_missing(gk):
+                    logger.warning(
+                        "[MT5 SYNC] Ticket %s missing for %s (%d/%d) — waiting confirmation.",
+                        tid,
+                        sym,
+                        self._ghost_missing_counts.get(gk, 0),
+                        self._ghost_min_confirmations,
+                    )
+                    continue
                 logger.info(
                     "[MT5 SYNC] Ticket %s closed on broker — ghost reconcile %s",
                     tid,
                     sym,
                 )
                 await self._reconcile_ghost_position(sym)
+            else:
+                self._ghost_reset(gk)
 
     async def sync_positions_with_exchange(self) -> int:
         """Re-sync local state against live MT5 positions.
@@ -2237,9 +2338,14 @@ class MT5Executor(PaperExecutor):
         """
         if not self._live:
             return len(self.open_positions)
+        if self._shutting_down:
+            return len(self.open_positions)
 
         if not _MT5_AVAILABLE:
             logger.warning("[MT5 SYNC] MetaTrader5 not available – skipping sync.")
+            return len(self.open_positions)
+        if not self._mt5_terminal_connected():
+            logger.warning("[MT5 SYNC] MT5 disconnected — sync skipped (no ghost actions).")
             return len(self.open_positions)
 
         mt5_positions_raw = await self._mt5_positions_get_retry()
@@ -2267,7 +2373,22 @@ class MT5Executor(PaperExecutor):
 
         # Ghost detection — broker closed without bot bookkeeping (SL/TP / manual)
         async with self._positions_lock:
-            ghost_symbols = [sym for sym in self.open_positions if sym not in live_symbols]
+            snapshot = list(self.open_positions.items())
+            ghost_symbols: list[str] = []
+            for sym, pos in snapshot:
+                if sym in live_symbols:
+                    self._ghost_reset(self._ghost_key(sym, getattr(pos, "mt5_position_ticket", None)))
+                    continue
+                gk = self._ghost_key(sym, getattr(pos, "mt5_position_ticket", None))
+                if self._ghost_mark_missing(gk):
+                    ghost_symbols.append(sym)
+                else:
+                    logger.warning(
+                        "[MT5 SYNC] Ghost candidate %s (%d/%d) — waiting confirmation.",
+                        sym,
+                        self._ghost_missing_counts.get(gk, 0),
+                        self._ghost_min_confirmations,
+                    )
         for sym in ghost_symbols:
             await self._reconcile_ghost_position(sym)
 
@@ -2276,7 +2397,8 @@ class MT5Executor(PaperExecutor):
 
         # Broker-only positions → import into local book (LONG + our magic)
         async with self._positions_lock:
-            untracked = [sym for sym in live_symbols if sym not in self.open_positions]
+            occupied = set(self.open_positions.keys()) | self._pending_symbols
+            untracked = [sym for sym in live_symbols if sym not in occupied]
         for sym in untracked:
             adopted = await self._try_adopt_mt5_position(sym)
             if not adopted:
@@ -2298,6 +2420,50 @@ class MT5Executor(PaperExecutor):
                 self._risk.sync_open_count(actual)
 
         return len(live_symbols)
+
+    async def _verify_initial_sl_synced(
+        self,
+        sym: str,
+        pos: OpenPosition,
+        ticket: int,
+    ) -> None:
+        """Verify broker SL right after BUY; force modify when missing/mismatched."""
+        if not self._live or not _MT5_AVAILABLE:
+            return
+        mt5_sym = self._resolve_symbol(sym)
+        if mt5_sym is None:
+            return
+        info = mt5.symbol_info(mt5_sym)
+        digits = int(info.digits) if info and info.digits else 5
+        expected = self._normalize_price(float(pos.stop_loss_price), digits)
+        for attempt in range(1, 4):
+            pins = mt5.positions_get(ticket=ticket)
+            if not pins:
+                await asyncio.sleep(0.12 * attempt)
+                continue
+            actual = float(getattr(pins[0], "sl", 0.0) or 0.0)
+            if actual > 0.0 and abs(actual - expected) <= (10 ** (-max(digits - 1, 1))):
+                pos.last_broker_sl_synced = expected
+                pos.last_mt5_modify_mono = time.monotonic()
+                return
+            ok = await self.modify_position(ticket=ticket, new_sl=expected, new_tp=0.0, symbol=sym)
+            if ok:
+                pos.last_broker_sl_synced = expected
+                pos.last_mt5_modify_mono = time.monotonic()
+                logger.info(
+                    "[MT5] Initial SL synced by force modify sym=%s ticket=%d sl=%.5f",
+                    sym,
+                    ticket,
+                    expected,
+                )
+                return
+            await asyncio.sleep(0.12 * attempt)
+        logger.error(
+            "[MT5] Initial SL verification failed sym=%s ticket=%d expected_sl=%.5f",
+            sym,
+            ticket,
+            expected,
+        )
 
     # ------------------------------------------------------------------
     # Position modification and explicit close

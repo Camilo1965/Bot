@@ -48,7 +48,6 @@ from rich.live import Live
 from rich.logging import RichHandler
 
 from bot import state as dash_state
-from bot.dashboard_helpers import display_timezone
 from bot.constants import (
     NEWS_FILTER_HOLD_MINUTES as _NEWS_FILTER_HOLD_MINUTES,
 )
@@ -56,6 +55,7 @@ from bot.constants import (
     NEWS_FILTER_VOLATILITY_THRESHOLD as _NEWS_FILTER_VOLATILITY_THRESHOLD,
 )
 from bot.dashboard import generate_dashboard
+from bot.dashboard_helpers import display_timezone
 from bot.loops import (
     close_pending_reconciler_loop,
     dashboard_logger,
@@ -108,6 +108,29 @@ _RESET  = "\033[0m"
 _GEMINI_ENABLED: bool = False
 
 
+def _apply_safe_env_defaults() -> None:
+    """Set conservative defaults for optional operational ENV knobs."""
+    defaults: dict[str, str] = {
+        "DIAGNOSTIC_BUNDLE_INTERVAL_S": "1800",
+        "TELEGRAM_LOG_ALERTS": "1",
+        "TELEGRAM_LOG_MIN_LEVEL": "WARNING",
+    }
+    for key, value in defaults.items():
+        if os.environ.get(key, "").strip():
+            continue
+        os.environ[key] = value
+        print(
+            f"[ENV] {key} not set; using default {value}.",
+            file=sys.stderr,
+        )
+    if not os.environ.get("BUY_PROB_THRESHOLD", "").strip():
+        print(
+            "[ENV] BUY_PROB_THRESHOLD not set; using model default 0.62 "
+            "(strategy/ml_predictor.py).",
+            file=sys.stderr,
+        )
+
+
 def _check_env() -> None:
     """Validate environment variables before the bot starts.
 
@@ -142,6 +165,7 @@ def _check_env() -> None:
 
 
 _check_env()
+_apply_safe_env_defaults()
 
 # ── Multi-asset watchlist ─────────────────────────────────────────────────────
 # Keep this aligned with symbols that exist in *Market Watch* on your MT5 broker
@@ -629,6 +653,23 @@ async def main() -> None:
                 parse_mode="HTML",
             )
         )
+        unresolved = paper_executor.validate_symbol_mapping(WATCHLIST)
+        if unresolved:
+            logger.critical(
+                "❌ [MT5] Symbol mapping validation failed: %s",
+                unresolved,
+            )
+            await send_priority_telegram_alert(
+                "🚨 *SYMBOL MAP ERROR*\n"
+                + "\n".join(f"• `{x}`" for x in unresolved),
+                priority="critical",
+                dedup_key="startup:symbol_map_invalid",
+                force=True,
+            )
+            if _mt5_initialized:
+                shutdown_mt5()
+            await close_db()
+            return
     else:
         paper_executor = PaperExecutor(db=db, risk_manager=risk_manager, exchange=None)
 
@@ -663,6 +704,10 @@ async def main() -> None:
         _GEMINI_ENABLED,
         WATCHLIST,
     )
+    if execution_mode == "mt5" and not isinstance(paper_executor, MT5Executor):
+        raise RuntimeError("EXECUTION_MODE=mt5 requires MT5Executor only.")
+    if execution_mode != "mt5" and isinstance(paper_executor, MT5Executor):
+        raise RuntimeError("Paper mode must not run MT5Executor.")
 
     # ------------------------------------------------------------------
     # [SYNC] Re-sync open positions from exchange on restart
@@ -928,6 +973,8 @@ async def main() -> None:
             pass  # never let the Telegram call block the shutdown path
         raise
     finally:
+        if isinstance(paper_executor, MT5Executor):
+            paper_executor.begin_shutdown()
         for task in running_tasks:
             if not task.done():
                 task.cancel()
@@ -938,9 +985,9 @@ async def main() -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await startup_alert_task
         _live.stop()
+        await close_db()
         if _mt5_initialized:
             shutdown_mt5()
-        await close_db()
 
     logger.info("🛑 ClawdBot shut down cleanly")
 
