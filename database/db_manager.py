@@ -51,6 +51,39 @@ BEGIN
 END $$;
 """
 
+# Legacy tick-style table (gui/db_reader) may only have best_bid/best_ask; add OHLC for bot kline writes.
+_MIGRATE_ADD_MARKET_OHLC = """
+DO $$
+BEGIN
+  IF to_regclass('public.market_data') IS NULL THEN RETURN; END IF;
+  IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'market_data' AND column_name = 'open') THEN
+    ALTER TABLE market_data ADD COLUMN open DOUBLE PRECISION;
+  END IF;
+  IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'market_data' AND column_name = 'high') THEN
+    ALTER TABLE market_data ADD COLUMN high DOUBLE PRECISION;
+  END IF;
+  IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'market_data' AND column_name = 'low') THEN
+    ALTER TABLE market_data ADD COLUMN low DOUBLE PRECISION;
+  END IF;
+  IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'market_data' AND column_name = 'close') THEN
+    ALTER TABLE market_data ADD COLUMN close DOUBLE PRECISION;
+  END IF;
+  IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'market_data' AND column_name = 'volume') THEN
+    ALTER TABLE market_data ADD COLUMN volume DOUBLE PRECISION;
+  END IF;
+END $$;
+"""
+
 _CREATE_ML_PREDICTIONS = """
 CREATE TABLE IF NOT EXISTS ml_predictions (
     timestamp TIMESTAMPTZ NOT NULL,
@@ -99,6 +132,10 @@ class DatabaseManager:
             except Exception:  # noqa: BLE001
                 pass
             await conn.execute(_CREATE_MARKET_DATA)
+            try:
+                await conn.execute(_MIGRATE_ADD_MARKET_OHLC)
+            except Exception:  # noqa: BLE001
+                logger.warning("market_data OHLC migration skipped: check Timescale/locks.")
             try: await conn.execute(_CREATE_HYPERTABLE_MARKET)
             except Exception: pass
             await conn.execute(_CREATE_ML_PREDICTIONS)
@@ -139,7 +176,8 @@ class DatabaseManager:
         if not self._pool: return []
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT close FROM market_data WHERE symbol = $1 ORDER BY timestamp DESC LIMIT $2",
+                "SELECT close FROM market_data WHERE symbol = $1 AND close IS NOT NULL "
+                "ORDER BY timestamp DESC LIMIT $2",
                 symbol,
                 limit,
             )

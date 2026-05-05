@@ -37,7 +37,6 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.live import Live
 from rich.logging import RichHandler
@@ -71,6 +70,7 @@ from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor
 from utils.diagnostic_bundle import write_diagnostic_bundle
+from utils.env_bootstrap import load_env_file
 from utils.runtime_snapshot import runtime_metrics_loop, write_startup_snapshot
 from utils.telegram_notifier import (
     install_asyncio_critical_telegram_alerts,
@@ -80,8 +80,7 @@ from utils.telegram_notifier import (
     telegram_command_poller,
 )
 
-# UTF-8 BOM tolerated; if .env was saved as UTF-16 in Notepad, re-save as UTF-8.
-load_dotenv(Path(__file__).resolve().parent / ".env", encoding="utf-8-sig")
+load_env_file(Path(__file__).resolve().parent / ".env")
 
 # ── ANSI colour helpers (no extra dependency) ─────────────────────────────────
 _YELLOW = "\033[33m"

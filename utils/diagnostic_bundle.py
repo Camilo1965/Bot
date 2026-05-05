@@ -9,9 +9,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 try:
-    from dotenv import load_dotenv as _load_dotenv
+    from utils.env_bootstrap import load_env_file as _load_env_file
 except ImportError:
-    _load_dotenv = None  # type: ignore[assignment]
+    _load_env_file = None  # type: ignore[assignment]
 
 # Embedded markdown max size (chars) before truncate — evita .md imposible de pegar.
 _MAX_EMBED_CHARS = 3_500_000
@@ -317,8 +317,8 @@ def write_diagnostic_bundle(
     full_day_bot_debug_errors_only:
         Si True, en ``full_day`` solo incluye ERROR/WARNING en ``bot_debug`` (bundle más chico).
     """
-    if load_dotenv_file and _load_dotenv is not None:
-        _load_dotenv(repo_root / ".env")
+    if load_dotenv_file and _load_env_file is not None:
+        _load_env_file(repo_root / ".env")
 
     logs_dir = repo_root / "logs"
     tz = _report_tz()
