@@ -44,6 +44,11 @@ _JOURNAL_COLUMNS: list[str] = [
     "duration_minutes",
 ]
 
+# ── Legacy compatibility constants ──────────────────────────────────────────
+_TAKER_FEE_RATE: float = 0.0004
+ATR_SL_MULTIPLIER: float = 1.5
+ATR_TRAILING_MULTIPLIER: float = 2.0
+
 # ── Error messages ───────────────────────────────────────────────────────────
 _ERRORS = {
     "MARKET_CLOSED": "MARKET_CLOSED: La sesión de trading para este símbolo no está abierta.",
@@ -211,3 +216,11 @@ class PaperExecutor:
 
     async def sync_positions_with_exchange(self, confirmations_required: int = 1) -> int:
         return len(self.open_positions)
+
+def _build_trade_report(*args: Any, **kwargs: Any) -> str:
+    """Legacy stub for MT5Executor."""
+    return ""
+
+def record_trade(*args: Any, **kwargs: Any) -> None:
+    """Legacy stub for MT5Executor."""
+    pass
