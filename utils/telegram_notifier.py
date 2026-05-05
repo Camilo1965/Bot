@@ -28,8 +28,8 @@ import logging
 import os
 import ssl
 import time
-from html import escape
 from datetime import datetime
+from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo
 

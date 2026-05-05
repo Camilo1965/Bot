@@ -8,14 +8,12 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from database.db_manager import db
-
 from bot.constants import (
     DEBUG_LOG_HINT,
     NEWS_FILTER_HOLD_MINUTES,
     NEWS_FILTER_VOLATILITY_THRESHOLD,
 )
-
+from database.db_manager import db
 from execution.paper_executor import PaperExecutor
 from strategy.feature_engineer import FeatureEngineer
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, compute_htf_trend

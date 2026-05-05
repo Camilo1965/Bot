@@ -11,9 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from bot.constants import DEBUG_LOG_HINT
-
 from database.db_manager import db
-
 from execution.mt5_executor import MT5Executor, fetch_mt5_wallet_snapshot
 from execution.paper_executor import PaperExecutor
 

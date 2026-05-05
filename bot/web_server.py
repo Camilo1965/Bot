@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -8,9 +7,9 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
-from bot.dashboard_helpers import compute_rsi, mt5_dashboard_mark
 from bot import state as dash_state
 from bot.constants import DEBUG_LOG_HINT
+from bot.dashboard_helpers import compute_rsi, mt5_dashboard_mark
 from database.db_manager import db
 from execution.mt5_executor import MT5Executor
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
@@ -41,6 +40,9 @@ def _make_api_rate_middleware(per_minute: int, window_s: float = 60.0):
         cutoff = now - window_s
         while bucket and bucket[0] < cutoff:
             bucket.pop(0)
+        if not bucket:
+            hits.pop(ip, None)
+            bucket = hits.setdefault(ip, [])
         if len(bucket) >= per_minute:
             return web.json_response(
                 {"error": "rate_limited", "retry_after_s": int(window_s)},
@@ -586,21 +588,23 @@ async def start_web_dashboard(
     paper_executor: PaperExecutor,
     risk_manager: RiskManager,
     watchlist: list[str],
-    host: str = "0.0.0.0",
+    host: str = "0.0.0.0",  # nosec B104
     port: int = 8080,
 ):
     """Run an aiohttp web server providing a modern real-time mobile dashboard."""
     report_tz = os.environ.get("REPORT_TIMEZONE", "America/Bogota")
     ceo_cache: dict[str, Any] = {"expires_mono": 0.0, "data": None}
     api_mt5_sync_last_mono = 0.0
+    # Min seconds between full MT5↔memory syncs on /api/state. 0 = sync every request
+    # (matches SPA poll ~2.5s ⇒ dashboard rarely >~3s stale vs broker).
     _raw_api_iv = os.environ.get(
-        "WEB_API_MT5_SYNC_EVERY_S",
-        os.environ.get("DASHBOARD_MT5_SYNC_EVERY_S", "5"),
+        "WEB_API_MT5_SYNC_MIN_INTERVAL_S",
+        os.environ.get("WEB_API_MT5_SYNC_EVERY_S", "0"),
     ).strip()
     try:
-        api_mt5_sync_iv = float(_raw_api_iv) if _raw_api_iv else 5.0
+        api_mt5_sync_iv = float(_raw_api_iv) if _raw_api_iv else 0.0
     except ValueError:
-        api_mt5_sync_iv = 5.0
+        api_mt5_sync_iv = 0.0
 
     async def build_ceo_snapshot() -> dict[str, Any]:
         now_mono = asyncio.get_event_loop().time()
@@ -664,9 +668,11 @@ async def start_web_dashboard(
         nonlocal api_mt5_sync_last_mono
         now_utc = datetime.now(tz=timezone.utc)
 
-        if isinstance(paper_executor, MT5Executor) and paper_executor._live and api_mt5_sync_iv > 0:
+        if isinstance(paper_executor, MT5Executor) and paper_executor._live:
             now_mono = asyncio.get_running_loop().time()
-            if (now_mono - api_mt5_sync_last_mono) >= api_mt5_sync_iv:
+            if api_mt5_sync_iv <= 0 or (
+                now_mono - api_mt5_sync_last_mono
+            ) >= api_mt5_sync_iv:
                 api_mt5_sync_last_mono = now_mono
                 try:
                     await paper_executor.sync_positions_with_exchange()

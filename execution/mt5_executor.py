@@ -72,11 +72,11 @@ except ImportError:
     _PANDAS_AVAILABLE = False
 
 from execution.paper_executor import (
+    _TAKER_FEE_RATE,
     ATR_SL_MULTIPLIER,
     ATR_TRAILING_MULTIPLIER,
     OpenPosition,
     PaperExecutor,
-    _TAKER_FEE_RATE,
     _build_trade_report,
     compute_dynamic_tp_hint,
     record_trade,
@@ -1179,47 +1179,33 @@ class MT5Executor(PaperExecutor):
         )
         return True
 
-    def _send_order(self, request: dict) -> Any | None:
-        """Send an order via ``mt5.order_send`` and log the result.
+    def _broker_blocks_new_long_on_symbol(self, mt5_sym: str) -> tuple[bool, str]:
+        """True if MT5 already has a BUY on *mt5_sym* so we must not stack another long.
 
-        Uses :func:`_log_mt5_retcode` to emit a human-readable description for
-        every non-success return code.  Prefer :meth:`_send_order_with_retry`
-        for live trading paths where transient failures should be retried.
+        Foreign (non-bot magic) positions are rejected by default so manual trades
+        do not collide with bot entries on the same instrument.  Set environment
+        ``MT5_ALLOW_FOREIGN_SYMBOL_OVERLAP=1`` to allow opens while a manual long
+        exists (dangerous — double exposure).
+
+        Also blocks when the broker already shows a bot-tagged BUY (sync lag vs
+        local ``open_positions``).
         """
-        result = mt5.order_send(request)
-        if result is None:
-            logger.error(
-                "mt5.order_send returned None for %s. Last error: %s",
-                request.get("symbol"),
-                mt5.last_error(),
-            )
-            return None
-
-        _log_mt5_retcode(result.retcode, context=str(request.get("symbol", "")))
-
-        if result.retcode != mt5.TRADE_RETCODE_DONE:
-            return None
-
-        action = request.get("action")
-        if action == mt5.TRADE_ACTION_SLTP:
-            logger.info(
-                "MT5 SL/TP MODIFIED  position=%d  sl=%.5f  tp=%.5f",
-                request.get("position", 0),
-                request.get("sl", 0.0),
-                request.get("tp", 0.0),
-            )
-        else:
-            logger.info(
-                "MT5 ORDER PLACED  symbol=%s  type=%s  volume=%.4f  price=%.5f  "
-                "order=%d  deal=%d",
-                request.get("symbol"),
-                "BUY" if request.get("type") == mt5.ORDER_TYPE_BUY else "SELL",
-                request.get("volume", 0.0),
-                result.price,
-                result.order,
-                result.deal,
-            )
-        return result
+        if not _MT5_AVAILABLE:
+            return False, ""
+        raw_allow = os.environ.get("MT5_ALLOW_FOREIGN_SYMBOL_OVERLAP", "0").strip().lower()
+        allow_foreign = raw_allow in ("1", "true", "yes")
+        raw = mt5.positions_get(symbol=mt5_sym)
+        if not raw:
+            return False, ""
+        for p in raw:
+            if p.type != mt5.POSITION_TYPE_BUY:
+                continue
+            if p.magic != self._magic:
+                if allow_foreign:
+                    continue
+                return True, "foreign_long_on_symbol"
+            return True, "broker_already_has_bot_long"
+        return False, ""
 
     async def _send_order_with_retry(
         self,
@@ -1432,7 +1418,7 @@ class MT5Executor(PaperExecutor):
                 )
                 return False
 
-            if sym in self.open_positions:
+            if sym in self.open_positions or sym in self._pending_symbols:
                 logger.debug("Trade skipped – a position for %s is already open.", sym)
                 return False
 
@@ -1443,7 +1429,8 @@ class MT5Executor(PaperExecutor):
                 )
                 return False
 
-            if self._risk.is_sector_exposed(sym, list(self.open_positions.keys())):
+            occupied_syms = set(self.open_positions.keys()) | self._pending_symbols
+            if self._risk.is_sector_exposed(sym, list(occupied_syms)):
                 sector = get_sector(sym)
                 logger.warning(
                     "🛡️ [RISK CONTROL] BUY signal for %s ignored – "
@@ -1464,6 +1451,7 @@ class MT5Executor(PaperExecutor):
 
             ts = timestamp or datetime.now(tz=timezone.utc)
             self._risk.register_open()
+            self._pending_symbols.add(sym)
 
         # ── Dynamic risk thresholds from sentiment ─────────────────────────
         thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
@@ -1511,11 +1499,26 @@ class MT5Executor(PaperExecutor):
                     "MT5 live mode requested but MetaTrader5 library is not "
                     "installed.  Rolling back and aborting."
                 )
-                self._risk.register_close()
+                async with self._positions_lock:
+                    self._pending_symbols.discard(sym)
+                    self._risk.register_close()
                 return False
 
             # mt5_sym is guaranteed non-None here (resolved before deductions).
             assert mt5_sym is not None  # noqa: S101
+
+            block_open, _occ_reason = self._broker_blocks_new_long_on_symbol(mt5_sym)
+            if block_open:
+                logger.warning(
+                    "[MT5] New LONG blocked (%s) on %s — sym=%s",
+                    _occ_reason,
+                    mt5_sym,
+                    sym,
+                )
+                async with self._positions_lock:
+                    self._pending_symbols.discard(sym)
+                    self._risk.register_close()
+                return False
 
             # Normalise SL price to the number of digits the broker accepts.
             sym_info = mt5.symbol_info(mt5_sym)
@@ -1526,7 +1529,9 @@ class MT5Executor(PaperExecutor):
             tick = mt5.symbol_info_tick(mt5_sym)
             if not self._validate_tick_freshness(tick, mt5_sym, max_age_seconds=5.0):
                 logger.error("[MT5] Tick freshness check failed – aborting trade for %s.", sym)
-                self._risk.register_close()
+                async with self._positions_lock:
+                    self._pending_symbols.discard(sym)
+                    self._risk.register_close()
                 return False
 
             ask_price = self._normalize_price(tick.ask, digits)
@@ -1551,7 +1556,9 @@ class MT5Executor(PaperExecutor):
                     "[MT5] Stop clamp failed (broker rules) – aborting trade for %s.",
                     sym,
                 )
-                self._risk.register_close()
+                async with self._positions_lock:
+                    self._pending_symbols.discard(sym)
+                    self._risk.register_close()
                 return False
             stop_loss_price = sl_clamped
 
@@ -1570,7 +1577,9 @@ class MT5Executor(PaperExecutor):
             # Issue 2 – verify sufficient margin before sending the order.
             if not self._check_margin_available(mt5_sym, lots, ask_price):
                 logger.error("[MT5] Margin check failed – aborting trade for %s.", sym)
-                self._risk.register_close()
+                async with self._positions_lock:
+                    self._pending_symbols.discard(sym)
+                    self._risk.register_close()
                 return False
 
             request = self._build_buy_request(
@@ -1583,6 +1592,7 @@ class MT5Executor(PaperExecutor):
             if result is None:
                 # Order rejected – roll back counter (balance wasn't deducted)
                 async with self._positions_lock:
+                    self._pending_symbols.discard(sym)
                     self._risk.register_close()
                 return False
             mt5_ticket = await self._resolve_position_ticket_after_buy(mt5_sym, result)
@@ -1597,6 +1607,7 @@ class MT5Executor(PaperExecutor):
         except Exception as exc:  # noqa: BLE001
             logger.exception("[MT5][DB] insert_open_trade failed for %s — rolling back: %s", sym, exc)
             async with self._positions_lock:
+                self._pending_symbols.discard(sym)
                 self._risk.register_close()
             return False
 
@@ -1616,6 +1627,7 @@ class MT5Executor(PaperExecutor):
                 sentiment_score=sentiment_score,
                 mt5_position_ticket=mt5_ticket,
             )
+            self._pending_symbols.discard(sym)
 
         record_trade(
             timestamp=ts,

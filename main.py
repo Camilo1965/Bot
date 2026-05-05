@@ -34,10 +34,9 @@ import logging
 import logging.handlers
 import os
 import sys
-import time
 import uuid
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -47,14 +46,32 @@ from rich.console import Console
 from rich.live import Live
 from rich.logging import RichHandler
 
+from bot import state as dash_state
+from bot.constants import (
+    NEWS_FILTER_HOLD_MINUTES as _NEWS_FILTER_HOLD_MINUTES,
+)
+from bot.constants import (
+    NEWS_FILTER_VOLATILITY_THRESHOLD as _NEWS_FILTER_VOLATILITY_THRESHOLD,
+)
+from bot.dashboard import generate_dashboard
+from bot.loops import (
+    close_pending_reconciler_loop,
+    dashboard_logger,
+    health_monitor_loop,
+    monthly_report_loop,
+    position_sync_loop,
+    weekly_report_loop,
+)
+from bot.market_consumer import market_consumer
+from bot.mt5_preload import preload_historical_data_mt5
+from bot.signal_emitter import signal_emitter
+from bot.web_server import start_web_dashboard
+from bot.weekly_retrainer import weekly_retrainer
 from data_ingestion.mt5_market_client import MT5MarketDataClient
 from data_ingestion.news_scraper import fetch_crypto_headlines
 from database.db_manager import close_db, db, init_db
 from execution.mt5_executor import (
     MT5Executor,
-    TIMEFRAME_H1,
-    TIMEFRAME_H4,
-    TIMEFRAME_M15,
     fetch_mt5_account_balance,
     fetch_mt5_wallet_snapshot,
     initialize_mt5,
@@ -73,26 +90,6 @@ from utils.telegram_notifier import (
     send_telegram_alert,
     telegram_command_poller,
 )
-
-from bot import state as dash_state
-from bot.constants import (
-    NEWS_FILTER_HOLD_MINUTES as _NEWS_FILTER_HOLD_MINUTES,
-    NEWS_FILTER_VOLATILITY_THRESHOLD as _NEWS_FILTER_VOLATILITY_THRESHOLD,
-)
-from bot.dashboard import generate_dashboard
-from bot.web_server import start_web_dashboard
-from bot.loops import (
-    close_pending_reconciler_loop,
-    dashboard_logger,
-    health_monitor_loop,
-    monthly_report_loop,
-    position_sync_loop,
-    weekly_report_loop,
-)
-from bot.market_consumer import market_consumer
-from bot.mt5_preload import preload_historical_data_mt5
-from bot.signal_emitter import signal_emitter
-from bot.weekly_retrainer import weekly_retrainer
 
 load_dotenv()
 
@@ -476,7 +473,7 @@ async def main() -> None:
         # [ELITE] Latest perpetual-futures funding rate per symbol
         "funding_rates": {symbol: 0.0 for symbol in WATCHLIST},
         # [PRO] News Filter state
-        "sentiment_history": deque(),  # stores (datetime, float) tuples
+        "sentiment_history": deque(maxlen=500),  # pruned in signal_emitter; maxlen caps memory
         "news_hold_until": None,       # datetime | None
         # Per-symbol last seen kline timestamp for deduplication
         "last_kline_ts": {symbol: None for symbol in WATCHLIST},
@@ -832,7 +829,7 @@ async def main() -> None:
         weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
         position_sync_loop(
             paper_executor,
-            interval=max(5, min(int(float(os.environ.get("MT5_POSITION_SYNC_S", "10"))), 300)),
+            interval=max(3, min(int(float(os.environ.get("MT5_POSITION_SYNC_S", "4"))), 300)),
         ),
         health_monitor_loop(shared_state, market_queue, paper_executor, interval=30),
         close_pending_reconciler_loop(shared_state, paper_executor, interval=20),

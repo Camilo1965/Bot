@@ -1,0 +1,34 @@
+[project]
+name = "clawdbot"
+version = "0.0.0"
+requires-python = ">=3.12"
+description = "ClawdBot — local config for static analysis (not a published package)."
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = [
+    "coverage_report",
+    ".venv",
+    "venv",
+    "MAQUINA VIRTUAL",
+]
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "B",
+    "I",
+]
+ignore = [
+    "E501",
+    "B008",
+    "B904",
+]
+
+[tool.bandit]
+exclude_dirs = ["tests", "coverage_report", ".venv", "venv", "MAQUINA VIRTUAL"]
+skips = ["B101", "B104"]

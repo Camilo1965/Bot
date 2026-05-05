@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from execution.mt5_executor import MT5Executor, TIMEFRAME_H1, TIMEFRAME_H4, TIMEFRAME_M15
+from execution.mt5_executor import TIMEFRAME_H1, TIMEFRAME_H4, TIMEFRAME_M15, MT5Executor
 
 
 async def preload_historical_data_mt5(

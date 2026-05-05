@@ -5,17 +5,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from rich import box as rich_box
 from rich.columns import Columns
 from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich import box as rich_box
 
 from bot import state as dash_state
 from bot.dashboard_helpers import compute_rsi, mt5_dashboard_mark
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
-from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE, RiskManager
+from risk.risk_manager import LEVERAGE as _RISK_LEVERAGE
+from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, BUY_SENTIMENT_THRESHOLD
 
 

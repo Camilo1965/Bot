@@ -23,14 +23,14 @@ Credentials are read from environment variables (populated via .env):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from typing import Any
+from zoneinfo import ZoneInfo
 
-import asyncio
 import asyncpg
 
 logger = logging.getLogger(__name__)

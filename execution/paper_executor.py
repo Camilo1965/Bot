@@ -63,9 +63,17 @@ from typing import TYPE_CHECKING, Any
 try:
     from ccxt.base.errors import (
         AuthenticationError as CcxtAuthenticationError,
+    )
+    from ccxt.base.errors import (
         ExchangeError as CcxtExchangeError,
+    )
+    from ccxt.base.errors import (
         InsufficientFunds as CcxtInsufficientFunds,
+    )
+    from ccxt.base.errors import (
         NetworkError as CcxtNetworkError,
+    )
+    from ccxt.base.errors import (
         NotSupported as CcxtNotSupported,
     )
 except Exception:  # noqa: BLE001
@@ -83,8 +91,8 @@ from risk.risk_manager import (
     BASE_ACTIVATION_PCT,
     BASE_SL,
     BASE_TRAILING_DISTANCE,
-    DynamicThresholds,
     LEVERAGE,
+    DynamicThresholds,
     RiskManager,
     get_dynamic_thresholds,
     get_sector,
@@ -434,6 +442,9 @@ class PaperExecutor:
         self.total_pnl: float = 0.0
         # Serialises open_positions mutations across async tasks.
         self._positions_lock = asyncio.Lock()
+        # Symbols with register_open() applied but not yet in open_positions (in-flight open).
+        # Prevents duplicate symbol / max-slot races between await points.
+        self._pending_symbols: set[str] = set()
 
     # ------------------------------------------------------------------
     # State persistence (paper-trading disaster recovery)
@@ -691,7 +702,7 @@ class PaperExecutor:
                 )
                 return False
 
-            if sym in self.open_positions:
+            if sym in self.open_positions or sym in self._pending_symbols:
                 logger.debug("Trade skipped – a position for %s is already open.", sym)
                 return False
 
@@ -703,7 +714,8 @@ class PaperExecutor:
                 return False
 
             # ── Sector / correlation-group exposure check ──────────────────────
-            if self._risk.is_sector_exposed(sym, list(self.open_positions.keys())):
+            occupied_syms = set(self.open_positions.keys()) | self._pending_symbols
+            if self._risk.is_sector_exposed(sym, list(occupied_syms)):
                 sector = get_sector(sym)
                 logger.warning(
                     "🛡️ [RISK CONTROL] Señal de BUY para %s ignorada. "
@@ -725,6 +737,7 @@ class PaperExecutor:
 
             ts = timestamp or datetime.now(tz=timezone.utc)
             self._risk.register_open()
+            self._pending_symbols.add(sym)
 
             # ── Compute dynamic risk thresholds from sentiment ─────────────
             thresholds: DynamicThresholds = get_dynamic_thresholds(sentiment_score)
@@ -791,6 +804,7 @@ class PaperExecutor:
                     sym,
                 )
                 async with self._positions_lock:
+                    self._pending_symbols.discard(sym)
                     self._risk.credit(position_size)
                     self._risk.register_close()
                 return False
@@ -805,6 +819,7 @@ class PaperExecutor:
         except Exception as exc:  # noqa: BLE001
             logger.exception("[DB] insert_open_trade failed for %s — rolling back: %s", sym, exc)
             async with self._positions_lock:
+                self._pending_symbols.discard(sym)
                 self._risk.register_close()
             return False
 
@@ -832,6 +847,7 @@ class PaperExecutor:
                 ml_confidence=win_probability,
                 sentiment_score=sentiment_score,
             )
+            self._pending_symbols.discard(sym)
         # ── Trade journal CSV (BUY row) ────────────────────────────────────
         record_trade(
             timestamp=ts,

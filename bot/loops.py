@@ -6,24 +6,20 @@ import asyncio
 import json
 import logging
 import os
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
-
-from collections import deque
 from zoneinfo import ZoneInfo
 
 from rich.live import Live
 
-from database.db_manager import db
-
 from bot.constants import DEBUG_LOG_HINT
 from bot.dashboard import generate_dashboard
 from bot.dashboard_helpers import mt5_dashboard_mark
-
+from database.db_manager import db
 from execution.mt5_executor import MT5Executor, fetch_mt5_wallet_snapshot
 from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
-
 from utils.telegram_notifier import (
     send_priority_telegram_alert,
 )
@@ -56,11 +52,12 @@ async def dashboard_logger(
     logger_dash = logging.getLogger("clawdbot.dashboard")
     audit = logging.getLogger("clawdbot.audit")
     last_mt5_sync_mono = 0.0
-    raw_iv = os.environ.get("DASHBOARD_MT5_SYNC_EVERY_S", "5").strip()
+    # Keep Rich TUI within a few seconds of broker state (see WEB_API_MT5_SYNC_* for web).
+    raw_iv = os.environ.get("DASHBOARD_MT5_SYNC_EVERY_S", "2").strip()
     try:
-        dash_sync_iv = float(raw_iv) if raw_iv else 5.0
+        dash_sync_iv = float(raw_iv) if raw_iv else 2.0
     except ValueError:
-        dash_sync_iv = 5.0
+        dash_sync_iv = 2.0
     while True:
         await asyncio.sleep(interval)
 
