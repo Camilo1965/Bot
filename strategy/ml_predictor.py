@@ -2,7 +2,7 @@
 strategy.ml_predictor
 ~~~~~~~~~~~~~~~~~~~~~~
 
-Dedicated **INJ/USDT** XGBoost classifier (six OHLC-derived features).
+Dedicated XGBoost classifier (quant OHLCV features: RSI, MACD, ATR, BB, vol delta, log returns).
 
 Entry rule
 ----------
@@ -11,7 +11,7 @@ Entry rule
 
 No sentiment, HTF, funding, or regime overrides — the loaded model is the only
 entry gate.  :meth:`MLPredictor.warm_start` still retrains from history when no
-artifact is present; weekly retrainer may refresh ``models/INJ_USDT.json``.
+artifact is present; weekly retrainer may refresh the active model path in this file.
 """
 
 from __future__ import annotations
@@ -23,27 +23,42 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
+from strategy.quant_features import (
+    DEFAULT_LABEL_ROUND_TRIP,
+    MIN_OHLC_ROWS,
+    QUANT_FEATURE_COLS,
+    add_quant_features,
+    compute_quant_vector_from_lists,
+    forward_return_label,
+)
+
 logger = logging.getLogger(__name__)
 
-ALLOWED_SYMBOLS: tuple[str, ...] = ("INJ/USDT",)
+ALLOWED_SYMBOLS: tuple[str, ...] = ("DOGE/USDT",)
 BUY_PROB_THRESHOLD: float = 0.70
-_INJ_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "INJ_USDT.json"
+_INJ_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "DOGE_USDT_v1.json"
 _inj_xgb_singleton: XGBClassifier | None = None
+_cached_booster_path: Path | None = None
+
+_LABEL_ROUND_TRIP: float = DEFAULT_LABEL_ROUND_TRIP
 
 # Back-test / warm_start labelling only (not used for live entry)
 _SELL_PROB_THRESHOLD = 0.35
 _SELL_SENTIMENT_THRESHOLD = -0.3
 
 
-def load_model() -> XGBClassifier:
-    """Load ``models/INJ_USDT.json`` once per process (cached)."""
-    global _inj_xgb_singleton
-    if _inj_xgb_singleton is None:
-        if not _INJ_MODEL_PATH.is_file():
-            raise FileNotFoundError(str(_INJ_MODEL_PATH))
-        booster = XGBClassifier()
-        booster.load_model(str(_INJ_MODEL_PATH))
-        _inj_xgb_singleton = booster
+def load_booster_from_disk(path: Path | None = None) -> XGBClassifier:
+    """Load XGB JSON from *path* or default ``_INJ_MODEL_PATH`` (cached per path)."""
+    global _inj_xgb_singleton, _cached_booster_path
+    p = path or _INJ_MODEL_PATH
+    if _inj_xgb_singleton is not None and _cached_booster_path == p:
+        return _inj_xgb_singleton
+    if not p.is_file():
+        raise FileNotFoundError(str(p))
+    booster = XGBClassifier()
+    booster.load_model(str(p))
+    _inj_xgb_singleton = booster
+    _cached_booster_path = p
     return _inj_xgb_singleton
 
 # Default prediction horizon (price-tick steps)
@@ -66,8 +81,8 @@ _RSI_OVERBOUGHT = 65.0         # mean-reversion SELL trigger
 _FUNDING_RATE_EXTREME_GREED = 0.0003   # > this → Short-Bias penalty on BUY
 _FUNDING_RATE_EXTREME_FEAR = -0.0003   # < this → Long-Bias bonus on BUY
 
-# Minimum prices needed for inference (SMA_20 requires 20 observations)
-_MIN_PRICES_FOR_INFERENCE = _SMA_PERIOD
+# Minimum bars for quant feature stack (MACD/BB warm-up)
+_MIN_PRICES_FOR_INFERENCE = MIN_OHLC_ROWS
 
 # Default ADX value used when OHLCV data is unavailable (neutral – no regime)
 _ADX_NEUTRAL_DEFAULT = 25.0
@@ -80,15 +95,7 @@ HTF_TREND_NEUTRAL = "neutral"
 # Minimum number of HTF candles required to compute a trend
 _HTF_MIN_CANDLES = 3
 
-# Feature column order expected by the model (OHLC-derived only; no sentiment/OBI)
-_FEATURE_COLS = [
-    "rsi",
-    "sma_ratio",
-    "volatility",
-    "momentum",
-    "adx",
-    "atr",
-]
+_FEATURE_COLS = QUANT_FEATURE_COLS
 
 Signal = str  # literal: "BUY" | "SELL" | "HOLD"
 TrendStatus = str  # literal: "bullish" | "bearish" | "neutral"
@@ -151,18 +158,15 @@ def compute_htf_trend(
 
 
 class MLPredictor:
-    """Predicts price-direction probability and generates trading signals.
-
-    The underlying model is an XGBoost binary classifier trained on a
-    six-element feature vector:
-    [rsi, sma_ratio, volatility, momentum, adx, atr].
-    """
+    """XGBoost binary classifier on :data:`~strategy.quant_features.QUANT_FEATURE_COLS`."""
 
     def __init__(self) -> None:
         self._model = XGBClassifier(
-            n_estimators=100,
-            max_depth=4,
-            learning_rate=0.1,
+            n_estimators=120,
+            max_depth=5,
+            learning_rate=0.08,
+            subsample=0.85,
+            colsample_bytree=0.85,
             eval_metric="logloss",
             random_state=42,
         )
@@ -255,66 +259,17 @@ class MLPredictor:
         highs: list[float] | None = None,
         lows: list[float] | None = None,
         obi_ratio: float = 1.0,
-    ) -> list[float]:
-        """Compute technical indicators and return a feature vector.
-
-        Parameters
-        ----------
-        prices:    Recent mid-prices in chronological order.
-        sentiment: Ignored for the feature vector (kept for API compatibility).
-        highs:     Optional high prices (same length as *prices*); used for
-                   ADX / ATR calculation.  Defaults to ``None`` (ADX=25, ATR=0).
-        lows:      Optional low prices (same length as *prices*); used for
-                   ADX / ATR calculation.  Defaults to ``None`` (ADX=25, ATR=0).
-        obi_ratio: Ignored (kept for API compatibility).
-
-        Returns
-        -------
-        A six-element list
-        ``[rsi, sma_ratio, volatility, momentum, adx, atr]``
-        where NaN values are replaced with ``0.0``.
-        """
+        volumes: list[float] | None = None,
+    ) -> list[float] | None:
+        """Compute quant features (same pipeline as ``scripts/quant_sweep.py``)."""
         del sentiment, obi_ratio
-        series = pd.Series(prices, dtype=float)
-
-        # SMA_20 ratio: current_price / SMA_20 (normalised)
-        sma_20 = series.rolling(_SMA_PERIOD).mean()
-        sma_20_val = float(sma_20.iloc[-1])
-        current_price = float(series.iloc[-1])
-        if np.isnan(sma_20_val) or sma_20_val == 0.0:
-            sma_ratio = 0.0
-        else:
-            sma_ratio = current_price / sma_20_val
-
-        # Volatility: rolling standard deviation of the last 20 periods
-        vol_series = series.rolling(_SMA_PERIOD).std()
-        vol_val = float(vol_series.iloc[-1])
-        volatility = 0.0 if np.isnan(vol_val) else vol_val
-
-        # RSI_14: Relative Strength Index using Wilder's exponential smoothing.
-        # When avg_loss=0 and avg_gain>0, RS=inf → RSI=100 (pure uptrend).
-        # When both are 0 (no movement), RS=NaN → fill with 50 (neutral).
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
-        avg_loss = loss.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
-        rs = avg_gain / avg_loss
-        rsi_series = (100 - (100 / (1 + rs))).fillna(50.0)
-        rsi = float(rsi_series.iloc[-1])
-
-        # Momentum: percentage change of current price vs 5 periods ago
-        mom_series = series.pct_change(_MOMENTUM_PERIOD) * 100
-        mom_val = float(mom_series.iloc[-1])
-        momentum = 0.0 if np.isnan(mom_val) else mom_val
-
-        # ADX / ATR: require matching highs and lows series
-        if highs is not None and lows is not None and len(highs) >= _ATR_PERIOD + 1:
-            adx, atr = self._compute_adx_atr(highs, lows, prices)
-        else:
-            adx, atr = _ADX_NEUTRAL_DEFAULT, 0.0  # neutral defaults when OHLCV unavailable
-
-        return [rsi, sma_ratio, volatility, momentum, adx, atr]
+        if highs is None or lows is None:
+            highs = prices
+            lows = prices
+        vec = compute_quant_vector_from_lists(prices, highs, lows, volumes)
+        if vec is None:
+            return None
+        return vec
 
     # ------------------------------------------------------------------
     # Training / warm-start
@@ -327,105 +282,33 @@ class MLPredictor:
         highs: list[float] | None = None,
         lows: list[float] | None = None,
         obi_ratios: list[float] | None = None,
+        volumes: list[float] | None = None,
         horizon: int = _PREDICTION_HORIZON,
     ) -> bool:
-        """Train (or re-train) the model from historical price data.
-
-        This method is idempotent – calling it multiple times is safe and will
-        simply replace the previously fitted model.
-
-        Parameters
-        ----------
-        prices:           Historical mid/close-prices in chronological order.
-        sentiment_scores: Ignored (API compatibility).
-        highs:            Optional high prices per tick (for ADX/ATR features).
-                          When ``None``, ADX defaults to 25.0 and ATR to 0.0.
-        lows:             Optional low prices per tick (for ADX/ATR features).
-                          When ``None``, ADX defaults to 25.0 and ATR to 0.0.
-        obi_ratios:       Ignored (API compatibility).
-        horizon:          Number of ticks ahead to use as the prediction target.
-
-        Returns
-        -------
-        ``True`` on success, ``False`` when there is insufficient data to
-        produce at least 10 labelled training samples.
-        """
+        """Train from OHLC(V); labels match sweep (forward return vs round-trip cost)."""
         del sentiment_scores, obi_ratios
-        series = pd.Series(prices, dtype=float)
-
-        # Compute all indicators across the full price history
-        sma_20 = series.rolling(_SMA_PERIOD).mean()
-        vol_series = series.rolling(_SMA_PERIOD).std()
-
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
-        avg_loss = loss.ewm(com=_RSI_PERIOD - 1, min_periods=_RSI_PERIOD).mean()
-        rs = avg_gain / avg_loss
-        rsi_series = (100 - (100 / (1 + rs))).fillna(50.0)
-
-        mom_series = series.pct_change(_MOMENTUM_PERIOD) * 100
-        sma_ratio_series = series / sma_20
-
-        # ADX / ATR series (row-by-row computation for the full history)
-        if highs is not None and lows is not None and len(highs) == len(prices):
-            h_series = pd.Series(highs, dtype=float)
-            l_series = pd.Series(lows, dtype=float)
-            prev_c = series.shift(1)
-
-            tr = pd.concat(
-                [h_series - l_series,
-                 (h_series - prev_c).abs(),
-                 (l_series - prev_c).abs()],
-                axis=1,
-            ).max(axis=1)
-
-            up_move = h_series - h_series.shift(1)
-            down_move = l_series.shift(1) - l_series
-            plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-            minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-
-            smth_atr = tr.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean()
-            smth_pdm = plus_dm.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean()
-            smth_mdm = minus_dm.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean()
-
-            safe_atr = smth_atr.replace(0.0, np.nan)
-            plus_di = 100 * smth_pdm / safe_atr
-            minus_di = 100 * smth_mdm / safe_atr
-            di_sum = plus_di + minus_di
-            dx = (100 * (plus_di - minus_di).abs() / di_sum.replace(0.0, np.nan)).fillna(0.0)
-            adx_series = dx.ewm(com=_ADX_PERIOD - 1, min_periods=_ADX_PERIOD).mean().fillna(_ADX_NEUTRAL_DEFAULT)
-            atr_series = smth_atr.fillna(0.0)
-        else:
-            adx_series = pd.Series(25.0, index=series.index)
-            atr_series = pd.Series(0.0, index=series.index)
+        n = len(prices)
+        if highs is None:
+            highs = list(prices)
+        if lows is None:
+            lows = list(prices)
+        vol = volumes if volumes is not None and len(volumes) == n else [0.0] * n
 
         df = pd.DataFrame(
             {
-                "rsi": rsi_series,
-                "sma_ratio": sma_ratio_series,
-                "volatility": vol_series,
-                "momentum": mom_series,
-                "adx": adx_series,
-                "atr": atr_series,
-                "price": series,
+                "open": prices,
+                "high": highs,
+                "low": lows,
+                "close": prices,
+                "volume": vol[:n],
             }
         )
+        feat = add_quant_features(df)
+        feat["label"] = forward_return_label(feat["close"], horizon, _LABEL_ROUND_TRIP)
+        feat = feat.dropna(subset=_FEATURE_COLS + ["label"])
 
-        # Fill NaN from rolling warm-up with 0
-        df[["sma_ratio", "volatility", "momentum"]] = df[
-            ["sma_ratio", "volatility", "momentum"]
-        ].fillna(0.0)
-
-        # Label: 1 if price rises after `horizon` ticks, else 0
-        df["label"] = (series.shift(-horizon) > series).astype(int)
-
-        # Drop rows without a future label (last `horizon` rows)
-        df = df.dropna(subset=["label"])
-
-        X = df[_FEATURE_COLS]
-        y = df["label"]
+        X = feat[_FEATURE_COLS]
+        y = feat["label"]
 
         if len(X) < 10:
             logger.warning(
@@ -437,7 +320,7 @@ class MLPredictor:
         self._model.fit(X, y)
         self._is_trained = True
         logger.info(
-            "MLPredictor warm-started on %d samples (%d features).",
+            "MLPredictor warm-started on %d samples (%d quant features).",
             len(X),
             X.shape[1],
         )
@@ -448,18 +331,18 @@ class MLPredictor:
     # ------------------------------------------------------------------
 
     def load_model(self, filepath: str | Path | None = None) -> bool:
-        """Attach the dedicated INJ/USDT artefact (cached). *filepath* is ignored."""
-        _ = filepath
+        """Load XGB JSON from *filepath* or default ``_INJ_MODEL_PATH``."""
+        path = Path(filepath) if filepath else _INJ_MODEL_PATH
         try:
-            self._model = load_model()
+            self._model = load_booster_from_disk(path)
             self._is_trained = True
-            logger.info("MLPredictor loaded dedicated model from %s.", _INJ_MODEL_PATH)
+            logger.info("MLPredictor loaded model from %s.", path)
             return True
         except FileNotFoundError:
-            logger.info("load_model: file not found at %s.", _INJ_MODEL_PATH)
+            logger.info("load_model: file not found at %s.", path)
             return False
         except Exception as exc:  # noqa: BLE001
-            logger.warning("load_model failed (%s): %s", _INJ_MODEL_PATH, exc)
+            logger.warning("load_model failed (%s): %s", path, exc)
             return False
 
     def save_model(self, filepath: str | Path) -> bool:
@@ -498,6 +381,7 @@ class MLPredictor:
         highs: list[float] | None = None,
         lows: list[float] | None = None,
         obi_ratio: float = 1.0,
+        volumes: list[float] | None = None,
         *,
         symbol: str | None = None,
     ) -> float | None:
@@ -533,7 +417,11 @@ class MLPredictor:
             )
             return None
 
-        features = self._compute_features(prices, sentiment_score, highs, lows, obi_ratio)
+        features = self._compute_features(
+            prices, sentiment_score, highs, lows, obi_ratio, volumes=volumes
+        )
+        if features is None:
+            return None
         X = pd.DataFrame([features], columns=_FEATURE_COLS)
         try:
             proba: float = float(self._model.predict_proba(X)[0][1])
@@ -545,19 +433,12 @@ class MLPredictor:
             )
             return None
 
-        rsi = features[0]
-        volatility = features[2]
-        momentum = features[3]
-        adx = features[4]
-        atr = features[5]
         logger.debug(
-            "[INDICATORS] RSI: %.1f | Volatility: %.4f | Momentum: %.1f%% | "
-            "ADX: %.1f | ATR: %.4f",
-            rsi,
-            volatility,
-            momentum,
-            adx,
-            atr,
+            "[QUANT_FEAT] rsi=%.2f macd_hist=%.6f atr=%.6f bb_pct_b=%.3f",
+            features[0],
+            features[3],
+            features[4],
+            features[5],
         )
         logger.debug("Predicted probability=%.4f", proba)
         return proba
@@ -572,6 +453,7 @@ class MLPredictor:
         funding_rate: float = 0.0,
         htf_trend_4h: TrendStatus = HTF_TREND_NEUTRAL,
         htf_trend_1h: TrendStatus = HTF_TREND_NEUTRAL,
+        volumes: list[float] | None = None,
         *,
         symbol: str = "INJ/USDT",
     ) -> Signal:
@@ -582,7 +464,13 @@ class MLPredictor:
             return "HOLD"
 
         probability = self.predict_proba(
-            prices, sentiment_score, highs, lows, obi_ratio, symbol=symbol
+            prices,
+            sentiment_score,
+            highs,
+            lows,
+            obi_ratio,
+            volumes=volumes,
+            symbol=symbol,
         )
 
         if probability is None:

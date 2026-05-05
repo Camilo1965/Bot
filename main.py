@@ -134,10 +134,10 @@ def _check_env() -> None:
 _check_env()
 _apply_safe_env_defaults()
 
-# INJ/USDT only — must exist in MT5 Market Watch (see SYMBOL_MAP).
-WATCHLIST: list[str] = ["INJ/USDT"]
+# DOGE/USDT (quant_sweep winner) — must exist in MT5 Market Watch (see SYMBOL_MAP).
+WATCHLIST: list[str] = ["DOGE/USDT"]
 
-_MODEL_PATH = Path(__file__).parent / "models" / "INJ_USDT.json"
+_MODEL_PATH = Path(__file__).parent / "models" / "DOGE_USDT_v1.json"
 _REPO_ROOT = Path(__file__).resolve().parent
 
 # Set once per process in :func:`setup_logging` — also embedded in JSON lines.
@@ -402,6 +402,7 @@ async def main() -> None:
         # [ELITE] OHLCV buffers for ADX / ATR computation
         "highs": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         "lows": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
+        "volumes": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         # [ATR] Latest ATR_14 value per symbol (updated each signal cycle; None = not yet computed)
         "atrs": {symbol: None for symbol in WATCHLIST},
         # [ELITE] Latest Order Book Imbalance ratio per symbol

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -42,6 +43,10 @@ async def market_consumer(
             state["last_kline_ts"][sym] = kline_ts
             state["highs"][sym].append(msg["high"])
             state["lows"][sym].append(msg["low"])
+            vol_deques = state.setdefault("volumes", {})
+            if sym not in vol_deques:
+                vol_deques[sym] = collections.deque(maxlen=1000)
+            vol_deques[sym].append(float(msg.get("volume", 0.0) or 0.0))
             
             if "timeframe" in msg and "close" in msg:
                 tf = msg["timeframe"]

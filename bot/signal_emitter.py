@@ -11,6 +11,7 @@ from bot.constants import DEBUG_LOG_HINT
 from database.db_manager import db
 from execution.paper_executor import PaperExecutor
 from strategy.feature_engineer import FeatureEngineer
+from strategy.quant_features import MIN_OHLC_ROWS
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor
 
 
@@ -29,17 +30,19 @@ async def signal_emitter(
         for symbol in watchlist:
             prices: list[float] = list(state["prices"].get(symbol, []))
 
-            if len(prices) < 50:
+            if len(prices) < MIN_OHLC_ROWS:
                 logger.debug(
-                    "⏳ [AI WARMUP] %s – Recopilando datos... (%d/50 ticks necesarios)",
+                    "⏳ [AI WARMUP] %s – Recopilando datos... (%d/%d barras necesarias)",
                     symbol,
                     len(prices),
+                    MIN_OHLC_ROWS,
                 )
                 continue
 
             # [ELITE] Gather regime and funding inputs
             highs: list[float] = list(state.get("highs", {}).get(symbol, []))
             lows: list[float] = list(state.get("lows", {}).get(symbol, []))
+            volumes: list[float] = list(state.get("volumes", {}).get(symbol, []))
             obi_ratio: float = state.get("obi_ratios", {}).get(symbol, 1.0)
             funding_rate: float = state.get("funding_rates", {}).get(symbol, 0.0)
 
@@ -60,6 +63,7 @@ async def signal_emitter(
                 lows=lows or None,
                 obi_ratio=obi_ratio,
                 funding_rate=funding_rate,
+                volumes=volumes or None,
                 symbol=symbol,
             )
             state["ml_signals"][symbol] = signal
@@ -69,6 +73,7 @@ async def signal_emitter(
                 highs=highs or None,
                 lows=lows or None,
                 obi_ratio=obi_ratio,
+                volumes=volumes or None,
                 symbol=symbol,
             ) or 0.0
 

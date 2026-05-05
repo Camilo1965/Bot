@@ -137,12 +137,17 @@ SYMBOL_MAP: dict[str, str] = {
     "BTC/USDT":    "BTCUSD-T",
     "ETH/USDT":    "ETHUSD-T",
     "SOL/USDT":    "SOLUSD-T",
+    "XRP/USDT":    "XRPUSD-T",
+    "ADA/USDT":    "ADAUSD-T",
+    "AVAX/USDT":   "AVAXUSD-T",
+    "DOT/USDT":    "DOTUSD-T",
+    "BCH/USDT":    "BCHUSD-T",
     "BNB/USDT":    "BNBUSD-T",
     "LINK/USDT":   "LINKUSD-T",
     "INJ/USDT":    "INJUSD-T",
     "FET/USDT":    "FETUSD-T",
     "RENDER/USDT": "RENDERUSD-T",
-    "DOGE/USDT":   "DOGEUSD-T",
+    "DOGE/USDT":   "DGEUSD-T",
     "PEPE/USDT":   "PEPEUSD-T",
     # Raw MT5 base names (pass-through for code that already normalises)
     "BTCUSD":      "BTCUSD-T",
@@ -153,7 +158,7 @@ SYMBOL_MAP: dict[str, str] = {
     "INJUSD":      "INJUSD-T",
     "FETUSD":      "FETUSD-T",
     "RENDERUSD":   "RENDERUSD-T",
-    "DOGEUSD":     "DOGEUSD-T",
+    "DOGEUSD":     "DGEUSD-T",
     "PEPEUSD":     "PEPEUSD-T",
 }
 
