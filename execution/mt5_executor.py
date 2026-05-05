@@ -559,7 +559,7 @@ class MT5Executor(PaperExecutor):
         deviation: int = 20,
     ) -> None:
         # Pass exchange=None so the parent class skips its Binance code paths.
-        super().__init__(db=db, risk_manager=risk_manager, symbol=symbol, exchange=None)
+        super().__init__(db=db, risk_manager=risk_manager, exchange=None)
         self._live = live
         self._magic = magic
         self._deviation = deviation
