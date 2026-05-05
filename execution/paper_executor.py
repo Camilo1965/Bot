@@ -68,6 +68,15 @@ class OpenPosition:
     trailing_stop_active: bool = False
     ml_confidence: float = 0.0
 
+    @property
+    def current_stop_loss(self) -> float:
+        """Alias for sl_price to maintain Dashboard compatibility."""
+        return self.sl_price
+
+def compute_dynamic_tp_hint(pos: OpenPosition) -> float | None:
+    """Helper for dashboard rendering."""
+    return None
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["entry_time"] = self.entry_time.isoformat()
