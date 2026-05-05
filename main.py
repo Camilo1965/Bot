@@ -37,6 +37,17 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+try:
+    from utils.env_bootstrap import load_env_file
+
+    load_env_file(_ROOT / ".env")
+except Exception:
+    pass
+logging.getLogger("dotenv.main").setLevel(logging.ERROR)
+
 from rich.console import Console
 from rich.live import Live
 from rich.logging import RichHandler
@@ -70,7 +81,6 @@ from execution.paper_executor import PaperExecutor
 from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor
 from utils.diagnostic_bundle import write_diagnostic_bundle
-from utils.env_bootstrap import load_env_file
 from utils.runtime_snapshot import runtime_metrics_loop, write_startup_snapshot
 from utils.telegram_notifier import (
     install_asyncio_critical_telegram_alerts,
@@ -79,8 +89,6 @@ from utils.telegram_notifier import (
     send_telegram_alert,
     telegram_command_poller,
 )
-
-load_env_file(Path(__file__).resolve().parent / ".env")
 
 # ── ANSI colour helpers (no extra dependency) ─────────────────────────────────
 _YELLOW = "\033[33m"
@@ -138,7 +146,7 @@ _apply_safe_env_defaults()
 WATCHLIST: list[str] = ["DOGE/USDT"]
 
 _MODEL_PATH = Path(__file__).parent / "models" / "DOGE_USDT_v1.json"
-_REPO_ROOT = Path(__file__).resolve().parent
+_REPO_ROOT = _ROOT
 
 # Set once per process in :func:`setup_logging` — also embedded in JSON lines.
 _LOG_SESSION_ID: str = ""

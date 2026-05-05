@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
+from asyncpg.exceptions import UniqueViolationError
 
 logger = logging.getLogger(__name__)
 
@@ -106,13 +107,22 @@ CREATE TABLE IF NOT EXISTS htf_trend (
 
 _CREATE_HYPERTABLE_HTF = "SELECT create_hypertable('htf_trend', 'timestamp', if_not_exists => TRUE);"
 
-_INSERT_MARKET = "INSERT INTO market_data (timestamp, symbol, open, high, low, close, volume) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING;"
 _INSERT_PRED = "INSERT INTO ml_predictions (timestamp, symbol, confidence, side) VALUES ($1, $2, $3, $4);"
 _UPSERT_HTF = "INSERT INTO htf_trend (timestamp, symbol, timeframe, trend_status) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING;"
 
 class DatabaseManager:
     def __init__(self) -> None:
         self._pool: asyncpg.Pool | None = None
+        self._market_cols: frozenset[str] | None = None
+
+    async def _refresh_market_columns(self, conn: asyncpg.Connection) -> None:
+        rows = await conn.fetch(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'market_data'
+            """
+        )
+        self._market_cols = frozenset(str(r["column_name"]) for r in rows)
 
     async def connect(self) -> None:
         dsn = os.environ.get("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/postgres")
@@ -144,6 +154,7 @@ class DatabaseManager:
             await conn.execute(_CREATE_HTF_TREND)
             try: await conn.execute(_CREATE_HYPERTABLE_HTF)
             except Exception: pass
+            await self._refresh_market_columns(conn)
         logger.info("Database schema initialised.")
 
     @staticmethod
@@ -167,10 +178,48 @@ class DatabaseManager:
         close: float,
         volume: float,
     ) -> None:
-        if not self._pool: return
+        """Insert kline row; fills ``best_bid``/``best_ask`` when present (legacy tick NOT NULL)."""
+        if not self._pool:
+            return
         b = self._to_timestamptz(bucket)
+        row: dict[str, Any] = {
+            "timestamp": b,
+            "symbol": symbol,
+            "open": open,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            # Quote bracket for the bar — satisfies tick-schema NOT NULL without inventing spread:
+            "best_bid": float(low),
+            "best_ask": float(high),
+        }
+        order = (
+            "timestamp",
+            "symbol",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "best_bid",
+            "best_ask",
+        )
         async with self._pool.acquire() as conn:
-            await conn.execute(_INSERT_MARKET, b, symbol, open, high, low, close, volume)
+            if not self._market_cols:
+                await self._refresh_market_columns(conn)
+            cols = self._market_cols or frozenset()
+            keys = [k for k in order if k in cols]
+            if "timestamp" not in keys or "symbol" not in keys:
+                logger.warning("market_data missing timestamp/symbol — skip insert")
+                return
+            vals = [row[k] for k in keys]
+            placeholders = ", ".join(f"${i + 1}" for i in range(len(keys)))
+            stmt = f"INSERT INTO market_data ({', '.join(keys)}) VALUES ({placeholders})"
+            try:
+                await conn.execute(stmt, *vals)
+            except UniqueViolationError:
+                pass
 
     async def fetch_market_data(self, symbol: str, limit: int = 1000) -> list[float]:
         if not self._pool: return []

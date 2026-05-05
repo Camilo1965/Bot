@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from io import StringIO
 from pathlib import Path
@@ -32,3 +33,4 @@ def load_env_file(path: Path, *, override: bool = False) -> None:
             continue
         if override or os.getenv(key) is None:
             os.environ[key] = val
+    logging.getLogger("dotenv.main").setLevel(logging.ERROR)
