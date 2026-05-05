@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from asyncpg.exceptions import UniqueViolationError
@@ -109,6 +110,17 @@ _CREATE_HYPERTABLE_HTF = "SELECT create_hypertable('htf_trend', 'timestamp', if_
 
 _INSERT_PRED = "INSERT INTO ml_predictions (timestamp, symbol, confidence, side) VALUES ($1, $2, $3, $4);"
 _UPSERT_HTF = "INSERT INTO htf_trend (timestamp, symbol, timeframe, trend_status) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING;"
+
+_EMPTY_PERIOD_SUMMARY: dict[str, Any] = {
+    "pnl_total": 0.0,
+    "total_trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "winrate": 0.0,
+    "profit_factor": 0.0,
+    "best_trade": None,
+    "worst_trade": None,
+}
 
 class DatabaseManager:
     def __init__(self) -> None:
@@ -249,6 +261,215 @@ class DatabaseManager:
         ts = datetime.now(tz=timezone.utc)
         async with self._pool.acquire() as conn:
             await conn.execute(_UPSERT_HTF, ts, symbol, timeframe, trend_status)
+
+    # ── CEO / Telegram: closed-trade analytics (expects ``trades_history``) ─────────
+
+    @staticmethod
+    async def _trade_column_triplet(conn: asyncpg.Connection) -> tuple[str, str, str, str] | None:
+        rows = await conn.fetch(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'trades_history'
+            """
+        )
+        if not rows:
+            return None
+        names = {str(r["column_name"]) for r in rows}
+        pnl_c = next((c for c in ("pnl", "net_pnl", "pnl_usdt", "gross_pnl") if c in names), None)
+        exit_c = next((c for c in ("exit_time", "closed_at", "close_time") if c in names), None)
+        sym_c = "symbol" if "symbol" in names else None
+        if not pnl_c or not exit_c or not sym_c:
+            return None
+        st_c = "status" if "status" in names else ""
+        return (pnl_c, exit_c, sym_c, st_c)
+
+    @staticmethod
+    def _period_start_utc(period: str, tz_name: str) -> datetime:
+        tz = ZoneInfo(tz_name)
+        now_local = datetime.now(tz=tz)
+        if period == "day":
+            start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == "month":
+            start_local = now_local - timedelta(days=30)
+        else:
+            start_local = now_local - timedelta(days=7)
+        return start_local.astimezone(timezone.utc)
+
+    async def fetch_period_summary(self, period: str, *, tz_name: str = "UTC") -> dict[str, Any]:
+        """Aggregate closed trades for CEO dashboard / Telegram reports."""
+        if not self._pool:
+            return dict(_EMPTY_PERIOD_SUMMARY)
+        end_utc = datetime.now(tz=timezone.utc)
+        start_utc = self._period_start_utc(period, tz_name)
+        try:
+            async with self._pool.acquire() as conn:
+                meta = await self._trade_column_triplet(conn)
+                if meta is None:
+                    return dict(_EMPTY_PERIOD_SUMMARY)
+                pnl_c, exit_c, sym_c, st_c = meta
+                st_sql = f'"{st_c}" = \'closed\'' if st_c else "TRUE"
+                q_agg = f"""
+                    SELECT
+                      COALESCE(SUM("{pnl_c}"), 0.0) AS pnl_total,
+                      COUNT(*)::bigint AS total_trades,
+                      COALESCE(SUM(CASE WHEN "{pnl_c}" > 0 THEN 1 ELSE 0 END), 0)::bigint AS wins,
+                      COALESCE(SUM(CASE WHEN "{pnl_c}" < 0 THEN 1 ELSE 0 END), 0)::bigint AS losses,
+                      COALESCE(SUM(CASE WHEN "{pnl_c}" > 0 THEN "{pnl_c}" ELSE 0 END), 0.0) AS gross_win,
+                      COALESCE(SUM(CASE WHEN "{pnl_c}" < 0 THEN "{pnl_c}" ELSE 0 END), 0.0) AS gross_loss
+                    FROM trades_history
+                    WHERE {st_sql}
+                      AND "{exit_c}" >= $1 AND "{exit_c}" <= $2
+                """
+                row = await conn.fetchrow(q_agg, start_utc, end_utc)
+                if row is None:
+                    return dict(_EMPTY_PERIOD_SUMMARY)
+                total = int(row["total_trades"] or 0)
+                wins = int(row["wins"] or 0)
+                losses = int(row["losses"] or 0)
+                winrate = (100.0 * wins / total) if total > 0 else 0.0
+                gw = float(row["gross_win"] or 0.0)
+                gl = float(row["gross_loss"] or 0.0)
+                if gl < 0 and gw > 0:
+                    pf = gw / abs(gl)
+                elif total > 0 and losses == 0 and wins > 0:
+                    pf = float("inf")
+                else:
+                    pf = 0.0
+                if pf == float("inf"):
+                    pf = 999.99
+
+                q_best = f"""
+                    SELECT "{sym_c}" AS symbol, "{pnl_c}" AS pnl FROM trades_history
+                    WHERE {st_sql} AND "{exit_c}" >= $1 AND "{exit_c}" <= $2
+                    ORDER BY "{pnl_c}" DESC NULLS LAST LIMIT 1
+                """
+                q_worst = f"""
+                    SELECT "{sym_c}" AS symbol, "{pnl_c}" AS pnl FROM trades_history
+                    WHERE {st_sql} AND "{exit_c}" >= $1 AND "{exit_c}" <= $2
+                    ORDER BY "{pnl_c}" ASC NULLS LAST LIMIT 1
+                """
+                br = await conn.fetchrow(q_best, start_utc, end_utc)
+                wr = await conn.fetchrow(q_worst, start_utc, end_utc)
+                best_trade = (
+                    {"symbol": str(br["symbol"]), "pnl": float(br["pnl"])}
+                    if br and br["symbol"] is not None
+                    else None
+                )
+                worst_trade = (
+                    {"symbol": str(wr["symbol"]), "pnl": float(wr["pnl"])}
+                    if wr and wr["symbol"] is not None
+                    else None
+                )
+
+                return {
+                    "pnl_total": float(row["pnl_total"] or 0.0),
+                    "total_trades": total,
+                    "wins": wins,
+                    "losses": losses,
+                    "winrate": winrate,
+                    "profit_factor": float(pf),
+                    "best_trade": best_trade,
+                    "worst_trade": worst_trade,
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fetch_period_summary failed: %s", exc)
+            return dict(_EMPTY_PERIOD_SUMMARY)
+
+    async def fetch_symbol_performance(self, period: str, *, tz_name: str = "UTC") -> list[dict[str, Any]]:
+        """Per-symbol realised PnL (rolling window matches CEO ``month`` = 30d)."""
+        if not self._pool:
+            return []
+        end_utc = datetime.now(tz=timezone.utc)
+        start_utc = self._period_start_utc("month" if period == "month" else "week", tz_name)
+        try:
+            async with self._pool.acquire() as conn:
+                meta = await self._trade_column_triplet(conn)
+                if meta is None:
+                    return []
+                pnl_c, exit_c, sym_c, st_c = meta
+                st_sql = f'"{st_c}" = \'closed\'' if st_c else "TRUE"
+                q = f"""
+                    SELECT "{sym_c}" AS symbol, COALESCE(SUM("{pnl_c}"), 0.0) AS pnl_total
+                    FROM trades_history
+                    WHERE {st_sql}
+                      AND "{exit_c}" >= $1 AND "{exit_c}" <= $2
+                    GROUP BY "{sym_c}"
+                    ORDER BY pnl_total DESC
+                """
+                rows = await conn.fetch(q, start_utc, end_utc)
+                return [{"symbol": str(r["symbol"]), "pnl_total": float(r["pnl_total"])} for r in rows]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fetch_symbol_performance failed: %s", exc)
+            return []
+
+    async def fetch_recent_closed_trades(self, limit: int = 250) -> list[dict[str, Any]]:
+        """Latest closed trades for CEO table."""
+        if not self._pool:
+            return []
+        lim = max(1, min(int(limit), 500))
+        try:
+            async with self._pool.acquire() as conn:
+                meta = await self._trade_column_triplet(conn)
+                if meta is None:
+                    return []
+                pnl_c, exit_c, sym_c, st_c = meta
+                st_sql = f'"{st_c}" = \'closed\'' if st_c else "TRUE"
+                q = f"""
+                    SELECT "{sym_c}" AS symbol, "{exit_c}" AS exit_time,
+                           "{pnl_c}" AS pnl, "{pnl_c}" AS pnl_net
+                    FROM trades_history
+                    WHERE {st_sql}
+                    ORDER BY "{exit_c}" DESC NULLS LAST
+                    LIMIT $1
+                """
+                rows = await conn.fetch(q, lim)
+                out: list[dict[str, Any]] = []
+                for r in rows:
+                    out.append(
+                        {
+                            "symbol": r["symbol"],
+                            "exit_time": r["exit_time"],
+                            "pnl": r["pnl"],
+                            "pnl_net": r["pnl_net"],
+                        }
+                    )
+                return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fetch_recent_closed_trades failed: %s", exc)
+            return []
+
+    async def fetch_daily_pnl_series(self, *, days: int, tz_name: str = "UTC") -> list[dict[str, Any]]:
+        """Calendar-ish daily totals for Telegram history report."""
+        if not self._pool:
+            return []
+        n = max(1, min(int(days), 366))
+        try:
+            async with self._pool.acquire() as conn:
+                meta = await self._trade_column_triplet(conn)
+                if meta is None:
+                    return []
+                pnl_c, exit_c, _, st_c = meta
+                st_sql = f'"{st_c}" = \'closed\'' if st_c else "TRUE"
+                q = f"""
+                    SELECT date_trunc('day', "{exit_c}" AT TIME ZONE 'UTC')::date AS day_utc,
+                           COALESCE(SUM("{pnl_c}"), 0.0) AS pnl_total
+                    FROM trades_history
+                    WHERE {st_sql}
+                      AND "{exit_c}" >= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' - $1::interval)
+                    GROUP BY 1
+                    ORDER BY 1 ASC
+                """
+                rows = await conn.fetch(q, timedelta(days=n))
+                return [
+                    {
+                        "day_utc": r["day_utc"].isoformat() if r["day_utc"] is not None else "",
+                        "pnl_total": float(r["pnl_total"] or 0.0),
+                    }
+                    for r in rows
+                ]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fetch_daily_pnl_series failed: %s", exc)
+            return []
 
 db = DatabaseManager()
 async def init_db() -> None: await db.connect(); await db.initialize()
