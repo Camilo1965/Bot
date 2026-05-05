@@ -80,7 +80,8 @@ from utils.telegram_notifier import (
     telegram_command_poller,
 )
 
-load_dotenv()
+# UTF-8 BOM tolerated; if .env was saved as UTF-16 in Notepad, re-save as UTF-8.
+load_dotenv(Path(__file__).resolve().parent / ".env", encoding="utf-8-sig")
 
 # ── ANSI colour helpers (no extra dependency) ─────────────────────────────────
 _YELLOW = "\033[33m"
