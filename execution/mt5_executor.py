@@ -565,6 +565,7 @@ class MT5Executor(PaperExecutor):
     ) -> None:
         # Pass exchange=None so the parent class skips its Binance code paths.
         super().__init__(db=db, risk_manager=risk_manager, exchange=None)
+        self._positions_lock = asyncio.Lock()
         self._live = live
         self._magic = magic
         self._deviation = deviation

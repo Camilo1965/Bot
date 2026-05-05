@@ -78,19 +78,20 @@ class OpenPosition:
         """Alias for sl_price to maintain Dashboard compatibility."""
         return self.sl_price
 
-def compute_dynamic_tp_hint(pos: OpenPosition) -> float | None:
-    """Helper for dashboard rendering."""
-    return None
-
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["entry_time"] = self.entry_time.isoformat()
         return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> OpenPosition:
+    def from_dict(cls, d: dict[str, Any]) -> "OpenPosition":
         d["entry_time"] = datetime.fromisoformat(d["entry_time"])
         return cls(**d)
+
+
+def compute_dynamic_tp_hint(pos: OpenPosition) -> float | None:
+    """Helper for dashboard rendering."""
+    return None
 
 
 class PaperExecutor:
@@ -104,6 +105,7 @@ class PaperExecutor:
     ) -> None:
         self._db = db
         self._risk = risk_manager
+        self._exchange = exchange
         self.open_positions: dict[str, OpenPosition] = {}
         self.total_pnl: float = 0.0
         self._state_file = Path("logs/state.json")

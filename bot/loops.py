@@ -161,8 +161,9 @@ async def position_sync_loop(
     never occupies a task slot needlessly.
     """
     is_live_mt5 = isinstance(paper_executor, MT5Executor) and paper_executor._live
-    if paper_executor._exchange is None and not is_live_mt5:
-        return  # Nothing to sync in pure paper-trading mode.
+    has_exchange = getattr(paper_executor, "_exchange", None) is not None
+    if not has_exchange and not is_live_mt5:
+        return  # Nothing to sync in pure paper-trading mode (no REST exchange).
 
     logger = logging.getLogger("clawdbot.sync")
     while True:
