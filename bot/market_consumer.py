@@ -23,7 +23,27 @@ async def market_consumer(
         msg = await queue.get()
         _count += 1
         sym = msg["symbol"]
-        price = msg["price"]
+        # MT5 feed emits trade (price), order_book (bids/asks), kline (OHLC) — not all have "price".
+        mtype = msg.get("type", "trade")
+        if mtype == "kline":
+            price = float(msg.get("close") or msg.get("open") or 0.0)
+        elif mtype == "order_book":
+            bids = msg.get("bids") or []
+            asks = msg.get("asks") or []
+            if bids and asks:
+                price = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+            else:
+                queue.task_done()
+                continue
+        elif "price" in msg:
+            price = float(msg["price"])
+        else:
+            queue.task_done()
+            continue
+
+        if price <= 0.0:
+            queue.task_done()
+            continue
 
         # Update last price in state
         state["prices"][sym].append(price)
@@ -37,24 +57,38 @@ async def market_consumer(
                 "mid": price,
             }
 
-        # [ELITE] Deduplicate and append to OHLCV buffers
-        kline_ts = msg.get("timestamp")
-        if kline_ts and kline_ts != state["last_kline_ts"].get(sym):
-            state["last_kline_ts"][sym] = kline_ts
-            state["highs"][sym].append(msg["high"])
-            state["lows"][sym].append(msg["low"])
+        # Tick streams have no OHLC — mirror mid into high/low so buffers stay aligned with prices for ATR/ML.
+        if mtype in ("trade", "order_book"):
+            state["highs"][sym].append(price)
+            state["lows"][sym].append(price)
             vol_deques = state.setdefault("volumes", {})
             if sym not in vol_deques:
                 vol_deques[sym] = collections.deque(maxlen=1000)
             vol_deques[sym].append(float(msg.get("volume", 0.0) or 0.0))
-            
+
+        # New closed candle: only kline messages carry OHLC; ticks must not write bogus highs/lows.
+        kline_ts = msg.get("timestamp")
+        if (
+            mtype == "kline"
+            and kline_ts
+            and kline_ts != state["last_kline_ts"].get(sym)
+            and "high" in msg
+            and "low" in msg
+        ):
+            state["last_kline_ts"][sym] = kline_ts
+            state["highs"][sym].append(float(msg["high"]))
+            state["lows"][sym].append(float(msg["low"]))
+            vol_deques = state.setdefault("volumes", {})
+            if sym not in vol_deques:
+                vol_deques[sym] = collections.deque(maxlen=1000)
+            vol_deques[sym].append(float(msg.get("volume", 0.0) or 0.0))
+
             if "timeframe" in msg and "close" in msg:
                 tf = msg["timeframe"]
                 if tf in ("1h", "4h"):
                     state["htf_closes"][sym][tf].append(msg["close"])
                     state["htf_opens"][sym][tf].append(msg["open"])
 
-            # Persist to DB
             try:
                 await db.insert_market_data(
                     bucket=kline_ts,
