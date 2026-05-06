@@ -214,8 +214,8 @@ class _ConsoleFormatter(logging.Formatter):
     """
 
     _LEVEL_COLORS: dict[int, str] = {
-        logging.DEBUG:    _RESET,
-        logging.INFO:     _RESET,
+        logging.DEBUG:    "",
+        logging.INFO:     "",
         logging.WARNING:  _YELLOW,
         logging.ERROR:    _RED + _BOLD,
         logging.CRITICAL: _RED + _BOLD,
@@ -235,6 +235,9 @@ class _ConsoleFormatter(logging.Formatter):
         msg = record.getMessage()
         if record.exc_info:
             msg += "\n" + self.formatException(record.exc_info)
+        # INFO/DEBUG: sin ANSI — en PowerShell sin VT, \033[0m se ve como "←[0m".
+        if record.levelno <= logging.INFO:
+            return f"{ts} | {msg}"
         return f"{color}{ts} | {msg}{_RESET}"
 
 
