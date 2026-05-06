@@ -74,7 +74,7 @@ TRAILING_DISTANCE: float = 0.02    # 2.0 % trailing gap from peak once active
 
 # ── Futures / leverage parameters ─────────────────────────────────────────────
 LEVERAGE: int = 5                   # 5× futures leverage
-RISK_PER_TRADE: float = _float_env("RISK_PER_TRADE", 0.025)  # default 2.5 % (aggressive profile)
+RISK_PER_TRADE: float = _float_env("RISK_PER_TRADE", 0.05)  # default 5 % (max-performance profile)
 
 # ── Daily-loss safety break ───────────────────────────────────────────────────
 MAX_DAILY_LOSS_PCT: float = 0.03    # 3 % maximum daily loss before halting

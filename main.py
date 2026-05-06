@@ -6,7 +6,7 @@ Runs an MT5 market-data poller (ticks + multi-timeframe candles).  OHLC
 snapshots are persisted to TimescaleDB.
 
 A dedicated XGBoost model emits BUY / HOLD from probability ≥ ``BUY_PROB_THRESHOLD``
-(default 0.60 aggressive profile; ``BUY_PROB_THRESHOLD`` env); no external sentiment gates.
+(default 0.50 max-performance profile; ``BUY_PROB_THRESHOLD`` env); no external sentiment gates.
 
 When the signal is BUY the :class:`~risk.risk_manager.RiskManager` sizes the
 position using a **fixed fractional** rule (``balance × RISK_PER_TRADE ×
@@ -140,7 +140,7 @@ def _apply_safe_env_defaults() -> None:
         )
     if not os.environ.get("BUY_PROB_THRESHOLD", "").strip():
         print(
-            "[ENV] BUY_PROB_THRESHOLD not set; using model default 0.60 "
+            "[ENV] BUY_PROB_THRESHOLD not set; using model default 0.50 "
             "(strategy/ml_predictor.py).",
             file=sys.stderr,
         )
@@ -744,6 +744,12 @@ async def main() -> None:
         "🔍 [AUDIT] UI coherence: COMPRAR/BUY only when "
         "ml_signals[symbol]==BUY and prob≥%.2f.",
         BUY_PROB_THRESHOLD,
+    )
+    logger.warning(
+        "[RIESGO] Perfil validado máx. rend. (prob 0.50 / risk 5%% equity): "
+        "en backtest DOGE/USDT 15m ~MaxDD 25%% — valores activos prob≥%.2f risk=%.1f%%.",
+        BUY_PROB_THRESHOLD,
+        RISK_PER_TRADE * 100.0,
     )
 
     try:

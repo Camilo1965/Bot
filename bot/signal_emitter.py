@@ -14,7 +14,7 @@ from strategy.feature_engineer import FeatureEngineer
 from strategy.quant_features import MIN_OHLC_ROWS
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor
 
-# BUY gate + ML-reversal min confidence = BUY_PROB_THRESHOLD (default 0.60 aggressive).
+# BUY gate + ML-reversal min confidence = BUY_PROB_THRESHOLD (default 0.50 max-performance).
 
 async def signal_emitter(
     state: dict[str, Any],
