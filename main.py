@@ -481,6 +481,17 @@ async def main() -> None:
     # ── Execution mode: MT5-first (Binance removed) ─────────────────────────
     execution_mode: str = os.environ.get("EXECUTION_MODE", "mt5").strip().lower()
     initial_balance: float = 10_000.0
+    _ib_raw = os.environ.get("INITIAL_BALANCE", "").strip()
+    if _ib_raw:
+        try:
+            initial_balance = float(_ib_raw)
+            logger.info(
+                "[ENV] INITIAL_BALANCE=%.2f (paper / fallback si MT5 no aporta equity)",
+                initial_balance,
+            )
+        except ValueError:
+            logger.warning("[ENV] INITIAL_BALANCE inválido — usando 10000.0")
+            initial_balance = 10_000.0
     _mt5_initialized: bool = False
 
     if execution_mode == "mt5":
