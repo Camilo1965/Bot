@@ -5,8 +5,8 @@ Sets up a structured JSON logger and starts the asyncio event loop.
 Runs an MT5 market-data poller (ticks + multi-timeframe candles).  OHLC
 snapshots are persisted to TimescaleDB.
 
-A dedicated INJ/USDT XGBoost model emits BUY / HOLD from probability ≥ 0.70
-(symbol-filtered); no external sentiment or news gates.
+A dedicated XGBoost model emits BUY / HOLD from probability ≥ ``BUY_PROB_THRESHOLD``
+(default 0.60 aggressive profile; ``BUY_PROB_THRESHOLD`` env); no external sentiment gates.
 
 When the signal is BUY the :class:`~risk.risk_manager.RiskManager` sizes the
 position using a **fixed fractional** rule (``balance × RISK_PER_TRADE ×
@@ -49,9 +49,12 @@ except Exception:
     pass
 logging.getLogger("dotenv.main").setLevel(logging.ERROR)
 
+from rich.box import ASCII
 from rich.console import Console
 from rich.live import Live
 from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.table import Table
 
 from bot import state as dash_state
 from bot.dashboard import generate_dashboard
@@ -73,13 +76,14 @@ from data_ingestion.mt5_market_client import MT5MarketDataClient
 from database.db_manager import close_db, db, init_db
 from execution.mt5_executor import (
     MT5Executor,
+    SYMBOL_MAP,
     fetch_mt5_account_balance,
     fetch_mt5_wallet_snapshot,
     initialize_mt5,
     shutdown_mt5,
 )
-from execution.paper_executor import PaperExecutor
-from risk.risk_manager import RiskManager
+from execution.paper_executor import POSITION_TTL_HOURS, PaperExecutor
+from risk.risk_manager import BASE_SL, MAX_POSITIONS, RISK_PER_TRADE, RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor
 from utils.diagnostic_bundle import write_diagnostic_bundle
 from utils.runtime_snapshot import runtime_metrics_loop, write_startup_snapshot
@@ -103,6 +107,22 @@ _RESET  = "\033[0m"
 # Dashboard event buffer and start time live in :mod:`bot.state`.
 
 
+def _print_operational_deploy(console: Console) -> None:
+    """Rich banner: active aggressive-profile parameters (startup audit)."""
+    sym = WATCHLIST[0] if WATCHLIST else "DOGE/USDT"
+    mt5_sym = SYMBOL_MAP.get(sym, "?")
+    tbl = Table(title="DESPLIEGUE OPERATIVO AGRESIVO", box=ASCII, show_header=True, header_style="bold")
+    tbl.add_column("Parametro")
+    tbl.add_column("Valor", justify="right")
+    tbl.add_row("ML BUY threshold (prob)", f"{BUY_PROB_THRESHOLD:.2f}")
+    tbl.add_row("RISK_PER_TRADE (equity)", f"{RISK_PER_TRADE * 100:.1f}%")
+    tbl.add_row("MAX_POSITIONS", str(MAX_POSITIONS))
+    tbl.add_row("POSITION_TTL_HOURS", f"{POSITION_TTL_HOURS:.1f}")
+    tbl.add_row("BASE_SL (initial)", f"{BASE_SL * 100:.1f}%")
+    tbl.add_row("Watchlist -> MT5", f"{sym} -> {mt5_sym}")
+    console.print(Panel(tbl, border_style="cyan"))
+
+
 def _apply_safe_env_defaults() -> None:
     """Set conservative defaults for optional operational ENV knobs."""
     defaults: dict[str, str] = {
@@ -120,7 +140,7 @@ def _apply_safe_env_defaults() -> None:
         )
     if not os.environ.get("BUY_PROB_THRESHOLD", "").strip():
         print(
-            "[ENV] BUY_PROB_THRESHOLD not set; using model default 0.70 "
+            "[ENV] BUY_PROB_THRESHOLD not set; using model default 0.60 "
             "(strategy/ml_predictor.py).",
             file=sys.stderr,
         )
@@ -394,6 +414,7 @@ async def main() -> None:
     install_telegram_log_alerts()
 
     logger.info("🚀 ClawdBot starting up...")
+    _print_operational_deploy(_rich_console)
 
     # ── Telegram startup notification ─────────────────────────────────────────
     startup_alert_task: asyncio.Task[bool] | None = asyncio.create_task(

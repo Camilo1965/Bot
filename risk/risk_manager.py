@@ -50,10 +50,22 @@ Multi-asset risk controls:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
 
 # ── Trade parameters ──────────────────────────────────────────────────────────
 INITIAL_SL: float = 0.025          # 2.5 % hard stop loss for initial protection
@@ -62,7 +74,7 @@ TRAILING_DISTANCE: float = 0.02    # 2.0 % trailing gap from peak once active
 
 # ── Futures / leverage parameters ─────────────────────────────────────────────
 LEVERAGE: int = 5                   # 5× futures leverage
-RISK_PER_TRADE: float = 0.01        # 1 % of balance risked per trade (cap 2 % in config reviews)
+RISK_PER_TRADE: float = _float_env("RISK_PER_TRADE", 0.025)  # default 2.5 % (aggressive profile)
 
 # ── Daily-loss safety break ───────────────────────────────────────────────────
 MAX_DAILY_LOSS_PCT: float = 0.03    # 3 % maximum daily loss before halting

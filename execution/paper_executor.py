@@ -15,6 +15,7 @@ import asyncio
 import csv
 import json
 import logging
+import os
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -24,9 +25,23 @@ from typing import Any
 from bot.constants import DEBUG_LOG_HINT
 from database.db_manager import DatabaseManager
 from risk.risk_manager import RiskManager, get_execution_thresholds
+from strategy.ml_predictor import BUY_PROB_THRESHOLD
 from utils.telegram_notifier import send_telegram_alert
 
 logger = logging.getLogger(__name__)
+
+
+def _ttl_hours_from_env() -> float:
+    raw = os.environ.get("TTL_HOURS", os.environ.get("POSITION_TTL_HOURS", "")).strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return 12.0
+
+
+POSITION_TTL_HOURS: float = _ttl_hours_from_env()
 
 # ── Journal column headers ──────────────────────────────────────────────────
 _JOURNAL_COLUMNS: list[str] = [
@@ -188,7 +203,7 @@ class PaperExecutor:
             return exit_reason
         return None
 
-    async def check_ml_exit(self, current_price: float, ml_signal: str, ml_probability: float | None, symbol: str, min_confidence: float = 0.70) -> float | None:
+    async def check_ml_exit(self, current_price: float, ml_signal: str, ml_probability: float | None, symbol: str, min_confidence: float = BUY_PROB_THRESHOLD) -> float | None:
         pos = self.open_positions.get(symbol)
         if not pos: return None
         now = datetime.now(tz=timezone.utc)
@@ -196,8 +211,12 @@ class PaperExecutor:
         if ml_signal == "SELL" and (ml_probability is None or ml_probability >= min_confidence):
             logger.info("📉 [SELL] %s ML Reversal triggered early exit.", symbol)
             return await self._close_position(symbol, current_price, "ml_reversal")
-        if duration_h >= 12.0:
-            logger.info("⏱️ [TTL] %s position reached max age (12h).", symbol)
+        if duration_h >= POSITION_TTL_HOURS:
+            logger.info(
+                "⏱️ [TTL] %s position reached max age (%.1fh).",
+                symbol,
+                POSITION_TTL_HOURS,
+            )
             return await self._close_position(symbol, current_price, "ttl_expiry")
         return None
 

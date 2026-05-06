@@ -84,6 +84,7 @@ from execution.paper_executor import (
 )
 from risk.risk_manager import (
     LEVERAGE,
+    RISK_PER_TRADE,
     DynamicThresholds,
     get_execution_thresholds,
     get_sector,
@@ -105,9 +106,8 @@ except ImportError:  # pragma: no cover – only available on Windows with MT5 i
 logger = logging.getLogger(__name__)
 
 # ── Default risk per trade used by calculate_lot_size ─────────────────────────
-# Mirrors RISK_PER_TRADE from risk_manager but expressed as a fraction for
-# lot-size math.  Override by passing ``risk_pct`` explicitly.
-_DEFAULT_RISK_PCT: float = 0.01  # 1 % of account equity per trade (Prop Firm safe)
+# Mirrors :data:`~risk.risk_manager.RISK_PER_TRADE`. Override by passing ``risk_pct``.
+_DEFAULT_RISK_PCT: float = RISK_PER_TRADE
 
 # Small buffer added to the trailing distance to absorb spread noise (fraction
 # of price, not percentage points).  A dedicated per-tick spread measurement
@@ -147,7 +147,7 @@ SYMBOL_MAP: dict[str, str] = {
     "INJ/USDT":    "INJUSD-T",
     "FET/USDT":    "FETUSD-T",
     "RENDER/USDT": "RENDERUSD-T",
-    "DOGE/USDT":   "DGEUSD-T",
+    "DOGE/USDT":   "DOGEUSD-T",
     "PEPE/USDT":   "PEPEUSD-T",
     # Raw MT5 base names (pass-through for code that already normalises)
     "BTCUSD":      "BTCUSD-T",
@@ -158,7 +158,7 @@ SYMBOL_MAP: dict[str, str] = {
     "INJUSD":      "INJUSD-T",
     "FETUSD":      "FETUSD-T",
     "RENDERUSD":   "RENDERUSD-T",
-    "DOGEUSD":     "DGEUSD-T",
+    "DOGEUSD":     "DOGEUSD-T",
     "PEPEUSD":     "PEPEUSD-T",
 }
 

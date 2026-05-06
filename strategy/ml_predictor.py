@@ -7,7 +7,7 @@ Dedicated XGBoost classifier (quant OHLCV features: RSI, MACD, ATR, BB, vol delt
 Entry rule
 ----------
 * ``symbol`` must be in ``ALLOWED_SYMBOLS`` (otherwise **HOLD**).
-* ``probability >= BUY_PROB_THRESHOLD`` (0.70) → **BUY**, else **HOLD**.
+* ``probability >= BUY_PROB_THRESHOLD`` (default 0.60; override ``BUY_PROB_THRESHOLD`` env) → **BUY**, else **HOLD**.
 
 No sentiment, HTF, funding, or regime overrides — the loaded model is the only
 entry gate.  :meth:`MLPredictor.warm_start` still retrains from history when no
@@ -17,6 +17,7 @@ artifact is present; weekly retrainer may refresh the active model path in this 
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -34,8 +35,19 @@ from strategy.quant_features import (
 
 logger = logging.getLogger(__name__)
 
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 ALLOWED_SYMBOLS: tuple[str, ...] = ("DOGE/USDT",)
-BUY_PROB_THRESHOLD: float = 0.70
+BUY_PROB_THRESHOLD: float = _float_env("BUY_PROB_THRESHOLD", 0.60)
 _INJ_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "DOGE_USDT_v1.json"
 _inj_xgb_singleton: XGBClassifier | None = None
 _cached_booster_path: Path | None = None
