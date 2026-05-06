@@ -147,7 +147,7 @@ SYMBOL_MAP: dict[str, str] = {
     "INJ/USDT":    "INJUSD-T",
     "FET/USDT":    "FETUSD-T",
     "RENDER/USDT": "RENDERUSD-T",
-    "DOGE/USDT":   "DOGEUSD-T",
+    "DOGE/USDT":   "DGEUSD-T",
     "PEPE/USDT":   "PEPEUSD-T",
     # Raw MT5 base names (pass-through for code that already normalises)
     "BTCUSD":      "BTCUSD-T",
@@ -158,7 +158,7 @@ SYMBOL_MAP: dict[str, str] = {
     "INJUSD":      "INJUSD-T",
     "FETUSD":      "FETUSD-T",
     "RENDERUSD":   "RENDERUSD-T",
-    "DOGEUSD":     "DOGEUSD-T",
+    "DOGEUSD":     "DGEUSD-T",
     "PEPEUSD":     "PEPEUSD-T",
 }
 
@@ -571,10 +571,10 @@ class MT5Executor(PaperExecutor):
         self._magic = magic
         self._deviation = deviation
 
-        # Issue 3 – warn if risk_pct exceeds prop-firm safe threshold.
-        if risk_pct > 0.02:
+        # Issue 3 – warn if risk_pct clearly above typical prop cap (skip noise at 2.5% aggressive).
+        if risk_pct > 0.025 + 1e-9:
             logger.warning(
-                "[MT5] ⚠️ RISK ALERT: risk_pct=%.4f exceeds 2%%. "
+                "[MT5] ⚠️ RISK ALERT: risk_pct=%.4f exceeds 2.5%%. "
                 "For prop-firm trading keep risk_pct <= 1%%.",
                 risk_pct,
             )
@@ -833,7 +833,11 @@ class MT5Executor(PaperExecutor):
                 mapped.replace("-T", "m"),
                 f"{mapped}.r",
                 mapped + "m",
+                "DOGEUSD-T",
+                "DGEUSD-T",
             ]
+            # Dedupe while preserving order
+            variants = list(dict.fromkeys(variants))
             fixed: str | None = None
             for v in variants:
                 if mt5.symbol_info(v) is not None:

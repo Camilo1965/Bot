@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from io import StringIO
 from pathlib import Path
 
@@ -11,6 +12,27 @@ try:
     from dotenv import dotenv_values
 except ImportError:
     dotenv_values = None  # type: ignore[assignment]
+
+_ENV_KEY_OK = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _sanitize_dotenv_text(text: str) -> str:
+    """Strip decorative/garbage lines (unicode rules, lone ``.``) so dotenv does not fail whole file."""
+    out: list[str] = []
+    for line in text.splitlines():
+        st = line.strip()
+        if not st:
+            out.append("")
+            continue
+        if st.startswith("#"):
+            out.append(line.rstrip("\r\n"))
+            continue
+        if "=" not in st:
+            continue
+        key = st.split("=", 1)[0].strip()
+        if _ENV_KEY_OK.fullmatch(key):
+            out.append(line.rstrip("\r\n"))
+    return "\n".join(out)
 
 
 def load_env_file(path: Path, *, override: bool = False) -> None:
@@ -27,7 +49,8 @@ def load_env_file(path: Path, *, override: bool = False) -> None:
             continue
     if text is None:
         return
-    vals = dotenv_values(stream=StringIO(text))
+    safe = _sanitize_dotenv_text(text)
+    vals = dotenv_values(stream=StringIO(safe))
     for key, val in vals.items():
         if val is None or not key:
             continue
