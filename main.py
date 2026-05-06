@@ -109,7 +109,7 @@ _RESET  = "\033[0m"
 
 def _print_operational_deploy(console: Console) -> None:
     """Rich banner: active aggressive-profile parameters (startup audit)."""
-    sym = WATCHLIST[0] if WATCHLIST else "DOGE/USDT"
+    sym = WATCHLIST[0] if WATCHLIST else "ETH/USDT"
     mt5_sym = SYMBOL_MAP.get(sym, "?")
     tbl = Table(title="DESPLIEGUE OPERATIVO AGRESIVO", box=ASCII, show_header=True, header_style="bold")
     tbl.add_column("Parametro")
@@ -163,10 +163,10 @@ def _check_env() -> None:
 _check_env()
 _apply_safe_env_defaults()
 
-# DOGE/USDT (quant_sweep winner) — must exist in MT5 Market Watch (see SYMBOL_MAP).
-WATCHLIST: list[str] = ["DOGE/USDT"]
+# ETH/USDT — must exist in MT5 Market Watch (see SYMBOL_MAP → ETHUSD-T on Admirals).
+WATCHLIST: list[str] = ["ETH/USDT"]
 
-_MODEL_PATH = Path(__file__).parent / "models" / "DOGE_USDT_v1.json"
+_MODEL_PATH = Path(__file__).parent / "models" / "ETH_USDT_v1.json"
 _REPO_ROOT = _ROOT
 
 # Set once per process in :func:`setup_logging` — also embedded in JSON lines.
@@ -760,8 +760,7 @@ async def main() -> None:
         BUY_PROB_THRESHOLD,
     )
     logger.warning(
-        "[RIESGO] Perfil validado máx. rend. (prob 0.50 / risk 5%% equity): "
-        "en backtest DOGE/USDT 15m ~MaxDD 25%% — valores activos prob≥%.2f risk=%.1f%%.",
+        "[RIESGO] Perfil ETH/USDT 15m — valores activos prob≥%.2f risk=%.1f%%.",
         BUY_PROB_THRESHOLD,
         RISK_PER_TRADE * 100.0,
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deep strategy audit: high-fidelity DOGE/USDT backtest aligned with risk_manager + MT5 execution."""
+"""Deep strategy audit: high-fidelity OHLCV backtest aligned with risk_manager + MT5 execution."""
 
 from __future__ import annotations
 
@@ -32,11 +32,14 @@ from strategy.quant_features import (  # noqa: E402
     forward_return_label,
 )
 
+_SL_CAP_SIM = 0.05
+_ATR_SL_MULT = 2.0
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("deep_strategy_audit")
 
 # --- Constants (match risk_manager / execution) ---
-SYMBOL = "DOGE/USDT"
+SYMBOL = "ETH/USDT"
 RISK_PER_TRADE = 0.01
 LEVERAGE = 5
 MAX_POSITIONS = 2
@@ -262,6 +265,8 @@ def run_backtest(
 
     X_all = feat_df[QUANT_FEATURE_COLS].to_numpy(dtype=np.float32)
     probas = model.predict_proba(X_all)[:, 1]
+    atrs = feat_df["atr"].astype(float).values
+    htf_cv = feat_df["close_vs_sma200_1h"].astype(float).values
 
     balance = start_balance
     positions: list[SimPosition] = []
@@ -279,13 +284,18 @@ def run_backtest(
             prob_entry = pending_q[0][1]
             entry_px = float(opens[k])
             ts_k = pd.Timestamp(timestamps[k])
-            lots = calculate_lot_size_sim(balance, entry_px, INITIAL_SL, risk_per_trade, contract_size, _VOLUME_STEP)
+            atr_k = float(atrs[k])
+            if math.isfinite(atr_k) and atr_k > 0.0 and entry_px > 0:
+                dyn_sl = min(_ATR_SL_MULT * atr_k / entry_px, _SL_CAP_SIM)
+            else:
+                dyn_sl = INITIAL_SL
+            lots = calculate_lot_size_sim(balance, entry_px, dyn_sl, risk_per_trade, contract_size, _VOLUME_STEP)
             pos_quote, lots_eff = cap_position_quote(lots, contract_size, entry_px, balance, risk_per_trade)
             fee_open = pos_quote * FEE_RATE
             if pos_quote <= 0 or balance < pos_quote + fee_open:
                 break
             balance -= pos_quote + fee_open
-            sl_p = entry_px * (1.0 - INITIAL_SL)
+            sl_p = entry_px * (1.0 - dyn_sl)
             act_p = entry_px * (1.0 + ACTIVATION_PCT)
             positions.append(
                 SimPosition(
@@ -341,7 +351,11 @@ def run_backtest(
 
         if k < n - 1:
             p = float(probas[k])
-            if p >= buy_threshold and len(positions) < MAX_POSITIONS:
+            if (
+                p >= buy_threshold
+                and float(htf_cv[k]) > 0.0
+                and len(positions) < MAX_POSITIONS
+            ):
                 pending_q.append((k + 1, p))
 
     last_k = n - 1
@@ -395,7 +409,7 @@ def max_drawdown(equity_curve: list[float], initial: float) -> float:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Deep DOGE/USDT strategy audit (execution-aligned).")
+    parser = argparse.ArgumentParser(description="Deep OHLCV strategy audit (execution-aligned).")
     parser.add_argument("--symbol", default=SYMBOL)
     parser.add_argument("--timeframe", default="15m")
     parser.add_argument("--limit", type=int, default=10_000)
@@ -424,7 +438,7 @@ def main() -> int:
 
     console.print(
         Panel.fit(
-            f"[bold]Deep strategy audit[/] DOGE/USDT | prob>={args.buy_threshold:.2f} risk={args.risk_per_trade:.4f}",
+            f"[bold]Deep strategy audit[/] {args.symbol} | prob>={args.buy_threshold:.2f} risk={args.risk_per_trade:.4f}",
             box=ASCII,
         )
     )

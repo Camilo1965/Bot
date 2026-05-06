@@ -147,7 +147,7 @@ class DBReaderThread(QThread):
 
     POLL_INTERVAL_S: float = 2.0
 
-    def __init__(self, symbol: str = "BTC/USDT", parent: Any = None) -> None:
+    def __init__(self, symbol: str = "ETH/USDT", parent: Any = None) -> None:
         super().__init__(parent)
         self.symbol = symbol
         self._running = False

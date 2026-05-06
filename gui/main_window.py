@@ -48,14 +48,10 @@ from gui.db_reader import DBReaderThread
 # Constants
 # ---------------------------------------------------------------------------
 
-WATCHLIST: list[str] = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",  # L1_MAJOR
-    "LINK/USDT", "INJ/USDT",                           # DEFI
-    "FET/USDT", "RENDER/USDT",                         # AI
-    "DOGE/USDT", "PEPE/USDT",                          # MEME
-]
+# Misma base que main.py: operación única ETH/USDT (MT5 ETHUSD-T).
+WATCHLIST: list[str] = ["ETH/USDT"]
 APP_TITLE = "ClawdBot - Institutional Dashboard"
-DEFAULT_SYMBOL = WATCHLIST[0]
+DEFAULT_SYMBOL = "ETH/USDT"
 
 # Minimum rendered height for a doji (zero-body) candle, in price units
 _MIN_CANDLE_HEIGHT: float = 0.01
@@ -760,7 +756,7 @@ class ChartPane(QWidget):
         layout.setContentsMargins(4, 8, 4, 8)
         layout.setSpacing(4)
 
-        self._title_lbl = _make_section_label("BTC/USDT  •  15m")
+        self._title_lbl = _make_section_label("ETH/USDT  •  15m")
         layout.addWidget(self._title_lbl)
 
         # ── pyqtgraph layout ─────────────────────────────────────────────

@@ -40,20 +40,9 @@ from backtest.run_backtest import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# --- Universe (Binance majors + liquid per user spec) ----------------------------
+# --- Universe (operación única ETH/USDT; ampliar lista si vuelves a multi-par) ---
 
-SYMBOLS: list[str] = [
-    "BTC/USDT",
-    "ETH/USDT",
-    "SOL/USDT",
-    "BNB/USDT",
-    "XRP/USDT",
-    "ADA/USDT",
-    "AVAX/USDT",
-    "DOGE/USDT",
-    "LINK/USDT",
-    "INJ/USDT",
-]
+SYMBOLS: list[str] = ["ETH/USDT"]
 
 MIN_TRADES = 30
 MIN_PF = 1.1

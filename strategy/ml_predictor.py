@@ -31,6 +31,7 @@ from strategy.quant_features import (
     add_quant_features,
     compute_quant_vector_from_lists,
     forward_return_label,
+    htf_sma200_1h_allows_long,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,9 +47,9 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-ALLOWED_SYMBOLS: tuple[str, ...] = ("DOGE/USDT",)
+ALLOWED_SYMBOLS: tuple[str, ...] = ("ETH/USDT",)
 BUY_PROB_THRESHOLD: float = _float_env("BUY_PROB_THRESHOLD", 0.50)
-_INJ_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "DOGE_USDT_v1.json"
+_XGB_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "ETH_USDT_v1.json"
 _inj_xgb_singleton: XGBClassifier | None = None
 _cached_booster_path: Path | None = None
 
@@ -60,9 +61,9 @@ _SELL_SENTIMENT_THRESHOLD = -0.3
 
 
 def load_booster_from_disk(path: Path | None = None) -> XGBClassifier:
-    """Load XGB JSON from *path* or default ``_INJ_MODEL_PATH`` (cached per path)."""
+    """Load XGB JSON from *path* or default ``_XGB_MODEL_PATH`` (cached per path)."""
     global _inj_xgb_singleton, _cached_booster_path
-    p = path or _INJ_MODEL_PATH
+    p = path or _XGB_MODEL_PATH
     if _inj_xgb_singleton is not None and _cached_booster_path == p:
         return _inj_xgb_singleton
     if not p.is_file():
@@ -343,8 +344,8 @@ class MLPredictor:
     # ------------------------------------------------------------------
 
     def load_model(self, filepath: str | Path | None = None) -> bool:
-        """Load XGB JSON from *filepath* or default ``_INJ_MODEL_PATH``."""
-        path = Path(filepath) if filepath else _INJ_MODEL_PATH
+        """Load XGB JSON from *filepath* or default ``_XGB_MODEL_PATH``."""
+        path = Path(filepath) if filepath else _XGB_MODEL_PATH
         try:
             self._model = load_booster_from_disk(path)
             self._is_trained = True
@@ -446,11 +447,11 @@ class MLPredictor:
             return None
 
         logger.debug(
-            "[QUANT_FEAT] rsi=%.2f macd_hist=%.6f atr=%.6f bb_pct_b=%.3f",
+            "[QUANT_FEAT] rsi=%.2f macd_hist=%.6f atr=%.6f vol_rel=%.3f",
             features[0],
             features[3],
             features[4],
-            features[5],
+            features[11],
         )
         logger.debug("Predicted probability=%.4f", proba)
         return proba
@@ -467,9 +468,9 @@ class MLPredictor:
         htf_trend_1h: TrendStatus = HTF_TREND_NEUTRAL,
         volumes: list[float] | None = None,
         *,
-        symbol: str = "INJ/USDT",
+        symbol: str = "ETH/USDT",
     ) -> Signal:
-        """BUY only when *symbol* is allowed and model probability ≥ ``BUY_PROB_THRESHOLD``."""
+        """BUY only when HTF (precio > SMA200 1h) passes, then ``probability ≥ BUY_PROB_THRESHOLD``."""
         del funding_rate, htf_trend_4h, htf_trend_1h
         if symbol not in ALLOWED_SYMBOLS:
             logger.debug("Signal=HOLD (symbol %s not in ALLOWED_SYMBOLS)", symbol)
@@ -487,6 +488,14 @@ class MLPredictor:
 
         if probability is None:
             logger.debug("Signal=HOLD (model not ready or insufficient data)")
+            return "HOLD"
+
+        if not htf_sma200_1h_allows_long(prices):
+            logger.debug(
+                "Signal=HOLD (precio ≤ SMA200 1h) prob=%.4f symbol=%s",
+                probability,
+                symbol,
+            )
             return "HOLD"
 
         if probability >= BUY_PROB_THRESHOLD:

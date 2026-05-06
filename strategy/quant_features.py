@@ -22,6 +22,8 @@ QUANT_FEATURE_COLS: list[str] = [
     "vol_delta_norm",
     "log_ret_1",
     "log_ret_5",
+    "close_vs_sma200_1h",
+    "vol_rel",
 ]
 
 _RSI_PERIOD = 14
@@ -32,9 +34,10 @@ _ATR_PERIOD = 14
 _BB_PERIOD = 20
 _BB_STD = 2.0
 _VOL_DELTA_WIN = 20
-
-# Warm-up: MACD slow + signal smoothing
-MIN_OHLC_ROWS = 60
+_VOL_REL_WIN = 20
+_SMA200_1H_PERIODS = 200
+# ~200 horas en velas 15m (4 por hora) para alinear subsample [::4] con SMA200 en 1h
+MIN_OHLC_ROWS = max(60, (_SMA200_1H_PERIODS - 1) * 4 + 1)
 
 # Friction model (aligned with execution.paper_executor._TAKER_FEE_RATE ≈ 0.0004)
 DEFAULT_TAKER_FEE_RATE: float = 0.0004
@@ -70,6 +73,34 @@ def _macd(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
     return line, signal, hist
 
 
+def _close_vs_sma200_1h_series(close: pd.Series, timestamp: pd.Series | None) -> pd.Series:
+    """Relative distance close/SMA200(1h)-1; 0 when insufficient history."""
+    c = close.astype(float)
+    if timestamp is not None and len(timestamp):
+        idx = pd.DatetimeIndex(pd.to_datetime(timestamp, utc=True))
+        sc = pd.Series(c.values, index=idx)
+        h_last = sc.resample("1h", label="right", closed="right").last().dropna()
+        sma_h = h_last.rolling(_SMA200_1H_PERIODS, min_periods=_SMA200_1H_PERIODS).mean()
+        aligned = sma_h.reindex(sc.index, method="ffill")
+        raw = c.values / aligned.values - 1.0
+        return pd.Series(raw, index=c.index).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    arr = c.values
+    n = len(arr)
+    out = np.zeros(n, dtype=float)
+    hourly = pd.Series(arr[::4], dtype=float)
+    if len(hourly) < _SMA200_1H_PERIODS:
+        return pd.Series(out, index=c.index)
+    sma200 = hourly.rolling(_SMA200_1H_PERIODS, min_periods=_SMA200_1H_PERIODS).mean()
+    for i in range(n):
+        hi = i // 4
+        if hi < _SMA200_1H_PERIODS - 1:
+            continue
+        sm = float(sma200.iloc[hi])
+        if sm > 0:
+            out[i] = float(arr[i]) / sm - 1.0
+    return pd.Series(out, index=c.index)
+
+
 def add_quant_features(
     ohlcv: pd.DataFrame,
     *,
@@ -80,6 +111,7 @@ def add_quant_features(
     close = df["close"].astype(float)
     high = df["high"].astype(float)
     low = df["low"].astype(float)
+    ts_col = df["timestamp"] if "timestamp" in df.columns else None
 
     df["rsi"] = _rsi(close, _RSI_PERIOD)
     m_line, m_sig, m_hist = _macd(close)
@@ -103,6 +135,10 @@ def add_quant_features(
 
     df["log_ret_1"] = np.log(close / close.shift(1)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
     df["log_ret_5"] = np.log(close / close.shift(5)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    df["close_vs_sma200_1h"] = _close_vs_sma200_1h_series(close, ts_col)
+    v_ma_rel = vol.rolling(_VOL_REL_WIN, min_periods=5).mean().replace(0, np.nan)
+    df["vol_rel"] = (vol / v_ma_rel).replace([np.inf, -np.inf], 1.0).fillna(1.0)
 
     return df
 
@@ -139,6 +175,14 @@ def compute_quant_vector_from_lists(
             v = 0.0
         out.append(v)
     return out
+
+
+def htf_sma200_1h_allows_long(closes: list[float]) -> bool:
+    """Long-only HTF gate: último close por encima de SMA200 en marco 1h (véase ``close_vs_sma200_1h``)."""
+    if len(closes) < MIN_OHLC_ROWS:
+        return False
+    s = _close_vs_sma200_1h_series(pd.Series(closes, dtype=float), None)
+    return float(s.iloc[-1]) > 0.0
 
 
 def forward_return_label(

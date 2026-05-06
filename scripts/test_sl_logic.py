@@ -24,7 +24,7 @@ async def simulate_atr_and_sl_logic():
     entry_price = 100.0
     initial_sl = 98.5 # -1.5%
     pos = MockOpenPosition(
-        symbol="BTC/USDT",
+        symbol="ETH/USDT",
         entry_price=entry_price,
         stop_loss_price=initial_sl,
         current_stop_loss=initial_sl,

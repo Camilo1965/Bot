@@ -11,7 +11,7 @@
 from utils.operations_tracker import OperationsTracker, TradeState
 
 t = OperationsTracker()
-t.log_event("tid-1", "BTC/USDT", TradeState.ORDER_SENT, 97000.0, retcode=10009)
+t.log_event("tid-1", "ETH/USDT", TradeState.ORDER_SENT, 3200.0, retcode=10009)
 ```
 
 ## Reconciliación real

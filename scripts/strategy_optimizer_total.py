@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Grid sweep: prob × risk on DOGE/USDT 15m hold-out backtest (single XGB train, many sims)."""
+"""Grid sweep: prob × risk on OHLCV 15m hold-out backtest (single XGB train, many sims)."""
 
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ def main() -> int:
     console.print(
         f"[bold]strategy_optimizer_total[/] | {args.symbol} | {args.limit} velas {args.timeframe} | "
         f"train {args.train_ratio:.0%} / test {1 - args.train_ratio:.0%}\n"
-        f"TTL 12h | SL 2.5% | Trailing activation 2% / distance 2% | fee/side {FEE_RATE}\n"
+        f"TTL 12h | SL min(2*ATR,5pct) HTF SMA200 1h | Trailing 2pct/2pct | fee/side {FEE_RATE}\n"
         f"Grid prob {escape(str(PROB_GRID))} | risk {escape(str(RISK_GRID))}"
     )
 

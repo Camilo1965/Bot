@@ -11,13 +11,13 @@ Requires Windows + MetaTrader 5 terminal logged in. Configure ``.env`` like ``ma
 Examples::
 
   python scripts/mt5_smoke_trade.py
-  python scripts/mt5_smoke_trade.py --symbol INJ/USDT --tp-pct 0.02
+  python scripts/mt5_smoke_trade.py --symbol ETH/USDT --tp-pct 0.02
   python scripts/mt5_smoke_trade.py --open-only
   python scripts/mt5_smoke_trade.py close --ticket 123456789
 
 Environment shortcuts::
 
-  MT5_TEST_SYMBOL=DOGE/USDT
+  MT5_TEST_SYMBOL=ETH/USDT
   MT5_TEST_RISK_PCT=0.005
   MT5_TEST_SL_PCT=0.015
   MT5_TEST_TP_PCT=0.02
@@ -315,8 +315,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--symbol",
-        default=os.environ.get("MT5_TEST_SYMBOL", "DOGE/USDT"),
-        help="Internal pair (see SYMBOL_MAP), default DOGE/USDT",
+        default=os.environ.get("MT5_TEST_SYMBOL", "ETH/USDT"),
+        help="Internal pair (see SYMBOL_MAP), default ETH/USDT",
     )
     parser.add_argument(
         "--risk-pct",

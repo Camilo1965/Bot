@@ -9,7 +9,7 @@ Usage (fire-and-forget from an async context)::
     import asyncio
     from utils.telegram_notifier import send_telegram_alert
 
-    asyncio.create_task(send_telegram_alert("🚀 *OPEN LONG* | #BTC/USDT"))
+    asyncio.create_task(send_telegram_alert("🚀 *OPEN LONG* | #ETH/USDT"))
 
 The function reads ``TELEGRAM_BOT_TOKEN`` and ``TELEGRAM_CHAT_ID`` from the
 environment at call time so it works with any environment-variable management

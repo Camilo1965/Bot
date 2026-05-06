@@ -372,7 +372,7 @@ def run_buy_threshold_sweep(repo: Path) -> dict[str, Any]:
         return result
 
     try:
-        df = fetch_ohlcv("BTC/USDT")
+        df = fetch_ohlcv("ETH/USDT")
         feat_df = build_features(df)
         split_idx = int(len(feat_df) * _TRAIN_RATIO)
         train_df = feat_df.iloc[:split_idx]
@@ -390,10 +390,10 @@ def run_buy_threshold_sweep(repo: Path) -> dict[str, Any]:
         thresholds = [0.50, 0.55, 0.58, 0.62, 0.65, 0.68, 0.72]
         sweep = []
         for th in thresholds:
-            st = simulate_backtest(test_df, model, buy_threshold=th, symbol="BTC/USDT")
+            st = simulate_backtest(test_df, model, buy_threshold=th, symbol="ETH/USDT")
             sweep.append({"buy_threshold": th, **st})
         result["status"] = "ok"
-        result["symbol"] = "BTC/USDT"
+        result["symbol"] = "ETH/USDT"
         result["train_rows"] = int(len(train_df))
         result["test_rows"] = int(len(test_df))
         result["sweep"] = sweep

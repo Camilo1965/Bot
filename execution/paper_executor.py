@@ -24,7 +24,10 @@ from typing import Any
 
 from bot.constants import DEBUG_LOG_HINT
 from database.db_manager import DatabaseManager
+from risk import risk_manager as _rm_mod
 from risk.risk_manager import RiskManager, get_execution_thresholds
+
+_SL_CAP_FRAC = float(getattr(_rm_mod, "_SL_CAP", 0.05))
 from strategy.ml_predictor import BUY_PROB_THRESHOLD
 from utils.telegram_notifier import send_telegram_alert
 
@@ -61,7 +64,8 @@ _JOURNAL_COLUMNS: list[str] = [
 
 # ── Legacy compatibility constants ──────────────────────────────────────────
 _TAKER_FEE_RATE: float = 0.0004
-ATR_SL_MULTIPLIER: float = 1.5
+# Stop inicial largos: distancia_sl ≈ ATR_SL_MULTIPLIER × ATR (tope risk_manager._SL_CAP).
+ATR_SL_MULTIPLIER: float = 2.0
 ATR_TRAILING_MULTIPLIER: float = 2.0
 
 # ── Error messages ───────────────────────────────────────────────────────────
@@ -175,7 +179,11 @@ class PaperExecutor:
         pos_size_quote = self._risk.calculate_position_size(win_probability)
         if not self._risk.has_sufficient_balance(pos_size_quote): return False
         thresh = get_execution_thresholds()
-        sl_price = entry_price * (1.0 - thresh.sl_pct)
+        if current_atr is not None and current_atr > 0.0 and entry_price > 0.0:
+            sl_pct_dyn = min((ATR_SL_MULTIPLIER * current_atr) / entry_price, _SL_CAP_FRAC)
+            sl_price = entry_price * (1.0 - sl_pct_dyn)
+        else:
+            sl_price = entry_price * (1.0 - thresh.sl_pct)
         act_price = entry_price * (1.0 + thresh.activation_pct)
         pos = OpenPosition(trade_id=uuid.uuid4().hex[:8], symbol=symbol, entry_time=datetime.now(tz=timezone.utc), entry_price=entry_price, position_size=pos_size_quote, sl_price=sl_price, activation_price=act_price, trailing_distance_pct=thresh.trailing_distance_pct, peak_price=entry_price, ml_confidence=win_probability)
         self.open_positions[symbol] = pos

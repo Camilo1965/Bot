@@ -748,7 +748,7 @@ async def start_web_dashboard(
 
         sentiment = state.get("sentiment")
         global_hold = False
-        sentiment_label = "INJ/USDT ML-only"
+        sentiment_label = "ETH/USDT ML-only"
         sentiment_detail = "Sin Gemini / noticias — solo XGB ≥ 70%"
 
         # Wallet

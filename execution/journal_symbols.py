@@ -1,4 +1,4 @@
-"""Normalize trading symbols for CSV journal and analytics (internal *BTC/USDT* form)."""
+"""Normalize trading symbols for CSV journal and analytics (internal *BASE/USDT* form)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ _BROKER_TO_INTERNAL: dict[str, str] = {
 
 
 def journal_symbol(symbol: str) -> str:
-    """Return canonical internal symbol for logging (e.g. ``BTC/USDT``)."""
+    """Return canonical internal symbol for logging (e.g. ``ETH/USDT``)."""
     s = symbol.strip()
     if "/" in s:
         return s

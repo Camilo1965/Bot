@@ -33,18 +33,8 @@ from strategy.quant_features import (  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("quant_sweep")
 
-TOP10: list[str] = [
-    "BTC/USDT",
-    "ETH/USDT",
-    "SOL/USDT",
-    "XRP/USDT",
-    "ADA/USDT",
-    "DOGE/USDT",
-    "LINK/USDT",
-    "AVAX/USDT",
-    "DOT/USDT",
-    "BCH/USDT",
-]
+# Producción = ETH/USDT único (main.py WATCHLIST); sweep default solo ETH.
+TOP10: list[str] = ["ETH/USDT"]
 
 BUY_THRESHOLD = 0.70
 _TRAIN_RATIO = 0.80
@@ -224,7 +214,7 @@ def patch_architecture(winner: str, model_basename: str) -> None:
         flags=re.M,
     )
     ml_txt = re.sub(
-        r'^(_INJ_MODEL_PATH\s*=\s*Path\(__file__\)\.resolve\(\)\.parent\.parent\s*/\s*"models"\s*/\s*")([^"]+)("\))',
+        r'^(_XGB_MODEL_PATH\s*=\s*Path\(__file__\)\.resolve\(\)\.parent\.parent\s*/\s*"models"\s*/\s*")([^"]+)("\))',
         rf'\1{model_basename}\3',
         ml_txt,
         count=1,
@@ -232,7 +222,7 @@ def patch_architecture(winner: str, model_basename: str) -> None:
     )
     ml_py.write_text(ml_txt, encoding="utf-8")
 
-    # Ensure SYMBOL_MAP has winner (TOP10 USD-T pattern)
+    # Ensure SYMBOL_MAP has winner (Admirals *USD-T pattern)
     mt5_txt = mt5_py.read_text(encoding="utf-8")
     base = winner.split("/")[0]
     admirals = f"{base}USD-T"
@@ -283,7 +273,7 @@ def rank_key(row: dict[str, object]) -> float:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Quantitative sweep TOP10 crypto.")
+    parser = argparse.ArgumentParser(description="Quantitative sweep (default universe: ETH/USDT).")
     parser.add_argument("--timeframe", default="15m", help="ccxt timeframe (default 15m)")
     parser.add_argument("--limit", type=int, default=3000, help="candles per symbol")
     parser.add_argument("--horizon", type=int, default=_HORIZON_DEFAULT, help="forward bars for label & PnL")

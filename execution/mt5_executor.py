@@ -833,7 +833,7 @@ class MT5Executor(PaperExecutor):
                 mapped.replace("-T", "m"),
                 f"{mapped}.r",
                 mapped + "m",
-                "DOGEUSD-T",
+                "ETHUSD-T",
                 "DGEUSD-T",
             ]
             # Dedupe while preserving order
