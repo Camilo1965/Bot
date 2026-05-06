@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,7 +28,7 @@ from risk import risk_manager as _rm_mod
 from risk.risk_manager import RiskManager, get_execution_thresholds
 
 _SL_CAP_FRAC = float(getattr(_rm_mod, "_SL_CAP", 0.05))
-from strategy.ml_predictor import BUY_PROB_THRESHOLD
+from strategy.ml_predictor import BUY_PROB_THRESHOLD, get_symbol_config
 from utils.telegram_notifier import send_telegram_alert
 
 logger = logging.getLogger(__name__)
@@ -78,9 +78,9 @@ _ERRORS = {
 
 @dataclass
 class OpenPosition:
-    """State for one open paper-trading position."""
+    """State for one open position (paper + MT5 bookkeeping)."""
 
-    trade_id: str
+    trade_id: str | int
     symbol: str
     entry_time: datetime
     entry_price: float
@@ -91,11 +91,24 @@ class OpenPosition:
     peak_price: float
     trailing_stop_active: bool = False
     ml_confidence: float = 0.0
+    sl_pct: float = 0.025
+    activation_pct: float = 0.02
+    stop_loss_price: float = 0.0
+    atr_trailing_distance: float = 0.0
+    sentiment_score: float = 0.0
+    mt5_position_ticket: int | None = None
+    current_stop_loss: float = 0.0
+    last_broker_sl_synced: float = 0.0
+    last_broker_tp_synced: float = 0.0
+    last_mt5_modify_mono: float = 0.0
+    close_pending: bool = False
+    last_close_error: str | None = None
 
-    @property
-    def current_stop_loss(self) -> float:
-        """Alias for sl_price to maintain Dashboard compatibility."""
-        return self.sl_price
+    def __post_init__(self) -> None:
+        if self.stop_loss_price <= 0.0 and self.sl_price > 0.0:
+            object.__setattr__(self, "stop_loss_price", self.sl_price)
+        if self.current_stop_loss <= 0.0 and self.sl_price > 0.0:
+            object.__setattr__(self, "current_stop_loss", self.sl_price)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -104,8 +117,19 @@ class OpenPosition:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "OpenPosition":
-        d["entry_time"] = datetime.fromisoformat(d["entry_time"])
-        return cls(**d)
+        raw = dict(d)
+        raw["entry_time"] = datetime.fromisoformat(raw["entry_time"])
+        kwargs: dict[str, Any] = {}
+        for f in fields(cls):
+            if f.name in raw:
+                kwargs[f.name] = raw[f.name]
+            elif f.default is not MISSING:
+                kwargs[f.name] = f.default
+            elif f.default_factory is not MISSING:
+                kwargs[f.name] = f.default_factory()
+            else:
+                raise KeyError(f.name)
+        return cls(**kwargs)
 
 
 def compute_dynamic_tp_hint(pos: OpenPosition) -> float | None:
@@ -176,16 +200,31 @@ class PaperExecutor:
     async def try_open_trade(self, entry_price: float, win_probability: float, symbol: str, sentiment_score: float = 0.0, current_atr: float | None = None) -> bool:
         if symbol in self.open_positions: return False
         if not self._risk.can_open_position(): return False
-        pos_size_quote = self._risk.calculate_position_size(win_probability)
+        cfg = get_symbol_config(symbol)
+        pos_size_quote = self._risk.calculate_position_size(win_probability, risk_pct=float(cfg["risk"]))
         if not self._risk.has_sufficient_balance(pos_size_quote): return False
         thresh = get_execution_thresholds()
-        if current_atr is not None and current_atr > 0.0 and entry_price > 0.0:
-            sl_pct_dyn = min((ATR_SL_MULTIPLIER * current_atr) / entry_price, _SL_CAP_FRAC)
-            sl_price = entry_price * (1.0 - sl_pct_dyn)
-        else:
-            sl_price = entry_price * (1.0 - thresh.sl_pct)
+        sl_frac = min(float(cfg["fixed_sl_pct"]), _SL_CAP_FRAC)
+        sl_price = entry_price * (1.0 - sl_frac)
         act_price = entry_price * (1.0 + thresh.activation_pct)
-        pos = OpenPosition(trade_id=uuid.uuid4().hex[:8], symbol=symbol, entry_time=datetime.now(tz=timezone.utc), entry_price=entry_price, position_size=pos_size_quote, sl_price=sl_price, activation_price=act_price, trailing_distance_pct=thresh.trailing_distance_pct, peak_price=entry_price, ml_confidence=win_probability)
+        pos = OpenPosition(
+            trade_id=uuid.uuid4().hex[:8],
+            symbol=symbol,
+            entry_time=datetime.now(tz=timezone.utc),
+            entry_price=entry_price,
+            position_size=pos_size_quote,
+            sl_price=sl_price,
+            activation_price=act_price,
+            trailing_distance_pct=thresh.trailing_distance_pct,
+            peak_price=entry_price,
+            ml_confidence=win_probability,
+            sl_pct=sl_frac,
+            activation_pct=thresh.activation_pct,
+            stop_loss_price=sl_price,
+            atr_trailing_distance=(current_atr or 0.0) * ATR_TRAILING_MULTIPLIER if current_atr else 0.0,
+            sentiment_score=sentiment_score,
+            current_stop_loss=sl_price,
+        )
         self.open_positions[symbol] = pos
         self._risk.register_open()
         self._risk.deduct(pos_size_quote)
@@ -203,7 +242,9 @@ class PaperExecutor:
                     pos.trailing_stop_active = True
                     logger.info("📈 [TS] %s trailing stop ACTIVATED at %.4f", symbol, current_price)
                 new_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
-                if new_sl > pos.sl_price: pos.sl_price = new_sl
+                if new_sl > pos.sl_price:
+                    pos.sl_price = new_sl
+                    pos.current_stop_loss = new_sl
         exit_reason = None
         if current_price <= pos.sl_price: exit_reason = "trailing_stop" if pos.trailing_stop_active else "stop_loss"
         if exit_reason:

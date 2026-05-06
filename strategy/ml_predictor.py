@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,8 @@ from strategy.quant_features import (
 
 logger = logging.getLogger(__name__)
 
+MODELS_DIR: Path = Path(__file__).resolve().parent.parent / "models"
+
 
 def _float_env(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
@@ -47,11 +50,32 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-ALLOWED_SYMBOLS: tuple[str, ...] = ("ETH/USDT",)
+# Sandbox / small-capital profile: higher prob gates, per-symbol SL and risk (see get_symbol_config).
+SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
+    "BTC/USDT": {
+        "prob_threshold": 0.65,
+        "fixed_sl_pct": 0.03,
+        "use_sma_filter": False,
+        "risk": 0.07,
+    },
+    "ETH/USDT": {
+        "prob_threshold": 0.74,
+        "fixed_sl_pct": 0.03,
+        "use_sma_filter": True,
+        "risk": 0.07,
+    },
+    "PAXG/USDT": {
+        "prob_threshold": 0.62,
+        "fixed_sl_pct": 0.015,
+        "use_sma_filter": True,
+        "risk": 0.07,
+    },
+}
+
+ALLOWED_SYMBOLS: tuple[str, ...] = tuple(SYMBOL_CONFIG.keys())
 BUY_PROB_THRESHOLD: float = _float_env("BUY_PROB_THRESHOLD", 0.50)
-_XGB_MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "ETH_USDT_v1.json"
-_inj_xgb_singleton: XGBClassifier | None = None
-_cached_booster_path: Path | None = None
+_XGB_MODEL_PATH = MODELS_DIR / "ETH_USDT_v1.json"
+_booster_cache: dict[str, XGBClassifier] = {}
 
 _LABEL_ROUND_TRIP: float = DEFAULT_LABEL_ROUND_TRIP
 
@@ -60,19 +84,36 @@ _SELL_PROB_THRESHOLD = 0.35
 _SELL_SENTIMENT_THRESHOLD = -0.3
 
 
+def model_json_path_for_symbol(symbol: str) -> Path:
+    """``models/BTC_USDT_v1.json`` style path for *symbol*."""
+    return MODELS_DIR / f"{symbol.replace('/', '_')}_v1.json"
+
+
+def get_symbol_config(symbol: str) -> dict[str, Any]:
+    """Per-symbol ML / risk knobs; unknown symbols fall back to env defaults."""
+    base: dict[str, Any] = {
+        "prob_threshold": BUY_PROB_THRESHOLD,
+        "fixed_sl_pct": 0.025,
+        "use_sma_filter": True,
+        "risk": _float_env("RISK_PER_TRADE", 0.02),
+    }
+    if symbol in SYMBOL_CONFIG:
+        return {**base, **SYMBOL_CONFIG[symbol]}
+    return base
+
+
 def load_booster_from_disk(path: Path | None = None) -> XGBClassifier:
-    """Load XGB JSON from *path* or default ``_XGB_MODEL_PATH`` (cached per path)."""
-    global _inj_xgb_singleton, _cached_booster_path
-    p = path or _XGB_MODEL_PATH
-    if _inj_xgb_singleton is not None and _cached_booster_path == p:
-        return _inj_xgb_singleton
+    """Load XGB JSON from *path* or default ``_XGB_MODEL_PATH`` (cached per resolved path)."""
+    p = (path or _XGB_MODEL_PATH).resolve()
+    key = str(p)
+    if key in _booster_cache:
+        return _booster_cache[key]
     if not p.is_file():
         raise FileNotFoundError(str(p))
     booster = XGBClassifier()
     booster.load_model(str(p))
-    _inj_xgb_singleton = booster
-    _cached_booster_path = p
-    return _inj_xgb_singleton
+    _booster_cache[key] = booster
+    return booster
 
 # Default prediction horizon (price-tick steps)
 _PREDICTION_HORIZON = 5
@@ -418,9 +459,6 @@ class MLPredictor:
         """
         if symbol is not None and symbol not in ALLOWED_SYMBOLS:
             return None
-        if not self._is_trained:
-            logger.debug("predict_proba called before model is trained.")
-            return None
 
         if len(prices) < _MIN_PRICES_FOR_INFERENCE:
             logger.debug(
@@ -436,8 +474,21 @@ class MLPredictor:
         if features is None:
             return None
         X = pd.DataFrame([features], columns=_FEATURE_COLS)
+        sym = symbol or "ETH/USDT"
+        booster: XGBClassifier | None = None
+        mp = model_json_path_for_symbol(sym)
+        if mp.is_file():
+            try:
+                booster = load_booster_from_disk(mp)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("predict_proba: load %s failed: %s", mp, exc)
+        if booster is None and self._is_trained:
+            booster = self._model
+        if booster is None:
+            logger.debug("predict_proba: no model file for %s and predictor untrained.", sym)
+            return None
         try:
-            proba: float = float(self._model.predict_proba(X)[0][1])
+            proba: float = float(booster.predict_proba(X)[0][1])
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "predict_proba: XGBoost inference failed (%s) – "
@@ -476,6 +527,7 @@ class MLPredictor:
             logger.debug("Signal=HOLD (symbol %s not in ALLOWED_SYMBOLS)", symbol)
             return "HOLD"
 
+        cfg = get_symbol_config(symbol)
         probability = self.predict_proba(
             prices,
             sentiment_score,
@@ -490,7 +542,7 @@ class MLPredictor:
             logger.debug("Signal=HOLD (model not ready or insufficient data)")
             return "HOLD"
 
-        if not htf_sma200_1h_allows_long(prices):
+        if cfg["use_sma_filter"] and not htf_sma200_1h_allows_long(prices):
             logger.debug(
                 "Signal=HOLD (precio ≤ SMA200 1h) prob=%.4f symbol=%s",
                 probability,
@@ -498,11 +550,13 @@ class MLPredictor:
             )
             return "HOLD"
 
-        if probability >= BUY_PROB_THRESHOLD:
+        th = float(cfg["prob_threshold"])
+        if probability >= th:
             logger.debug(
-                "Signal=BUY  probability=%.4f  symbol=%s",
+                "Signal=BUY  probability=%.4f  symbol=%s (th=%.2f)",
                 probability,
                 symbol,
+                th,
             )
             return "BUY"
 

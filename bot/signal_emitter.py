@@ -12,7 +12,7 @@ from database.db_manager import db
 from execution.paper_executor import PaperExecutor
 from strategy.feature_engineer import FeatureEngineer
 from strategy.quant_features import MIN_OHLC_ROWS
-from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor
+from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, get_symbol_config
 
 # BUY gate + ML-reversal min confidence = BUY_PROB_THRESHOLD (default 0.50 max-performance).
 
@@ -108,7 +108,7 @@ async def signal_emitter(
                         ml_signal=signal,
                         ml_probability=win_prob if win_prob > 0.0 else None,
                         symbol=symbol,
-                        min_confidence=BUY_PROB_THRESHOLD,
+                        min_confidence=float(get_symbol_config(symbol)["prob_threshold"]),
                     )
                     if smart_pnl is not None:
                         logger.debug(

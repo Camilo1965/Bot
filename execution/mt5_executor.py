@@ -60,7 +60,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import TYPE_CHECKING, Any
 
 try:
@@ -72,6 +72,7 @@ except ImportError:
     _PANDAS_AVAILABLE = False
 
 from execution.journal_symbols import journal_symbol
+from risk import risk_manager as _risk_cap_mod
 from execution.paper_executor import (
     _TAKER_FEE_RATE,
     ATR_SL_MULTIPLIER,
@@ -89,7 +90,10 @@ from risk.risk_manager import (
     get_execution_thresholds,
     get_sector,
 )
+from strategy.ml_predictor import get_symbol_config
 from utils.telegram_notifier import send_telegram_alert
+
+_SL_CAP_VALUE: float = float(getattr(_risk_cap_mod, "_SL_CAP", 0.05))
 
 if TYPE_CHECKING:
     from database.db_manager import DatabaseManager
@@ -149,6 +153,7 @@ SYMBOL_MAP: dict[str, str] = {
     "RENDER/USDT": "RENDERUSD-T",
     "DOGE/USDT":   "DGEUSD-T",
     "PEPE/USDT":   "PEPEUSD-T",
+    "PAXG/USDT":   "XAUUSD-T",
     # Raw MT5 base names (pass-through for code that already normalises)
     "BTCUSD":      "BTCUSD-T",
     "ETHUSD":      "ETHUSD-T",
@@ -495,6 +500,41 @@ def calculate_lot_size(
 
     # Clamp to broker limits.
     lots = max(volume_min, min(volume_max, lots_stepped))
+
+    # Small accounts: enforce minimum tradable volume (default 0.01) if margin allows;
+    # reject when implied loss at SL would exceed risk budget × overshoot factor.
+    try:
+        floor_target = max(
+            0.01,
+            float(os.environ.get("MT5_MIN_LOT_FLOOR", "0.01").strip() or "0.01"),
+        )
+    except ValueError:
+        floor_target = 0.01
+    try:
+        risk_mult = float(
+            os.environ.get("MT5_FLOOR_LOT_MAX_RISK_MULT", "1.5").strip() or "1.5"
+        )
+    except ValueError:
+        risk_mult = 1.5
+    floor_target = max(floor_target, volume_min)
+    step_dec = Decimal(str(volume_step))
+    floor_dec = Decimal(str(floor_target))
+    ceil_parts = (floor_dec / step_dec).quantize(Decimal("1"), rounding=ROUND_UP)
+    min_lot_floor = float(ceil_parts * step_dec)
+    min_lot_floor = min(volume_max, max(volume_min, min_lot_floor))
+
+    if lots + 1e-12 < min_lot_floor:
+        implied_loss = min_lot_floor * sl_distance_price * contract_size
+        cap = account_balance * risk_pct * max(risk_mult, 1.0)
+        if implied_loss > cap + 1e-9:
+            logger.warning(
+                "calculate_lot_size: min lot %.4f would risk %.4f at SL vs cap %.4f — skip",
+                min_lot_floor,
+                implied_loss,
+                cap,
+            )
+            return 0.0
+        lots = min_lot_floor
 
     logger.debug(
         "calculate_lot_size: symbol=%s  balance=%.2f  risk_pct=%.4f  "
@@ -1482,6 +1522,9 @@ class MT5Executor(PaperExecutor):
         stop when it activates later.
         """
         sym = symbol or self.symbol
+        cfg_sym = get_symbol_config(sym)
+        risk_pct_sym = float(cfg_sym["risk"])
+        fixed_sl_sym = min(float(cfg_sym["fixed_sl_pct"]), _SL_CAP_VALUE)
 
         # ── MT5 symbol resolution (fail-fast before any state mutation) ────
         mt5_sym: str | None = None
@@ -1529,7 +1572,10 @@ class MT5Executor(PaperExecutor):
                 )
                 return False
 
-            position_size = self._risk.calculate_position_size(win_probability)
+            position_size = self._risk.calculate_position_size(
+                win_probability,
+                risk_pct=risk_pct_sym,
+            )
             if not self._risk.has_sufficient_balance(position_size):
                 logger.warning(
                     "⚠️ [ALERT] Insufficient balance (%.2f) for position size %.2f.",
@@ -1542,43 +1588,24 @@ class MT5Executor(PaperExecutor):
             self._risk.register_open()
             self._pending_symbols.add(sym)
 
-        # ── Dynamic risk thresholds from sentiment ─────────────────────────
-        thresholds: DynamicThresholds = get_execution_thresholds()
-        
-        # ── ATR-based dynamic SL logging ──────────────────────────────────
-        if current_atr is not None and current_atr > 0.0:
-            sl_dist = current_atr * ATR_SL_MULTIPLIER * thresholds.multiplier
-            logger.info(
-                "🛡️ [RIESGO] SL configurado a distancia ATR: %.2f (Sentimiento: %.2f, Multiplicador: %.2f)",
-                sl_dist,
-                sentiment_score,
-                thresholds.multiplier
-            )
-
-        # ── ATR-based dynamic SL / trailing distance ───────────────────────
-        sl_distance: float | None = None
-        stop_loss_price: float = 0.0
-        atr_trailing_distance: float = 0.0
-        if current_atr is not None and current_atr > 0.0:
-            sl_distance = current_atr * ATR_SL_MULTIPLIER
-            stop_loss_price = entry_price - sl_distance
-            atr_trailing_distance = current_atr * ATR_TRAILING_MULTIPLIER
-        else:
-            # Fallback: derive SL from the percentage threshold
-            stop_loss_price = entry_price * (1.0 - thresholds.sl_pct)
-
-        # ── Spread-adjusted trailing distance ─────────────────────────────
+        # ── Per-symbol fixed SL (SYMBOL_CONFIG) + spread-aware trailing % ────
+        th0 = get_execution_thresholds()
         effective_trailing_pct = self._effective_trailing_distance(
-            sym, entry_price, thresholds.trailing_distance_pct
+            sym, entry_price, th0.trailing_distance_pct
         )
-        # Patch thresholds to carry the spread-adjusted value so OpenPosition
-        # stores the correct distance.
         thresholds = DynamicThresholds(
-            multiplier=thresholds.multiplier,
-            sl_pct=thresholds.sl_pct,
-            activation_pct=thresholds.activation_pct,
+            multiplier=th0.multiplier,
+            sl_pct=fixed_sl_sym,
+            activation_pct=th0.activation_pct,
             trailing_distance_pct=effective_trailing_pct,
         )
+        stop_loss_price = float(entry_price) * (1.0 - fixed_sl_sym)
+        atr_trailing_distance = (
+            float(current_atr) * ATR_TRAILING_MULTIPLIER
+            if current_atr is not None and float(current_atr) > 0.0
+            else 0.0
+        )
+        sl_distance: float | None = max(float(entry_price) - stop_loss_price, 0.0)
 
         # ── Live MT5 order ─────────────────────────────────────────────────
         mt5_ticket: int | None = None
@@ -1609,10 +1636,8 @@ class MT5Executor(PaperExecutor):
                     self._risk.register_close()
                 return False
 
-            # Normalise SL price to the number of digits the broker accepts.
             sym_info = mt5.symbol_info(mt5_sym)
             digits: int = sym_info.digits if sym_info else 5
-            stop_loss_price = self._normalize_price(stop_loss_price, digits)
 
             # Issue 4 – reject stale tick prices before entering.
             tick = mt5.symbol_info_tick(mt5_sym)
@@ -1624,17 +1649,10 @@ class MT5Executor(PaperExecutor):
                 return False
 
             ask_price = self._normalize_price(tick.ask, digits)
-
-            # Issue 1 – Calculate SL relative to the BID price (the price that triggers it).
-            # This ensures SL is always below current market and accounts for spread.
-            if current_atr is not None and current_atr > 0.0:
-                sl_distance = current_atr * ATR_SL_MULTIPLIER
-                stop_loss_price = tick.bid - sl_distance
-            else:
-                # Fallback: percentage based on Bid
-                stop_loss_price = tick.bid * (1.0 - thresholds.sl_pct)
-
-            stop_loss_price = self._normalize_price(stop_loss_price, digits)
+            stop_loss_price = self._normalize_price(
+                float(tick.bid) * (1.0 - fixed_sl_sym),
+                digits,
+            )
 
             # Issue 1 – widen SL if tighter than broker ``trade_stops_level`` (+ buffer).
             sl_clamped, _ = self._clamp_stop_loss_buy(
@@ -1660,8 +1678,17 @@ class MT5Executor(PaperExecutor):
                 symbol=mt5_sym,
                 account_balance=account_equity,
                 sl_distance_price=max(ask_price - stop_loss_price, 1e-8),
-                risk_pct=self._risk_pct,
+                risk_pct=risk_pct_sym,
             )
+            if lots <= 0.0:
+                logger.error(
+                    "[MT5] Lot size 0 (min-lot / risk cap) – aborting trade for %s.",
+                    sym,
+                )
+                async with self._positions_lock:
+                    self._pending_symbols.discard(sym)
+                    self._risk.register_close()
+                return False
 
             # Issue 2 – verify sufficient margin before sending the order.
             if not self._check_margin_available(mt5_sym, lots, ask_price):
@@ -1700,21 +1727,26 @@ class MT5Executor(PaperExecutor):
                 self._risk.register_close()
             return False
 
+        act_px = float(entry_price) * (1.0 + thresholds.activation_pct)
         async with self._positions_lock:
             self.open_positions[sym] = OpenPosition(
+                trade_id=trade_id,
                 symbol=sym,
+                entry_time=ts,
                 entry_price=entry_price,
                 position_size=position_size,
-                entry_time=ts,
-                trade_id=trade_id,
+                sl_price=stop_loss_price,
+                activation_price=act_px,
+                trailing_distance_pct=thresholds.trailing_distance_pct,
+                peak_price=float(entry_price),
+                ml_confidence=win_probability,
                 sl_pct=thresholds.sl_pct,
                 activation_pct=thresholds.activation_pct,
-                trailing_distance_pct=thresholds.trailing_distance_pct,
                 stop_loss_price=stop_loss_price,
                 atr_trailing_distance=atr_trailing_distance,
-                ml_confidence=win_probability,
                 sentiment_score=sentiment_score,
                 mt5_position_ticket=mt5_ticket,
+                current_stop_loss=stop_loss_price,
             )
             pos_ref = self.open_positions[sym]
             self._pending_symbols.discard(sym)
@@ -1732,11 +1764,12 @@ class MT5Executor(PaperExecutor):
         )
         self._save_state()
 
-        if sl_distance is not None:
+        if sl_distance is not None and sl_distance > 0:
             logger.info(
-                "✅ [OPEN LONG] %s at %.2f. Dynamic SL (ATR): %.2f (distance: %.2f).",
+                "✅ [OPEN LONG] %s at %.2f. Fixed SL %%: %.2f%% → price %.2f (dist≈%.4f).",
                 sym,
                 entry_price,
+                thresholds.sl_pct * 100.0,
                 stop_loss_price,
                 sl_distance,
             )
@@ -1754,7 +1787,7 @@ class MT5Executor(PaperExecutor):
             send_telegram_alert(
                 f"🚀 *OPEN BUY* | #{sym}\n"
                 f"Precio: {entry_price:.2f}\n"
-                f"SL Dinámico (ATR): {self.open_positions[sym].stop_loss_price:.2f}"
+                f"SL fijo (~{thresholds.sl_pct * 100:.2f}%): {self.open_positions[sym].stop_loss_price:.2f}"
             )
         )
         if self._live and isinstance(mt5_ticket, int):
@@ -1990,11 +2023,13 @@ class MT5Executor(PaperExecutor):
 
         sl_raw = float(p.sl or 0.0)
         thresholds = get_execution_thresholds()
+        cfg_a = get_symbol_config(sym)
+        fixed_ad = min(float(cfg_a["fixed_sl_pct"]), _SL_CAP_VALUE)
         if sl_raw > 0.0:
             stop_loss_price = self._normalize_price(sl_raw, digits)
         else:
             stop_loss_price = self._normalize_price(
-                entry * (1.0 - thresholds.sl_pct), digits
+                entry * (1.0 - fixed_ad), digits
             )
 
         try:
@@ -2015,24 +2050,27 @@ class MT5Executor(PaperExecutor):
             )
             return False
 
+        peak = max(entry, float(p.price_current))
+        act_px_ad = entry * (1.0 + thresholds.activation_pct)
         op = OpenPosition(
+            trade_id=trade_id,
             symbol=sym,
+            entry_time=ts,
             entry_price=entry,
             position_size=position_size,
-            entry_time=ts,
-            trade_id=trade_id,
-            sl_pct=thresholds.sl_pct,
-            activation_pct=thresholds.activation_pct,
+            sl_price=stop_loss_price,
+            activation_price=act_px_ad,
             trailing_distance_pct=thresholds.trailing_distance_pct,
+            peak_price=peak,
+            sl_pct=fixed_ad,
+            activation_pct=thresholds.activation_pct,
             stop_loss_price=stop_loss_price,
             atr_trailing_distance=0.0,
             ml_confidence=0.0,
             sentiment_score=0.0,
             mt5_position_ticket=int(p.ticket),
+            current_stop_loss=stop_loss_price,
         )
-        peak = max(entry, float(p.price_current))
-        op.peak_price = peak
-        op.current_stop_loss = stop_loss_price
         if sl_raw > 0.0:
             op.last_broker_sl_synced = stop_loss_price
         tp_raw = float(p.tp or 0.0)

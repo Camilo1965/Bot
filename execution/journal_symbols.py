@@ -14,6 +14,7 @@ _BROKER_TO_INTERNAL: dict[str, str] = {
     "RENDERUSD-T": "RENDER/USDT",
     "DOGEUSD-T": "DOGE/USDT",
     "PEPEUSD-T": "PEPE/USDT",
+    "XAUUSD-T": "PAXG/USDT",
 }
 
 

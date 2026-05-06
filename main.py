@@ -84,7 +84,12 @@ from execution.mt5_executor import (
 )
 from execution.paper_executor import POSITION_TTL_HOURS, PaperExecutor
 from risk.risk_manager import BASE_SL, MAX_POSITIONS, RISK_PER_TRADE, RiskManager
-from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor
+from strategy.ml_predictor import (
+    BUY_PROB_THRESHOLD,
+    MLPredictor,
+    load_booster_from_disk,
+    model_json_path_for_symbol,
+)
 from utils.diagnostic_bundle import write_diagnostic_bundle
 from utils.runtime_snapshot import runtime_metrics_loop, write_startup_snapshot
 from utils.telegram_notifier import (
@@ -163,10 +168,21 @@ def _check_env() -> None:
 _check_env()
 _apply_safe_env_defaults()
 
-# ETH/USDT — must exist in MT5 Market Watch (see SYMBOL_MAP → ETHUSD-T on Admirals).
-WATCHLIST: list[str] = ["ETH/USDT"]
+def _watchlist_from_env() -> list[str]:
+    raw = os.environ.get("WATCHLIST", "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    return ["BTC/USDT", "ETH/USDT", "PAXG/USDT"]
 
-_MODEL_PATH = Path(__file__).parent / "models" / "ETH_USDT_v1.json"
+
+# Symbols must exist in MT5 Market Watch (see execution.mt5_executor.SYMBOL_MAP).
+WATCHLIST: list[str] = _watchlist_from_env()
+
+_MODEL_PATH = (
+    Path(__file__).parent / "models" / f"{WATCHLIST[0].replace('/', '_')}_v1.json"
+    if WATCHLIST
+    else Path(__file__).parent / "models" / "ETH_USDT_v1.json"
+)
 _REPO_ROOT = _ROOT
 
 # Set once per process in :func:`setup_logging` — also embedded in JSON lines.
@@ -702,6 +718,15 @@ async def main() -> None:
     # ------------------------------------------------------------------
     # Attempt to load a pre-trained model; fall back to warm-start
     # ------------------------------------------------------------------
+    for _sym in WATCHLIST:
+        _mp = model_json_path_for_symbol(_sym)
+        if _mp.is_file():
+            try:
+                load_booster_from_disk(_mp)
+                logger.info("✅ ML booster cached: %s", _mp.name)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("Could not load model for %s (%s): %s", _sym, _mp, _exc)
+
     model_loaded = predictor.load_model(_MODEL_PATH)
     if model_loaded:
         logger.info("✅ Pre-trained model loaded from %s.", _MODEL_PATH)

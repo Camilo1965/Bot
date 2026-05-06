@@ -67,6 +67,16 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
+
+
 # ── Trade parameters ──────────────────────────────────────────────────────────
 INITIAL_SL: float = 0.025          # 2.5 % hard stop loss for initial protection
 ACTIVATION_PCT: float = 0.02       # 2.0 % profit to activate trailing stop (module-level legacy)
@@ -80,7 +90,7 @@ RISK_PER_TRADE: float = _float_env("RISK_PER_TRADE", 0.05)  # default 5 % (max-p
 MAX_DAILY_LOSS_PCT: float = 0.03    # 3 % maximum daily loss before halting
 _HALT_DURATION: timedelta = timedelta(hours=24)
 
-MAX_POSITIONS: int = 2          # Maximum simultaneous open positions
+MAX_POSITIONS: int = _int_env("MAX_POSITIONS", 2)  # Maximum simultaneous open positions
 
 # ── Portfolio drawdown circuit-breaker ───────────────────────────────────────
 MAX_PORTFOLIO_DD_PCT: float = 0.15  # 15 % max peak-to-trough loss from initial balance
@@ -99,6 +109,8 @@ SECTOR_MAP: dict[str, str] = {
     "RENDERUSDT": "AI",
     "DOGEUSDT": "MEME",
     "PEPEUSDT": "MEME",
+    "PAXGUSDT": "METALS",
+    "XAUUSD": "METALS",
 }
 
 _SECTOR_UNCLASSIFIED: str = "UNCLASSIFIED"
@@ -191,10 +203,15 @@ class RiskManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def calculate_position_size(self, win_probability: float) -> float:  # noqa: ARG002
+    def calculate_position_size(
+        self,
+        win_probability: float,  # noqa: ARG002
+        *,
+        risk_pct: float | None = None,
+    ) -> float:
         """Return the position size in quote currency for the next trade.
 
-        Uses the formula ``balance * RISK_PER_TRADE * LEVERAGE``.
+        Uses the formula ``balance * risk_pct * LEVERAGE`` (default ``RISK_PER_TRADE``).
 
         The position size is also capped at ``balance / max_positions`` so
         that no single trade consumes more than a fair share of the
@@ -206,8 +223,11 @@ class RiskManager:
             ML-predicted probability of the trade being profitable (0–1).
             Accepted for API compatibility; not used in the leverage-based
             formula.
+        risk_pct:
+            Optional per-symbol risk fraction; defaults to :data:`RISK_PER_TRADE`.
         """
-        position_size = self.balance * RISK_PER_TRADE * LEVERAGE
+        r = RISK_PER_TRADE if risk_pct is None else float(risk_pct)
+        position_size = self.balance * r * LEVERAGE
         # Cap allocation to an equal share of the current balance
         max_allocation = self.balance / self.max_positions
         position_size = min(position_size, max_allocation)
@@ -216,7 +236,7 @@ class RiskManager:
             position_size,
             self.balance,
             LEVERAGE,
-            RISK_PER_TRADE,
+            r,
             max_allocation,
         )
         return position_size
