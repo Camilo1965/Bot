@@ -30,4 +30,4 @@
 
 ## Tests añadidos
 
-- `tests/test_bot_critical.py`: bloqueo con DB lenta, máximo con tres opens en vuelo, burst concurrente.
+- `tests/test_env_smoke.py`: valida que `.env.example` exista para setup.

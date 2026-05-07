@@ -1,274 +1,179 @@
-# ClawdBot 🐾
+# ClawdBot
 
-> **Institutional-grade algorithmic trading system built on an Event-Driven Architecture (EDA)**
-> Python 3.10+ · asyncio · PostgreSQL / TimescaleDB (optional infra; Redis not required for the default `main.py` loop)
+[![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Windows%20(MT5)-0078D6?logo=windows&logoColor=white)](#notes)
+[![Database](https://img.shields.io/badge/db-TimescaleDB-1E8CBE)](https://www.timescale.com/)
 
-The diagram below describes the **target** modular layout. The live entrypoint today
-uses **asyncio tasks**, in-memory shared state, and direct calls between strategy,
-risk, and execution rather than a dedicated central bus or Redis cache.
+> Institutional-grade algorithmic trading bot for MT5 and paper mode.
+> Python 3.12+ · asyncio · TimescaleDB · XGBoost · Windows-only MT5 / PyQt6
 
----
-
-## Table of Contents
-
-1. [Architecture Overview](#architecture-overview)
-2. [Project Structure](#project-structure)
-3. [Prerequisites](#prerequisites)
-4. [Quick Start](#quick-start)
-5. [Module Reference](#module-reference)
-6. [Configuration](#configuration)
-7. [Roadmap](#roadmap)
-
----
-
-## Architecture Overview
-
-ClawdBot is built around an **Event-Driven Architecture (EDA)**. Every significant
-action in the system – a new market tick, a generated trading signal, an order
-fill, a risk-limit breach – is represented as an *event* that flows through a
-central **Event Bus**.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          ClawdBot Process                            │
-│                                                                      │
-│  ┌─────────────┐   events    ┌──────────────┐   events              │
-│  │ data_ingestion│──────────▶│  Event Bus   │──────────┐            │
-│  │  (WebSocket /│            │  (asyncio    │          │            │
-│  │   REST feed) │            │   queues)    │          ▼            │
-│  └─────────────┘            └──────────────┘   ┌─────────────┐     │
-│                                    ▲            │  strategy   │     │
-│  ┌─────────────┐   orders          │            │  (ML models │     │
-│  │  execution  │◀──────────────────┘            │  & signals) │     │
-│  │  (OMS /     │                                └─────────────┘     │
-│  │   exchange) │                                       │            │
-│  └─────────────┘                                       │ signals    │
-│         │                                              ▼            │
-│         │               ┌─────────────┐        ┌─────────────┐     │
-│         └──────────────▶│    risk     │        │    utils    │     │
-│           fills         │  (sizing,  │        │  (logging,  │     │
-│                         │   limits)  │        │   config)   │     │
-│                         └─────────────┘        └─────────────┘     │
-└──────────────────────────────────────────────────────────────────────┘
-         │                                        │
-         ▼                                        ▼
-  ┌─────────────┐                        ┌─────────────┐
-  │ TimescaleDB │                        │    Redis    │
-  │ (tick / bar │                        │  (cache /   │
-  │  history)   │                        │   pub-sub)  │
-  └─────────────┘                        └─────────────┘
+```text
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                           CLAWDBOT: LIVE LOOP                               ║
+║                                                                              ║
+║  market_consumer  ──►  signal_emitter  ──►  executor (MT5/Paper)            ║
+║        │                        │                       │                   ║
+║        ▼                        ▼                       ▼                   ║
+║   MT5 ticks               ML predictor           Orders / Positions          ║
+║        │                        │                       │                   ║
+║        ▼                        ▼                       ▼                   ║
+║   TimescaleDB ◄─────────────── risk_manager ◄────────── state                ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
-### Key Design Principles
+## Highlights
 
-| Principle | Implementation |
-|---|---|
-| **Loose coupling** | Modules communicate only via events; no direct imports across domain boundaries |
-| **Non-blocking I/O** | Every network call uses `asyncio` coroutines (`asyncpg`, `redis-py async`, `ccxt.async_support`) |
-| **Time-series storage** | TimescaleDB hypertables give sub-second query performance on millions of OHLCV rows |
-| **Low-latency cache** | Optional Redis for order-book snapshots (planned); features are computed in-process |
-| **Reproducible ML** | Feature engineering pipelines are version-controlled inside `/strategy` |
+- Async single-process loop with coordinated tasks (no event bus yet)
+- MT5 live mode + paper simulation (long-only execution)
+- XGBoost inference with per-symbol thresholds
+- TimescaleDB hypertables for OHLCV and trades
+- Rich TUI + optional web dashboard (aiohttp :8080)
 
----
+## Architecture
 
-## Project Structure
+The current runtime is an asyncio loop with direct calls between modules. A dedicated
+event bus is planned (see `BACKLOG.md`). Concurrency safety for positions uses an
+`asyncio.Lock` + `_pending_symbols` gate (see `ARCHITECTURE.md`).
+
+```mermaid
+flowchart LR
+  subgraph main_loop [main / loops]
+    MC[market_consumer]
+    SE[signal_emitter]
+  end
+  subgraph exec [execution]
+    PE[PaperExecutor / MT5Executor]
+    L["_positions_lock asyncio.Lock"]
+    OP[(open_positions dict)]
+    Pending["_pending_symbols set"]
+  end
+  subgraph io [I/O]
+    MT5[MetaTrader5 API]
+    DB[(TimescaleDB asyncpg)]
+  end
+  MC --> SE
+  SE --> PE
+  PE --> L
+  L --> OP
+  L --> Pending
+  PE --> MT5
+  PE --> DB
+```
+
+## Project Layout
 
 ```
 Bot/
-├── core/                  # Event bus and abstract base classes
-│   └── __init__.py
-├── data_ingestion/        # Async WebSocket feeds & historical REST loaders
-│   └── __init__.py
+├── bot/                   # Main bot loop, dashboards, and event loop coordination
 ├── strategy/              # ML models, signal generation, feature engineering
-│   └── __init__.py
 ├── execution/             # Order Management System (OMS)
-│   └── __init__.py
-├── risk/                  # Position sizing and risk management
-│   └── __init__.py
-├── utils/                 # Structured logging and configuration helpers
-│   └── __init__.py
-├── main.py                # Application entry point (asyncio event loop)
+├── risk/                  # Risk management and position sizing
+├── database/              # TimescaleDB connection management
+├── data_ingestion/        # Market data feeds (MT5 and polling)
+├── utils/                 # Configuration, logging, and utilities
+├── gui/                   # PyQt6 desktop GUI (Windows-only)
+├── models/                # Pre-trained XGBoost model files
+├── scripts/               # Utility scripts and audits
+├── logs/                  # Runtime logs
+├── tests/                 # pytest tests
+├── main.py                # Application entry point
 ├── docker-compose.yml     # TimescaleDB + Redis services
 ├── requirements.txt       # Python dependencies
 ├── .env.example           # Environment variable template
-└── README.md
+├── ARCHITECTURE.md        # Execution details and locking model
+├── BACKLOG.md             # Deferred items (event bus, Redis, etc.)
+└── AGENTS.md              # Cursor Cloud notes
 ```
-
----
 
 ## Prerequisites
 
-- **Docker** ≥ 24 and **Docker Compose** ≥ 2
-- **Python** 3.10 or later
-- (Optional) a virtual-environment manager such as `venv` or `conda`
-
----
+- Docker >= 24 and Docker Compose >= 2
+- Python 3.12+
+- MT5 terminal + account if running live mode (Windows-only)
 
 ## Quick Start
 
-### 1 – Start the infrastructure containers
+### 1) Configure environment
 
 ```bash
-# Copy and edit the environment file
 cp .env.example .env
-# (fill in DB_USER, DB_PASSWORD, exchange credentials, etc.)
+```
 
-# Start PostgreSQL/TimescaleDB and Redis in the background
-docker compose up -d
+Set:
+- `EXECUTION_MODE=paper` on Linux
+- `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` for live mode
 
-# Verify both containers are healthy
+### 2) Start TimescaleDB
+
+```bash
+docker compose up -d db
 docker compose ps
 ```
 
-### 2 – Install Python dependencies
+Optional Redis (not required by default loop):
+
+```bash
+docker compose up -d redis
+```
+
+### 3) Install dependencies
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install --upgrade pip
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3 – Run the application
+Linux/CI: filter `MetaTrader5`, `PyQt6`, `pyqtgraph` before install. See `AGENTS.md`.
+
+### 4) Run
 
 ```bash
 python main.py
 ```
 
-You should see structured JSON log output similar to:
-
-```json
-{"timestamp": "2025-01-01T00:00:00+00:00", "level": "INFO", "logger": "clawdbot", "message": "ClawdBot starting up"}
-{"timestamp": "2025-01-01T00:00:00+00:00", "level": "INFO", "logger": "clawdbot", "message": "ClawdBot shut down cleanly"}
-```
-
-### 4 – Tear down containers
-
-```bash
-docker compose down          # keep volumes
-docker compose down -v       # also remove volumes (destroys data)
-```
-
----
-
-## Module Reference
-
-### `core/`
-Contains the **Event Bus** and abstract base classes that every domain module
-inherits from. The event bus exposes `publish(event)` and `subscribe(event_type,
-handler)` coroutines backed by `asyncio.Queue`.
-
-### `data_ingestion/`
-Responsible for streaming real-time market data via **WebSocket** (using
-`ccxt.async_support` or raw `websockets`) and loading historical OHLCV data from
-exchange REST APIs or TimescaleDB.
-
-### `strategy/`
-Houses **feature engineering** pipelines (`pandas` / `polars`), **ML model**
-training and inference (`xgboost`, `transformers`), and **signal generation**
-logic that publishes `SignalEvent` objects onto the bus.
-
-### `execution/`
-The **Order Management System** converts signals into exchange orders via
-`ccxt.async_support`, tracks open positions, and emits `FillEvent` objects on
-confirmation.
-
-### `risk/`
-Enforces **position limits**, **max drawdown** guards, and **fixed-fractional**
-position sizing (see `RISK_PER_TRADE` / leverage in `risk/risk_manager.py`), not
-Kelly sizing (possible future enhancement).
-
-### `utils/`
-Provides a reusable **structured JSON logger** and a `Config` class that loads
-settings from the `.env` file via `python-dotenv`.
-
----
+On Linux, the bot exits after startup because MT5 feed is unavailable.
 
 ## Configuration
 
-All secrets and environment-specific settings live in `.env` (never committed).
-Copy `.env.example` and populate the values:
+All settings are in `.env`. See `.env.example` for full defaults.
 
-| Variable | Description |
-|---|---|
-| `EXCHANGE_API_KEY` | API key for the target exchange |
-| `EXCHANGE_SECRET` | API secret for the target exchange |
-| `DB_USER` | PostgreSQL username |
-| `DB_PASSWORD` | PostgreSQL password |
-| `REDIS_URL` | Redis connection URL (e.g. `redis://localhost:6379/0`) |
+Core variables:
+- `EXECUTION_MODE` (`mt5` or `paper`)
+- `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`
+- `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME`
+- `GEMINI_API_KEY` (optional sentiment)
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (optional alerts)
 
----
+## Testing
 
-## Roadmap
+```bash
+python -m pytest tests/ -q --tb=short
+```
 
-- [ ] Implement `core/event_bus.py` with async publish/subscribe
-- [ ] Add WebSocket feed in `data_ingestion/`
-- [ ] Build feature engineering pipeline in `strategy/`
-- [ ] Implement OMS in `execution/`
-- [ ] Optional: Kelly-criterion or regime-aware sizing in `risk/` (today: fixed fractional)
-- [ ] Wire up structured config loader in `utils/`
-- [ ] Add pytest test suite
-- [ ] CI/CD pipeline with GitHub Actions
-# 📈 ClawdBot - Quantitative Algorithmic Trading System
+Current coverage is minimal (smoke checks + targeted regressions). See `BUGS_REPORT.md` and `CHANGES.md` for audit context.
 
-ClawdBot es un sistema de trading algorítmico de grado institucional diseñado con una arquitectura orientada a eventos (Event-Driven Architecture). Su objetivo es operar en los mercados financieros combinando microestructura de mercado (Order Book y datos Tick), indicadores técnicos estadísticos y análisis de sentimiento impulsado por Inteligencia Artificial (NLP).
+## Status / Roadmap
 
-## 🏗️ Arquitectura del Sistema
+Active production loop is **asyncio direct-call** (no bus). Deferred items are tracked in
+`BACKLOG.md`:
 
-El sistema está construido para minimizar la latencia y procesar grandes volúmenes de datos en tiempo real:
+- Event bus abstraction
+- Optional Redis cache/pub-sub
+- GUI realtime improvements
+- Short selling model
+- Live Sharpe / profit metrics
 
-* **Motor Principal:** Python 3.10+ utilizando `asyncio` para concurrencia y manejo de WebSockets.
-* **Base de Datos (Series Temporales):** PostgreSQL con la extensión TimescaleDB, optimizado para almacenar millones de velas (OHLCV) y datos de ticks históricos.
-* **Caché en Memoria (opcional):** Redis puede usarse para libro de órdenes y pub/sub; el bucle por defecto no lo requiere.
-* **Inteligencia Artificial:** Módulos de Machine Learning (XGBoost/LightGBM) para datos tabulares y NLP (Modelos LLM/FinBERT) para análisis de sentimiento de noticias financieras.
+## Notes
 
-## 📂 Estructura del Proyecto
+- MT5 + PyQt6 are Windows-only
+- Web dashboard runs on `:8080` only when the full loop is active
+- See `ARCHITECTURE.md` for synchronization details
+- Known issues and fixes: `BUGS_REPORT.md` and `CHANGES.md`
 
-El código está modularizado siguiendo los estándares de la industria cuantitativa:
+## Disclaimer
 
-* `/core`: Contiene el bus de eventos base, enrutador de mensajes y clases abstractas.
-* `/data_ingestion`: Conexiones asíncronas vía WebSockets a exchanges (APIs) y recolección de noticias.
-* `/strategy`: El "cerebro". Ingeniería de características (Feature Engineering), modelos predictivos de Machine Learning y generador de señales.
-* `/execution`: Sistema de Gestión de Órdenes (OMS). Lógica para enrutar órdenes (Market/Limit), cálculo de comisiones y control de *slippage*.
-* `/risk`: Gestión de capital, dimensionamiento por fracción fija (`RISK_PER_TRADE`) y límites de riesgo.
-* `/utils`: Configuraciones de variables de entorno, sistemas de logging y métricas de rendimiento (Ratio de Sharpe).
-
-## 🚀 Instalación y Despliegue Local
-
-### Requisitos Previos
-* [Docker](https://www.docker.com/) y Docker Compose instalados.
-* Python 3.10 o superior.
-
-### Paso a Paso
-
-1.  **Clonar el repositorio:**
-    ```bash
-    git clone [https://github.com/TU_USUARIO/clawdbot.git](https://github.com/TU_USUARIO/clawdbot.git)
-    cd clawdbot
-    ```
-
-2.  **Configurar Variables de Entorno:**
-    Copia el archivo de ejemplo y configura tus claves (APIs, contraseñas de BD):
-    ```bash
-    cp .env.example .env
-    ```
-
-3.  **Levantar la Infraestructura (Base de datos y Caché):**
-    Utiliza Docker para iniciar TimescaleDB y Redis en segundo plano:
-    ```bash
-    docker-compose up -d
-    ```
-
-4.  **Instalar Dependencias de Python:**
-    Se recomienda usar un entorno virtual (`venv` o `conda`):
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-5.  **Ejecutar el Bot:**
-    ```bash
-    python main.py
-    ```
-
-## ⚠️ Descargo de Responsabilidad (Disclaimer)
-Este software tiene fines educativos y de investigación cuantitativa. El trading algorítmico en mercados financieros conlleva un alto nivel de riesgo. Los mercados son volátiles y las fallas de software o latencia de red pueden resultar en pérdidas financieras significativas. No opere con dinero que no esté dispuesto a perder.
+This software is for educational and research use. Algorithmic trading involves risk.
+Do not trade with funds you cannot afford to lose.

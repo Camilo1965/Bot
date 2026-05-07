@@ -35,4 +35,4 @@ jobs:
           pip install -r /tmp/requirements_ci.txt
 
       - name: Run pytest
-        run: python -m pytest tests/ -q --tb=short --ignore=tests/manual_order_test.py
+        run: python -m pytest tests/ -q --tb=short
