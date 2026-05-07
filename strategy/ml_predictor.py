@@ -50,25 +50,47 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-# Sandbox / small-capital profile: higher prob gates, per-symbol SL and risk (see get_symbol_config).
+# Optimization for MT5 known symbols with higher Profit Factor and daily consistency.
 SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     "BTC/USDT": {
-        "prob_threshold": 0.65,
-        "fixed_sl_pct": 0.03,
+        "prob_threshold": 0.60,
+        "fixed_sl_pct": 0.02,
         "use_sma_filter": False,
-        "risk": 0.07,
+        "risk": 0.03,
+        "timeframe": "30m",
+        "horizon": 12,
     },
     "ETH/USDT": {
-        "prob_threshold": 0.74,
+        "prob_threshold": 0.65,
+        "fixed_sl_pct": 0.02,
+        "use_sma_filter": True,
+        "risk": 0.03,
+        "timeframe": "15m",
+        "horizon": 8,
+    },
+    "SOL/USDT": {
+        "prob_threshold": 0.50,
         "fixed_sl_pct": 0.03,
         "use_sma_filter": True,
-        "risk": 0.07,
+        "risk": 0.03,
+        "timeframe": "15m",
+        "horizon": 12,
     },
-    "PAXG/USDT": {
-        "prob_threshold": 0.62,
-        "fixed_sl_pct": 0.015,
+    "DOGE/USDT": {
+        "prob_threshold": 0.55,
+        "fixed_sl_pct": 0.04,
+        "use_sma_filter": False,
+        "risk": 0.02,
+        "timeframe": "30m",
+        "horizon": 12,
+    },
+    "XRP/USDT": {
+        "prob_threshold": 0.65,
+        "fixed_sl_pct": 0.025,
         "use_sma_filter": True,
-        "risk": 0.07,
+        "risk": 0.03,
+        "timeframe": "5m",
+        "horizon": 4,
     },
 }
 
@@ -314,13 +336,19 @@ class MLPredictor:
         lows: list[float] | None = None,
         obi_ratio: float = 1.0,
         volumes: list[float] | None = None,
+        symbol: str = "ETH/USDT",
     ) -> list[float] | None:
         """Compute quant features (same pipeline as ``scripts/quant_sweep.py``)."""
         del sentiment, obi_ratio
         if highs is None or lows is None:
             highs = prices
             lows = prices
-        vec = compute_quant_vector_from_lists(prices, highs, lows, volumes)
+        
+        cfg = get_symbol_config(symbol)
+        tf_str = cfg.get("timeframe", "15m")
+        tf_min = int(tf_str[:-1]) if tf_str[:-1].isdigit() else 15
+        
+        vec = compute_quant_vector_from_lists(prices, highs, lows, volumes, base_timeframe_min=tf_min)
         if vec is None:
             return None
         return vec
@@ -438,6 +466,7 @@ class MLPredictor:
         volumes: list[float] | None = None,
         *,
         symbol: str | None = None,
+        precomputed_features: list[float] | None = None,
     ) -> float | None:
         """Return the probability of an upward price move.
 
@@ -451,6 +480,7 @@ class MLPredictor:
         lows:            Optional low prices for ADX/ATR computation.
         obi_ratio:       Ignored (API compatibility).
         symbol:          When set and not in ``ALLOWED_SYMBOLS``, returns ``None``.
+        precomputed_features: Optional precomputed feature vector to avoid redundant calculation.
 
         Returns
         -------
@@ -460,17 +490,21 @@ class MLPredictor:
         if symbol is not None and symbol not in ALLOWED_SYMBOLS:
             return None
 
-        if len(prices) < _MIN_PRICES_FOR_INFERENCE:
-            logger.debug(
-                "predict_proba: not enough prices (%d < %d).",
-                len(prices),
-                _MIN_PRICES_FOR_INFERENCE,
-            )
-            return None
+        if precomputed_features is not None:
+            features = precomputed_features
+        else:
+            if len(prices) < _MIN_PRICES_FOR_INFERENCE:
+                logger.debug(
+                    "predict_proba: not enough prices (%d < %d).",
+                    len(prices),
+                    _MIN_PRICES_FOR_INFERENCE,
+                )
+                return None
 
-        features = self._compute_features(
-            prices, sentiment_score, highs, lows, obi_ratio, volumes=volumes
-        )
+            features = self._compute_features(
+                prices, sentiment_score, highs, lows, obi_ratio, volumes=volumes
+            )
+
         if features is None:
             return None
         X = pd.DataFrame([features], columns=_FEATURE_COLS)
@@ -520,14 +554,23 @@ class MLPredictor:
         volumes: list[float] | None = None,
         *,
         symbol: str = "ETH/USDT",
-    ) -> Signal:
-        """BUY only when HTF (precio > SMA200 1h) passes, then ``probability ≥ BUY_PROB_THRESHOLD``."""
+    ) -> tuple[Signal, float]:
+        """BUY only when HTF (precio > SMA200 1h) passes, then ``probability ≥ BUY_PROB_THRESHOLD``.
+        
+        Returns tuple of (Signal, Probability).
+        """
         del funding_rate, htf_trend_4h, htf_trend_1h
         if symbol not in ALLOWED_SYMBOLS:
             logger.debug("Signal=HOLD (symbol %s not in ALLOWED_SYMBOLS)", symbol)
-            return "HOLD"
+            return "HOLD", 0.0
 
         cfg = get_symbol_config(symbol)
+        
+        # Precompute features once
+        features = self._compute_features(
+            prices, sentiment_score, highs, lows, obi_ratio, volumes=volumes
+        )
+        
         probability = self.predict_proba(
             prices,
             sentiment_score,
@@ -536,19 +579,20 @@ class MLPredictor:
             obi_ratio,
             volumes=volumes,
             symbol=symbol,
+            precomputed_features=features,
         )
 
         if probability is None:
             logger.debug("Signal=HOLD (model not ready or insufficient data)")
-            return "HOLD"
+            return "HOLD", 0.0
 
-        if cfg["use_sma_filter"] and not htf_sma200_1h_allows_long(prices):
+        if cfg["use_sma_filter"] and not htf_sma200_1h_allows_long(prices, base_timeframe_min=tf_min):
             logger.debug(
                 "Signal=HOLD (precio ≤ SMA200 1h) prob=%.4f symbol=%s",
                 probability,
                 symbol,
             )
-            return "HOLD"
+            return "HOLD", probability
 
         th = float(cfg["prob_threshold"])
         if probability >= th:
@@ -558,7 +602,7 @@ class MLPredictor:
                 symbol,
                 th,
             )
-            return "BUY"
+            return "BUY", probability
 
         logger.debug("Signal=HOLD  probability=%.4f  symbol=%s", probability, symbol)
-        return "HOLD"
+        return "HOLD", probability

@@ -136,6 +136,14 @@ def generate_dashboard(
     col3.append("📈 PnL Sesión: ", style="dim")
     col3.append(pnl_s, style=f"bold {pnl_c}")
     col3.append("\n")
+    
+    # [NEW] Portfolio Exposure
+    exp_pct = risk_manager.get_current_risk_exposure() * 100
+    exp_color = "bright_red" if exp_pct > 8 else "yellow" if exp_pct > 5 else "bright_green"
+    col3.append("🛡️ Riesgo Port.: ", style="dim")
+    col3.append(f"{exp_pct:.1f}%", style=f"bold {exp_color}")
+    col3.append("\n")
+    
     col3.append(f"🏆 W/L: {wins}/{losses}", style="dim")
     if total_trades > 0:
         wr_color = "bright_green" if winrate >= 55 else "yellow" if winrate >= 45 else "bright_red"
@@ -396,6 +404,16 @@ def generate_dashboard(
     pnl_val, pnl_c = _pnl_str(total_pnl)
 
     risk_text = Text()
+    
+    # [NEW] Weekly Performance
+    weekly_pnl = risk_manager.balance - risk_manager._weekly_start_balance
+    wp_s, wp_c = _pnl_str(weekly_pnl)
+    risk_text.append("📅 PnL Semanal:    ", style="dim")
+    risk_text.append(f"{wp_s:>10} {unit}\n", style=f"bold {wp_c}")
+    risk_text.append("🛡️ Riesgo Actual:   ", style="dim")
+    risk_text.append(f"{exp_pct:>10.1f}%\n", style=f"bold {exp_color}")
+    risk_text.append("─" * 32 + "\n", style="dim")
+
     risk_text.append("💰 Balance:        ", style="dim")
     risk_text.append(f"{balance:>10,.2f} {unit}\n", style="bold white")
     if use_mt5:

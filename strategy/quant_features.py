@@ -73,7 +73,7 @@ def _macd(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
     return line, signal, hist
 
 
-def _close_vs_sma200_1h_series(close: pd.Series, timestamp: pd.Series | None) -> pd.Series:
+def _close_vs_sma200_1h_series(close: pd.Series, timestamp: pd.Series | None, base_timeframe_min: int = 15) -> pd.Series:
     """Relative distance close/SMA200(1h)-1; 0 when insufficient history."""
     c = close.astype(float)
     if timestamp is not None and len(timestamp):
@@ -87,12 +87,16 @@ def _close_vs_sma200_1h_series(close: pd.Series, timestamp: pd.Series | None) ->
     arr = c.values
     n = len(arr)
     out = np.zeros(n, dtype=float)
-    hourly = pd.Series(arr[::4], dtype=float)
+    
+    # Calculate step based on base_timeframe_min (e.g., 60/15 = 4)
+    step = max(1, 60 // base_timeframe_min)
+    
+    hourly = pd.Series(arr[::step], dtype=float)
     if len(hourly) < _SMA200_1H_PERIODS:
         return pd.Series(out, index=c.index)
     sma200 = hourly.rolling(_SMA200_1H_PERIODS, min_periods=_SMA200_1H_PERIODS).mean()
     for i in range(n):
-        hi = i // 4
+        hi = i // step
         if hi < _SMA200_1H_PERIODS - 1:
             continue
         sm = float(sma200.iloc[hi])
@@ -105,6 +109,7 @@ def add_quant_features(
     ohlcv: pd.DataFrame,
     *,
     volume_col: str = "volume",
+    base_timeframe_min: int = 15,
 ) -> pd.DataFrame:
     """Append feature columns to OHLCV frame (expects open, high, low, close)."""
     df = ohlcv.copy()
@@ -136,7 +141,7 @@ def add_quant_features(
     df["log_ret_1"] = np.log(close / close.shift(1)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
     df["log_ret_5"] = np.log(close / close.shift(5)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-    df["close_vs_sma200_1h"] = _close_vs_sma200_1h_series(close, ts_col)
+    df["close_vs_sma200_1h"] = _close_vs_sma200_1h_series(close, ts_col, base_timeframe_min=base_timeframe_min)
     v_ma_rel = vol.rolling(_VOL_REL_WIN, min_periods=5).mean().replace(0, np.nan)
     df["vol_rel"] = (vol / v_ma_rel).replace([np.inf, -np.inf], 1.0).fillna(1.0)
 
@@ -148,6 +153,7 @@ def compute_quant_vector_from_lists(
     highs: list[float],
     lows: list[float],
     volumes: list[float] | None,
+    base_timeframe_min: int = 15,
 ) -> list[float] | None:
     """Latest feature vector aligned with QUANT_FEATURE_COLS (for live inference)."""
     if len(closes) < MIN_OHLC_ROWS or len(highs) < MIN_OHLC_ROWS or len(lows) < MIN_OHLC_ROWS:
@@ -166,7 +172,7 @@ def compute_quant_vector_from_lists(
             "volume": vol,
         }
     )
-    feat = add_quant_features(df)
+    feat = add_quant_features(df, base_timeframe_min=base_timeframe_min)
     row = feat.iloc[-1]
     out = []
     for c in QUANT_FEATURE_COLS:
@@ -177,11 +183,11 @@ def compute_quant_vector_from_lists(
     return out
 
 
-def htf_sma200_1h_allows_long(closes: list[float]) -> bool:
+def htf_sma200_1h_allows_long(closes: list[float], base_timeframe_min: int = 15) -> bool:
     """Long-only HTF gate: último close por encima de SMA200 en marco 1h (véase ``close_vs_sma200_1h``)."""
     if len(closes) < MIN_OHLC_ROWS:
         return False
-    s = _close_vs_sma200_1h_series(pd.Series(closes, dtype=float), None)
+    s = _close_vs_sma200_1h_series(pd.Series(closes, dtype=float), None, base_timeframe_min=base_timeframe_min)
     return float(s.iloc[-1]) > 0.0
 
 

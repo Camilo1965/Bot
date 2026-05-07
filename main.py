@@ -172,7 +172,7 @@ def _watchlist_from_env() -> list[str]:
     raw = os.environ.get("WATCHLIST", "").strip()
     if raw:
         return [x.strip() for x in raw.split(",") if x.strip()]
-    return ["BTC/USDT", "ETH/USDT", "PAXG/USDT"]
+    return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "XRP/USDT"]
 
 
 # Symbols must exist in MT5 Market Watch (see execution.mt5_executor.SYMBOL_MAP).

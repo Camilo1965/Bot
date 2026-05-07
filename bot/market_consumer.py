@@ -47,8 +47,23 @@ async def market_consumer(
             continue
 
         # Update last price in state
-        state["prices"][sym].append(price)
+        state["last_price"] = price  # Store latest price for real-time checks
         state["last_market_message_at"] = datetime.now(tz=timezone.utc)
+
+        # Buffer update logic: update technical indicator buffers based on configured timeframe
+        from strategy.ml_predictor import get_symbol_config
+        cfg = get_symbol_config(sym)
+        target_tf = cfg.get("timeframe", "15m")
+
+        if mtype == "kline" and msg.get("timeframe") == target_tf:
+            state["prices"][sym].append(price)
+            state["highs"][sym].append(float(msg.get("high", price)))
+            state["lows"][sym].append(float(msg.get("low", price)))
+            
+            vol_deques = state.setdefault("volumes", {})
+            if sym not in vol_deques:
+                vol_deques[sym] = collections.deque(maxlen=1000)
+            vol_deques[sym].append(float(msg.get("volume", 0.0) or 0.0))
 
         _rsi_tf = dashboard_rsi_timeframe()
         if (
@@ -68,32 +83,15 @@ async def market_consumer(
                 "mid": price,
             }
 
-        # Tick streams have no OHLC — mirror mid into high/low so buffers stay aligned with prices for ATR/ML.
-        if mtype in ("trade", "order_book"):
-            state["highs"][sym].append(price)
-            state["lows"][sym].append(price)
-            vol_deques = state.setdefault("volumes", {})
-            if sym not in vol_deques:
-                vol_deques[sym] = collections.deque(maxlen=1000)
-            vol_deques[sym].append(float(msg.get("volume", 0.0) or 0.0))
-
         # New closed candle: only kline messages carry OHLC; ticks must not write bogus highs/lows.
         kline_ts = msg.get("timestamp")
         if (
             mtype == "kline"
             and kline_ts
             and kline_ts != state["last_kline_ts"].get(sym)
-            and "high" in msg
-            and "low" in msg
         ):
             state["last_kline_ts"][sym] = kline_ts
-            state["highs"][sym].append(float(msg["high"]))
-            state["lows"][sym].append(float(msg["low"]))
-            vol_deques = state.setdefault("volumes", {})
-            if sym not in vol_deques:
-                vol_deques[sym] = collections.deque(maxlen=1000)
-            vol_deques[sym].append(float(msg.get("volume", 0.0) or 0.0))
-
+            
             if "timeframe" in msg and "close" in msg:
                 tf = msg["timeframe"]
                 if tf in ("1h", "4h"):

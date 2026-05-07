@@ -57,7 +57,8 @@ async def signal_emitter(
             else:
                 current_atr = state.get("atrs", {}).get(symbol)
 
-            signal = predictor.generate_signal(
+            # Single-pass prediction
+            signal, win_prob = predictor.generate_signal(
                 prices,
                 0.0,
                 highs=highs or None,
@@ -68,16 +69,6 @@ async def signal_emitter(
                 symbol=symbol,
             )
             state["ml_signals"][symbol] = signal
-            win_prob: float = predictor.predict_proba(
-                prices,
-                0.0,
-                highs=highs or None,
-                lows=lows or None,
-                obi_ratio=obi_ratio,
-                volumes=volumes or None,
-                symbol=symbol,
-            ) or 0.0
-
             # Store the latest ML confidence so dashboard_logger can display it.
             state["ml_probs"][symbol] = win_prob
 

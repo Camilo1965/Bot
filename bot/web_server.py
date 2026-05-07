@@ -991,6 +991,11 @@ async def start_web_dashboard(
         
         return web.json_response(resp)
 
+    async def handle_performance(request: web.Request) -> web.Response:
+        from bot.performance_analyzer import analyzer
+        metrics = await analyzer.get_metrics()
+        return web.json_response(metrics)
+
     _rpm_raw = os.environ.get("DASH_API_RATE_PER_MIN", "180").strip()
     try:
         _rpm = max(0, int(_rpm_raw))
@@ -1000,7 +1005,8 @@ async def start_web_dashboard(
     app = web.Application(middlewares=_middlewares)
     app.add_routes([
         web.get("/", handle_html),
-        web.get("/api/state", handle_api)
+        web.get("/api/state", handle_api),
+        web.get("/api/performance", handle_performance)
     ])
 
     # ... existing aiohttp runner code ...

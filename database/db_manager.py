@@ -106,7 +106,43 @@ CREATE TABLE IF NOT EXISTS htf_trend (
 );
 """
 
+_CREATE_TRADE_HISTORY = """
+CREATE TABLE IF NOT EXISTS trade_history (
+    id UUID PRIMARY KEY,
+    timestamp_open TIMESTAMPTZ NOT NULL,
+    timestamp_close TIMESTAMPTZ,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    side TEXT NOT NULL,
+    entry_price DOUBLE PRECISION NOT NULL,
+    exit_price DOUBLE PRECISION,
+    lots DOUBLE PRECISION NOT NULL,
+    pnl_usd DOUBLE PRECISION,
+    pnl_pct DOUBLE PRECISION,
+    exit_reason TEXT,
+    win_probability DOUBLE PRECISION,
+    atr_at_entry DOUBLE PRECISION
+);
+"""
+
 _CREATE_HYPERTABLE_HTF = "SELECT create_hypertable('htf_trend', 'timestamp', if_not_exists => TRUE);"
+_CREATE_HYPERTABLE_TRADES = "SELECT create_hypertable('trade_history', 'timestamp_open', if_not_exists => TRUE);"
+
+_INSERT_TRADE = """
+INSERT INTO trade_history (
+    id, timestamp_open, symbol, timeframe, side, entry_price, lots, win_probability, atr_at_entry
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+"""
+
+_UPDATE_TRADE_EXIT = """
+UPDATE trade_history SET
+    timestamp_close = $2,
+    exit_price = $3,
+    pnl_usd = $4,
+    pnl_pct = $5,
+    exit_reason = $6
+WHERE id = $1;
+"""
 
 _INSERT_PRED = "INSERT INTO ml_predictions (timestamp, symbol, confidence, side) VALUES ($1, $2, $3, $4);"
 _UPSERT_HTF = "INSERT INTO htf_trend (timestamp, symbol, timeframe, trend_status) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING;"
@@ -166,6 +202,11 @@ class DatabaseManager:
             await conn.execute(_CREATE_HTF_TREND)
             try: await conn.execute(_CREATE_HYPERTABLE_HTF)
             except Exception: pass
+            
+            await conn.execute(_CREATE_TRADE_HISTORY)
+            try: await conn.execute(_CREATE_HYPERTABLE_TRADES)
+            except Exception: pass
+            
             await self._refresh_market_columns(conn)
         logger.info("Database schema initialised.")
 
@@ -261,6 +302,42 @@ class DatabaseManager:
         ts = datetime.now(tz=timezone.utc)
         async with self._pool.acquire() as conn:
             await conn.execute(_UPSERT_HTF, ts, symbol, timeframe, trend_status)
+
+    async def insert_trade_open(
+        self,
+        trade_id: Any,
+        timestamp_open: datetime,
+        symbol: str,
+        timeframe: str,
+        side: str,
+        entry_price: float,
+        lots: float,
+        win_probability: float | None = None,
+        atr: float | None = None,
+    ) -> None:
+        if not self._pool: return
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                _INSERT_TRADE,
+                trade_id, timestamp_open, symbol, timeframe, side,
+                entry_price, lots, win_probability, atr
+            )
+
+    async def update_trade_exit(
+        self,
+        trade_id: Any,
+        timestamp_close: datetime,
+        exit_price: float,
+        pnl_usd: float,
+        pnl_pct: float,
+        exit_reason: str,
+    ) -> None:
+        if not self._pool: return
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                _UPDATE_TRADE_EXIT,
+                trade_id, timestamp_close, exit_price, pnl_usd, pnl_pct, exit_reason
+            )
 
     # ── CEO / Telegram: closed-trade analytics (expects ``trades_history``) ─────────
 

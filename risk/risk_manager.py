@@ -170,17 +170,19 @@ def get_execution_thresholds() -> DynamicThresholds:
     )
 
 
+# ── Portfolio risk parameters ──────────────────────────────────────────────────
+MAX_PORTFOLIO_RISK_PCT: float = 0.10 # 10% maximum capital at risk across all positions
+DRAWDOWN_HALFRISK_THRESHOLD: float = 0.05 # Reduce risk by 50% if weekly DD > 5%
+
 class RiskManager:
-    """Calculate position sizes for Binance Futures with a daily-loss safety break.
+    """Calculate position sizes for MetaTrader 5 with portfolio-level risk control.
 
     Parameters
     ----------
     initial_balance:
         Starting simulated balance in quote currency (e.g. USDT).
-        Defaults to 10 000.
     max_positions:
         Maximum number of positions that may be open at the same time.
-        Defaults to 3.
     """
 
     def __init__(
@@ -198,199 +200,73 @@ class RiskManager:
         self._daily_start_balance: float = initial_balance
         self._daily_loss: float = 0.0
         self._trading_halted_until: datetime | None = None
+        
+        # [PRO] Portfolio-level risk tracking
+        self._weekly_start_balance: float = initial_balance
+        self._total_risk_usd: float = 0.0 # Sum of (entry - SL) * lots for all open positions
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def get_current_risk_exposure(self) -> float:
+        """Return the current percentage of capital at risk."""
+        if self.balance <= 0: return 1.0
+        return self._total_risk_usd / self.balance
 
     def calculate_position_size(
         self,
-        win_probability: float,  # noqa: ARG002
+        win_probability: float,
         *,
         risk_pct: float | None = None,
+        sl_distance_pct: float = 0.02,
     ) -> float:
         """Return the position size in quote currency for the next trade.
 
-        Uses the formula ``balance * risk_pct * LEVERAGE`` (default ``RISK_PER_TRADE``).
-
-        The position size is also capped at ``balance / max_positions`` so
-        that no single trade consumes more than a fair share of the
-        portfolio.
-
-        Parameters
-        ----------
-        win_probability:
-            ML-predicted probability of the trade being profitable (0–1).
-            Accepted for API compatibility; not used in the leverage-based
-            formula.
-        risk_pct:
-            Optional per-symbol risk fraction; defaults to :data:`RISK_PER_TRADE`.
+        Includes dynamic risk reduction based on drawdown and portfolio exposure.
         """
-        r = RISK_PER_TRADE if risk_pct is None else float(risk_pct)
-        position_size = self.balance * r * LEVERAGE
+        base_r = RISK_PER_TRADE if risk_pct is None else float(risk_pct)
+        
+        # 1. Drawdown 'Thermometer' - reduce risk if weekly performance is poor
+        weekly_dd = (self._weekly_start_balance - self.balance) / self._weekly_start_balance
+        if weekly_dd > DRAWDOWN_HALFRISK_THRESHOLD:
+            base_r *= 0.5
+            logger.warning(
+                "Risk reduced by 50%% due to weekly drawdown (%.2f%% > %.2f%%)",
+                weekly_dd * 100, DRAWDOWN_HALFRISK_THRESHOLD * 100
+            )
+
+        # 2. Portfolio Exposure Check
+        current_exposure = self.get_current_risk_exposure()
+        if current_exposure + base_r > MAX_PORTFOLIO_RISK_PCT:
+            # Scale down base_r to fit remaining risk budget
+            base_r = max(0.0, MAX_PORTFOLIO_RISK_PCT - current_exposure)
+            if base_r < 0.005: # Minimum 0.5% risk to bother opening
+                logger.warning("Portfolio risk budget full (%.2f%%). Skipping trade.", current_exposure * 100)
+                return 0.0
+            logger.info("Risk scaled to %.2f%% to fit portfolio budget.", base_r * 100)
+
+        # 3. Size by SL distance: risk_amount = balance * base_r
+        # position_size = risk_amount / sl_distance_pct
+        position_size = (self.balance * base_r) / max(0.001, sl_distance_pct)
+        
         # Cap allocation to an equal share of the current balance
-        max_allocation = self.balance / self.max_positions
+        max_allocation = (self.balance / self.max_positions) * LEVERAGE
         position_size = min(position_size, max_allocation)
+        
         logger.debug(
-            "position_size=%.2f  balance=%.2f  leverage=%d  risk_per_trade=%.4f  max_allocation=%.2f",
-            position_size,
-            self.balance,
-            LEVERAGE,
-            r,
-            max_allocation,
+            "position_size=%.2f  balance=%.2f  risk_per_trade=%.4f  max_allocation=%.2f",
+            position_size, self.balance, base_r, max_allocation,
         )
         return position_size
 
-    def can_open_position(self) -> bool:
-        """Return *True* if another position may be opened (below max_positions)."""
-        return self._open_count < self.max_positions
-
-    def is_sector_exposed(self, symbol: str, open_symbols: list[str]) -> bool:
-        """Return *True* if any symbol in *open_symbols* shares the sector of *symbol*.
-
-        Used to enforce a maximum of one open position per correlation group
-        (e.g. at most one L1 Major at a time: BTC, ETH, SOL, BNB).
-
-        Parameters
-        ----------
-        symbol:
-            The candidate symbol being considered for a new position.
-        open_symbols:
-            Symbols that currently have an open position.
-        """
-        target_sector = get_sector(symbol)
-        # Unclassified symbols are never blocked by sector exposure.
-        if target_sector == _SECTOR_UNCLASSIFIED:
-            return False
-        return any(get_sector(s) == target_sector for s in open_symbols)
-
-    # ------------------------------------------------------------------
-    # Daily-loss safety break
-    # ------------------------------------------------------------------
-
-    def is_trading_halted(self) -> bool:
-        """Return *True* if trading has been halted due to the daily loss limit.
-
-        The halt is automatically lifted once the 24-hour window has elapsed.
-        """
-        if self._trading_halted_until is None:
-            return False
-        now = datetime.now(tz=timezone.utc)
-        if now >= self._trading_halted_until:
-            # Window has expired – clear the halt
-            logger.info("Trading halt expired – resuming normal operation.")
-            self._trading_halted_until = None
-            return False
-        return True
-
-    # ------------------------------------------------------------------
-    # Portfolio drawdown circuit-breaker
-    # ------------------------------------------------------------------
-
-    def is_portfolio_dd_exceeded(self) -> bool:
-        """Return *True* when the account has lost more than ``MAX_PORTFOLIO_DD_PCT``
-        of the balance recorded at instantiation time.
-
-        This session-level guard fires on "black swan" events (e.g. a flash
-        crash that triggers multiple stop-losses in quick succession).  Unlike
-        the daily-loss halt it is **not** auto-lifted at midnight; a bot
-        restart with fresh capital is required to resume trading.
-
-        For a $50 live account the default 15 % threshold corresponds to a
-        $7.50 maximum tolerable loss before the engine goes fully defensive.
-        """
-        if self.balance < self._portfolio_dd_floor:
-            logger.critical(
-                "🚨 [CIRCUIT BREAKER] Portfolio drawdown limit breached – "
-                "balance=%.2f initial=%.2f threshold=%.0f%% (floor=%.2f). "
-                "All new positions BLOCKED for this session.",
-                self.balance,
-                self._initial_balance,
-                MAX_PORTFOLIO_DD_PCT * 100,
-                self._portfolio_dd_floor,
-            )
-            return True
-        return False
-
-    def record_daily_loss(self, loss: float) -> None:
-        """Accumulate a realised loss and trigger the safety break if needed.
-
-        Parameters
-        ----------
-        loss:
-            Positive value representing the loss amount in quote currency.
-            If the value is negative (i.e. a profit), it is ignored.
-        """
-        if loss <= 0.0:
-            return
-        self._daily_loss += loss
-        threshold = self._daily_start_balance * MAX_DAILY_LOSS_PCT
-        if self._daily_loss >= threshold and self._trading_halted_until is None:
-            self._trading_halted_until = datetime.now(tz=timezone.utc) + _HALT_DURATION
-            logger.warning(
-                "Daily loss limit breached (%.2f / %.2f = %.2f%%). "
-                "Trading HALTED until %s.",
-                self._daily_loss,
-                self._daily_start_balance,
-                (self._daily_loss / self._daily_start_balance) * 100,
-                self._trading_halted_until.isoformat(),
-            )
-
-    def reset_daily_stats(self) -> None:
-        """Reset daily-loss counters (call once per UTC day, e.g. at midnight).
-
-        Clears the accumulated daily loss and refreshes the reference balance
-        used for the 3 % threshold calculation.  Also lifts any active trading
-        halt so the new day can start fresh.
-        """
-        self._daily_start_balance = self.balance
-        self._daily_loss = 0.0
-        self._trading_halted_until = None
-        logger.info(
-            "Daily stats reset.  New reference balance: %.2f",
-            self._daily_start_balance,
-        )
-
-    @property
-    def open_count(self) -> int:
-        """Current number of open positions."""
-        return self._open_count
-
-    def sync_open_count(self, count: int) -> None:
-        """Set the open-position counter to *count* (used at startup to re-sync state).
-
-        Call this once during bot initialisation after querying the exchange for
-        existing open positions so that :meth:`can_open_position` reflects the
-        real number of live positions rather than assuming zero.
-
-        Parameters
-        ----------
-        count:
-            Number of currently open positions as reported by the exchange.
-            Negative values are clamped to 0.
-        """
-        if count < 0:
-            logger.warning(
-                "sync_open_count called with negative value %d – clamping to 0.",
-                count,
-            )
-            count = 0
-        self._open_count = count
-        logger.info("Open-position counter synchronised to %d.", count)
-
-    def register_open(self) -> None:
-        """Increment the open-position counter (call when a trade is opened)."""
+    def register_open(self, risk_usd: float) -> None:
+        """Increment open count and track total risk."""
         self._open_count += 1
+        self._total_risk_usd += max(0.0, risk_usd)
 
-    def register_close(self) -> None:
-        """Decrement the open-position counter (call when a trade is closed)."""
-        if self._open_count == 0:
-            logger.warning(
-                "register_close called when open_count is already 0 – "
-                "possible mismatched open/close calls."
-            )
-            return
-        self._open_count -= 1
+    def register_close(self, risk_usd: float) -> None:
+        """Decrement open count and release risk budget."""
+        if self._open_count > 0:
+            self._open_count -= 1
+        self._total_risk_usd = max(0.0, self._total_risk_usd - risk_usd)
+
 
     def has_sufficient_balance(self, position_size: float) -> bool:
         """Return *True* if the current balance can cover *position_size*."""

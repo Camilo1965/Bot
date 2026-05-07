@@ -89,12 +89,16 @@ class OpenPosition:
     activation_price: float
     trailing_distance_pct: float
     peak_price: float
+    tp_price: float | None = None # [NEW] Dynamic Take Profit
+    time_limit_reached: bool = False # [NEW] Time-based logic
     trailing_stop_active: bool = False
     ml_confidence: float = 0.0
     sl_pct: float = 0.025
     activation_pct: float = 0.02
     stop_loss_price: float = 0.0
     atr_trailing_distance: float = 0.0
+    atr_at_entry: float | None = None # [NEW] Store ATR for history
+    timeframe: str = "15m" # [NEW] Track timeframe
     sentiment_score: float = 0.0
     mt5_position_ticket: int | None = None
     current_stop_loss: float = 0.0
@@ -201,19 +205,38 @@ class PaperExecutor:
         if symbol in self.open_positions: return False
         if not self._risk.can_open_position(): return False
         cfg = get_symbol_config(symbol)
-        pos_size_quote = self._risk.calculate_position_size(win_probability, risk_pct=float(cfg["risk"]))
-        if not self._risk.has_sufficient_balance(pos_size_quote): return False
+        
+        # Risk Management: Portfolio level
+        sl_frac = min(float(cfg.get("fixed_sl_pct", 0.025)), _SL_CAP_FRAC)
+        pos_size_quote = self._risk.calculate_position_size(
+            win_probability, 
+            risk_pct=float(cfg.get("risk", 0.02)),
+            sl_distance_pct=sl_frac
+        )
+        
+        if pos_size_quote <= 0 or not self._risk.has_sufficient_balance(pos_size_quote): 
+            return False
+            
         thresh = get_execution_thresholds()
-        sl_frac = min(float(cfg["fixed_sl_pct"]), _SL_CAP_FRAC)
         sl_price = entry_price * (1.0 - sl_frac)
         act_price = entry_price * (1.0 + thresh.activation_pct)
+        
+        # [PRO] ATR-based Take Profit (default 2.5x ATR)
+        atr_mult = float(os.environ.get("TP_ATR_MULTIPLIER", "2.5"))
+        tp_price = entry_price + (current_atr * atr_mult) if current_atr else None
+        
+        trade_id = uuid.uuid4().hex[:8]
+        now = datetime.now(tz=timezone.utc)
+        tf = cfg.get("timeframe", "15m")
+
         pos = OpenPosition(
-            trade_id=uuid.uuid4().hex[:8],
+            trade_id=trade_id,
             symbol=symbol,
-            entry_time=datetime.now(tz=timezone.utc),
+            entry_time=now,
             entry_price=entry_price,
             position_size=pos_size_quote,
             sl_price=sl_price,
+            tp_price=tp_price,
             activation_price=act_price,
             trailing_distance_pct=thresh.trailing_distance_pct,
             peak_price=entry_price,
@@ -222,19 +245,45 @@ class PaperExecutor:
             activation_pct=thresh.activation_pct,
             stop_loss_price=sl_price,
             atr_trailing_distance=(current_atr or 0.0) * ATR_TRAILING_MULTIPLIER if current_atr else 0.0,
+            atr_at_entry=current_atr,
+            timeframe=tf,
             sentiment_score=sentiment_score,
             current_stop_loss=sl_price,
         )
+        
         self.open_positions[symbol] = pos
-        self._risk.register_open()
+        
+        # Risk accounting
+        risk_usd = pos_size_quote * sl_frac
+        self._risk.register_open(risk_usd=risk_usd)
         self._risk.deduct(pos_size_quote)
+        
+        # DB Record
+        try:
+            await self._db.insert_trade_open(
+                trade_id=trade_id,
+                timestamp_open=now,
+                symbol=symbol,
+                timeframe=tf,
+                side="LONG",
+                entry_price=entry_price,
+                lots=pos_size_quote / entry_price, # rough lots for paper
+                win_probability=win_probability,
+                atr=current_atr
+            )
+        except Exception as exc:
+            logger.warning("Failed to log trade open to DB: %s", exc)
+
         self.save_state()
-        logger.info("🚀 [BUY] %s entry=%.4f size=%.2f SL=%.4f ACT=%.4f (ML=%.2f%%)", symbol, entry_price, pos_size_quote, sl_price, act_price, win_probability * 100)
+        tp_str = f"TP={tp_price:.4f}" if tp_price else "TP=NONE"
+        logger.info("🚀 [BUY] %s entry=%.4f size=%.2f SL=%.4f %s (ML=%.2f%%)", symbol, entry_price, pos_size_quote, sl_price, tp_str, win_probability * 100)
         return True
 
     async def check_and_close(self, symbol: str, current_price: float) -> str | None:
         pos = self.open_positions.get(symbol)
         if not pos: return None
+        
+        # 1. Update Peak and Trailing Stop
         if current_price > pos.peak_price:
             pos.peak_price = current_price
             if current_price >= pos.activation_price:
@@ -245,8 +294,26 @@ class PaperExecutor:
                 if new_sl > pos.sl_price:
                     pos.sl_price = new_sl
                     pos.current_stop_loss = new_sl
+
+        # 2. Check Exits
         exit_reason = None
-        if current_price <= pos.sl_price: exit_reason = "trailing_stop" if pos.trailing_stop_active else "stop_loss"
+        
+        # Dynamic Take Profit (ATR-based)
+        if pos.tp_price and current_price >= pos.tp_price:
+            exit_reason = "take_profit"
+        # Trailing / Stop Loss
+        elif current_price <= pos.sl_price: 
+            exit_reason = "trailing_stop" if pos.trailing_stop_active else "stop_loss"
+        
+        # [PRO] Time-based exit improvement: Move SL to entry after 4 hours if in profit
+        now = datetime.now(tz=timezone.utc)
+        duration_h = (now - pos.entry_time).total_seconds() / 3600.0
+        if not pos.trailing_stop_active and duration_h >= 4.0 and current_price > pos.entry_price:
+            if pos.sl_price < pos.entry_price:
+                pos.sl_price = pos.entry_price
+                pos.current_stop_loss = pos.entry_price
+                logger.info("⏱️ [TIME] %s duration=%.1fh: SL moved to entry (Break-even).", symbol, duration_h)
+
         if exit_reason:
             await self._close_position(symbol, current_price, exit_reason)
             return exit_reason
@@ -272,16 +339,40 @@ class PaperExecutor:
     async def _close_position(self, symbol: str, exit_price: float, reason: str) -> float:
         pos = self.open_positions.pop(symbol)
         exit_time = datetime.now(tz=timezone.utc)
-        gross_pnl = (exit_price - pos.entry_price) / pos.entry_price * pos.position_size
+        
+        # PnL Calculation
+        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
+        gross_pnl = pnl_pct * pos.position_size
+        
         self.total_pnl += gross_pnl
         self._risk.credit(pos.position_size + gross_pnl)
-        self._risk.register_close()
-        if gross_pnl < 0: self._risk.record_daily_loss(abs(gross_pnl))
+        
+        # Risk accounting
+        risk_usd = pos.position_size * pos.sl_pct
+        self._risk.register_close(risk_usd=risk_usd)
+        
+        if gross_pnl < 0: 
+            self._risk.record_daily_loss(abs(gross_pnl))
+            
+        # [NEW] Persistence to trade_history table
+        try:
+            await self._db.update_trade_exit(
+                trade_id=pos.trade_id,
+                timestamp_close=exit_time,
+                exit_price=exit_price,
+                pnl_usd=gross_pnl,
+                pnl_pct=pnl_pct * 100,
+                exit_reason=reason
+            )
+        except Exception as exc:
+            logger.warning("Failed to update trade exit in DB: %s", exc)
+
         self._append_to_journal(pos, exit_price, exit_time, reason)
         self.save_state()
-        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100
-        logger.info("🏁 [CLOSE] %s exit=%.4f pnl=%.2f (%.2f%%) reason=%s", symbol, exit_price, gross_pnl, pnl_pct, reason)
-        await send_telegram_alert(f"🏁 *CLOSE* {symbol}\nExit: {exit_price:.4f}\nPnL: {gross_pnl:+.2f} ({pnl_pct:+.2f}%)\nReason: {reason}")
+        
+        pnl_pct_display = pnl_pct * 100
+        logger.info("🏁 [CLOSE] %s exit=%.4f pnl=%.2f (%.2f%%) reason=%s", symbol, exit_price, gross_pnl, pnl_pct_display, reason)
+        await send_telegram_alert(f"🏁 *CLOSE* {symbol}\nExit: {exit_price:.4f}\nPnL: {gross_pnl:+.2f} ({pnl_pct_display:+.2f}%)\nReason: {reason}")
         return gross_pnl
 
     async def sync_positions_with_exchange(self, confirmations_required: int = 1) -> int:
