@@ -267,8 +267,59 @@ class RiskManager:
             self._open_count -= 1
         self._total_risk_usd = max(0.0, self._total_risk_usd - risk_usd)
 
+    @property
+    def open_count(self) -> int:
+        """Current number of open positions."""
+        return self._open_count
+
+    def can_open_position(self) -> bool:
+        """Return *True* if another position may be opened (below max_positions)."""
+        return self._open_count < self.max_positions
+
+    def sync_open_count(self, count: int) -> None:
+        """Set the open-position counter to *count*."""
+        self._open_count = max(0, count)
+        logger.info("Open-position counter synchronised to %d.", self._open_count)
+
+    def is_trading_halted(self) -> bool:
+        """Return *True* if trading has been halted due to the daily loss limit."""
+        if self._trading_halted_until is None:
+            return False
+        now = datetime.now(tz=timezone.utc)
+        if now >= self._trading_halted_until:
+            self._trading_halted_until = None
+            return False
+        return True
+
+    def is_portfolio_dd_exceeded(self) -> bool:
+        """Return *True* when the account has lost more than MAX_PORTFOLIO_DD_PCT."""
+        if self.balance < self._portfolio_dd_floor:
+            return True
+        return False
+
+    def record_daily_loss(self, loss: float) -> None:
+        """Accumulate a realised loss and trigger the safety break if needed."""
+        if loss <= 0.0: return
+        self._daily_loss += loss
+        threshold = self._daily_start_balance * MAX_DAILY_LOSS_PCT
+        if self._daily_loss >= threshold and self._trading_halted_until is None:
+            self._trading_halted_until = datetime.now(tz=timezone.utc) + _HALT_DURATION
+
+    def reset_daily_stats(self) -> None:
+        """Reset daily-loss counters."""
+        self._daily_start_balance = self.balance
+        self._daily_loss = 0.0
+        self._trading_halted_until = None
+
+    def is_sector_exposed(self, symbol: str, open_symbols: list[str]) -> bool:
+        """Return *True* if any symbol in *open_symbols* shares the sector of *symbol*."""
+        target_sector = get_sector(symbol)
+        if target_sector == _SECTOR_UNCLASSIFIED:
+            return False
+        return any(get_sector(s) == target_sector for s in open_symbols)
 
     def has_sufficient_balance(self, position_size: float) -> bool:
+
         """Return *True* if the current balance can cover *position_size*."""
         return self.balance >= position_size > 0.0
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -107,7 +108,7 @@ CREATE TABLE IF NOT EXISTS htf_trend (
 """
 
 _CREATE_TRADE_HISTORY = """
-CREATE TABLE IF NOT EXISTS trade_history (
+CREATE TABLE IF NOT EXISTS trades_history (
     id UUID PRIMARY KEY,
     timestamp_open TIMESTAMPTZ NOT NULL,
     timestamp_close TIMESTAMPTZ,
@@ -126,16 +127,16 @@ CREATE TABLE IF NOT EXISTS trade_history (
 """
 
 _CREATE_HYPERTABLE_HTF = "SELECT create_hypertable('htf_trend', 'timestamp', if_not_exists => TRUE);"
-_CREATE_HYPERTABLE_TRADES = "SELECT create_hypertable('trade_history', 'timestamp_open', if_not_exists => TRUE);"
+_CREATE_HYPERTABLE_TRADES = "SELECT create_hypertable('trades_history', 'timestamp_open', if_not_exists => TRUE);"
 
 _INSERT_TRADE = """
-INSERT INTO trade_history (
+INSERT INTO trades_history (
     id, timestamp_open, symbol, timeframe, side, entry_price, lots, win_probability, atr_at_entry
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
 """
 
 _UPDATE_TRADE_EXIT = """
-UPDATE trade_history SET
+UPDATE trades_history SET
     timestamp_close = $2,
     exit_price = $3,
     pnl_usd = $4,
@@ -338,6 +339,32 @@ class DatabaseManager:
                 _UPDATE_TRADE_EXIT,
                 trade_id, timestamp_close, exit_price, pnl_usd, pnl_pct, exit_reason
             )
+
+    # ── Legacy Aliases for MT5Executor ───────────────────────────────────────
+    async def insert_open_trade(self, symbol: str, entry_price: float, position_size: float, entry_time: datetime) -> Any:
+        trade_id = uuid.uuid4()
+        await self.insert_trade_open(
+            trade_id=trade_id,
+            timestamp_open=entry_time,
+            symbol=symbol,
+            timeframe="15m", # default
+            side="LONG",
+            entry_price=entry_price,
+            lots=position_size / entry_price if entry_price > 0 else 0,
+        )
+        return trade_id
+
+    async def close_trade(self, trade_id: Any, exit_price: float, exit_time: datetime, pnl: float, **kwargs: Any) -> None:
+        pnl_pct = kwargs.get("pnl_pct", 0.0)
+        reason = kwargs.get("exit_reason", "unknown")
+        await self.update_trade_exit(
+            trade_id=trade_id,
+            timestamp_close=exit_time,
+            exit_price=exit_price,
+            pnl_usd=pnl,
+            pnl_pct=pnl_pct,
+            exit_reason=reason
+        )
 
     # ── CEO / Telegram: closed-trade analytics (expects ``trades_history``) ─────────
 

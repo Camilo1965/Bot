@@ -1585,7 +1585,10 @@ class MT5Executor(PaperExecutor):
                 return False
 
             ts = timestamp or datetime.now(tz=timezone.utc)
-            self._risk.register_open()
+            
+            # [PRO] Portfolio risk accounting
+            risk_usd = position_size * fixed_sl_sym
+            self._risk.register_open(risk_usd=risk_usd)
             self._pending_symbols.add(sym)
 
         # ── Per-symbol fixed SL (SYMBOL_CONFIG) + spread-aware trailing % ────
@@ -1866,7 +1869,11 @@ class MT5Executor(PaperExecutor):
 
         async with self._positions_lock:
             self._risk.credit(gross_pnl)
-            self._risk.register_close()
+            
+            # [PRO] Portfolio risk accounting
+            risk_usd = pos.position_size * pos.sl_pct
+            self._risk.register_close(risk_usd=risk_usd)
+            
             if gross_pnl < 0.0:
                 self._risk.record_daily_loss(-gross_pnl)
             self.total_pnl += gross_pnl
