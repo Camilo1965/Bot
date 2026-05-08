@@ -319,9 +319,8 @@ class RiskManager:
         return any(get_sector(s) == target_sector for s in open_symbols)
 
     def has_sufficient_balance(self, position_size: float) -> bool:
-
-        """Return *True* if the current balance can cover *position_size*."""
-        return self.balance >= position_size > 0.0
+        """Return *True* if the current balance can cover the margin for *position_size*."""
+        return self.balance >= (position_size / LEVERAGE) > 0.0
 
     def deduct(self, amount: float) -> None:
         """Subtract *amount* from the simulated balance (trade entry)."""
