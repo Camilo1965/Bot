@@ -13,13 +13,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("clawdbot.vibe")
 
 _MCP_BINARY = "vibe-trading-mcp"
-_REQUEST_TIMEOUT = 120
+_REQUEST_TIMEOUT = 180
 
 
 class VibeMCPClient:
@@ -30,19 +32,44 @@ class VibeMCPClient:
         self._request_id = 0
         self._available = False
         self._lock = asyncio.Lock()
-        self._reader_lock = asyncio.Lock()
+        self._init_error: str | None = None
+        self._stderr_lines: list[str] = []
 
     async def start(self) -> bool:
         """Start the MCP subprocess.  Returns True if successful."""
         if not shutil.which(_MCP_BINARY):
             logger.warning(
-                "[VIBE] %s not found on PATH — Vibe-Trading tools disabled.",
+                "[VIBE] %s not found on PATH - Vibe-Trading tools disabled.",
                 _MCP_BINARY,
             )
             return False
+
+        env = dict(os.environ)
+
+        bot_root = Path(__file__).resolve().parent.parent
+        agent_env = bot_root / "agent" / ".env"
+        if agent_env.is_file():
+            logger.info("[VIBE] Found agent/.env at %s", agent_env)
+            try:
+                for line in agent_env.read_text(encoding="utf-8-sig").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        k, v = k.strip(), v.strip()
+                        if k and k not in env:
+                            env[k] = v
+            except Exception as exc:
+                logger.warning("[VIBE] Could not read agent/.env: %s", exc)
+        else:
+            logger.warning(
+                "[VIBE] agent/.env not found at %s - "
+                "Vibe-Trading will rely on process env vars only.",
+                agent_env,
+            )
+
         try:
-            import os
-            env = dict(os.environ)
             self._proc = await asyncio.create_subprocess_exec(
                 _MCP_BINARY,
                 stdin=asyncio.subprocess.PIPE,
@@ -50,26 +77,67 @@ class VibeMCPClient:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
-            result = await self._call(
-                "initialize",
-                {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "clawdbot", "version": "1.0"},
-                },
-            )
+
+            # Drain stderr in background so it doesn't block
+            asyncio.create_task(self._drain_stderr())
+
+            # Give the subprocess a moment to start
+            await asyncio.sleep(3)
+
+            # Check if process is still alive
+            if self._proc.returncode is not None:
+                stderr_tail = "\n".join(self._stderr_lines[-20:])
+                self._init_error = (
+                    f"vibe-trading-mcp exited with code {self._proc.returncode}.\n"
+                    f"stderr tail:\n{stderr_tail}"
+                )
+                logger.warning("[VIBE] %s", self._init_error)
+                self._proc = None
+                return False
+
+            # Send initialize
+            result = await self._call("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "clawdbot", "version": "1.0"},
+            })
             if result:
                 await self._notify("notifications/initialized", {})
                 self._available = True
                 logger.info("[VIBE] MCP client started successfully.")
                 return True
-            logger.warning("[VIBE] MCP initialize failed — tools disabled.")
+
+            stderr_tail = "\n".join(self._stderr_lines[-20:])
+            self._init_error = (
+                "MCP initialize returned no result.\n"
+                f"stderr tail:\n{stderr_tail}"
+            )
+            logger.warning("[VIBE] %s", self._init_error)
             await self.stop()
             return False
         except Exception as exc:
-            logger.warning("[VIBE] MCP client start failed: %s — tools disabled.", exc)
+            self._init_error = str(exc)
+            logger.warning("[VIBE] MCP client start failed: %s - tools disabled.", exc)
             self._proc = None
             return False
+
+    async def _drain_stderr(self) -> None:
+        """Background task: read stderr from MCP subprocess and log it."""
+        if not self._proc or not self._proc.stderr:
+            return
+        try:
+            while True:
+                raw = await self._proc.stderr.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    self._stderr_lines.append(line)
+                    if len(self._stderr_lines) > 200:
+                        self._stderr_lines = self._stderr_lines[-100:]
+                    logger.debug("[VIBE MCP stderr] %s", line)
+        except Exception:
+            pass
 
     async def stop(self) -> None:
         """Gracefully shut down the MCP subprocess."""
@@ -87,6 +155,10 @@ class VibeMCPClient:
     def available(self) -> bool:
         return self._available and self._proc is not None and self._proc.returncode is None
 
+    @property
+    def last_error(self) -> str | None:
+        return self._init_error
+
     async def _call(self, method: str, params: dict[str, Any]) -> Any | None:
         """Send a JSON-RPC request and return the result."""
         if not self._proc or not self._proc.stdin or not self._proc.stdout:
@@ -99,18 +171,44 @@ class VibeMCPClient:
             "params": params,
         }
         line = json.dumps(request) + "\n"
-        self._proc.stdin.write(line.encode("utf-8"))
-        await self._proc.stdin.drain()
-        raw = await asyncio.wait_for(
-            self._proc.stdout.readline(), timeout=_REQUEST_TIMEOUT
-        )
-        if not raw:
+        try:
+            self._proc.stdin.write(line.encode("utf-8"))
+            await self._proc.stdin.drain()
+        except Exception as exc:
+            logger.warning("[VIBE] Failed to write to MCP stdin: %s", exc)
             return None
-        response = json.loads(raw.decode("utf-8"))
-        if "error" in response:
-            logger.warning("[VIBE] MCP error: %s", response["error"])
-            return None
-        return response.get("result")
+
+        # Read lines until we get a valid JSON-RPC response with our ID
+        deadline = asyncio.get_event_loop().time() + _REQUEST_TIMEOUT
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                logger.warning("[VIBE] Timeout waiting for MCP response (method=%s).", method)
+                return None
+            try:
+                raw = await asyncio.wait_for(
+                    self._proc.stdout.readline(), timeout=min(remaining, 30)
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[VIBE] Timeout reading MCP response line.")
+                return None
+            if not raw:
+                return None
+            decoded = raw.decode("utf-8", errors="replace").strip()
+            if not decoded:
+                continue
+            try:
+                response = json.loads(decoded)
+            except json.JSONDecodeError:
+                logger.debug("[VIBE] Non-JSON line from MCP: %s", decoded[:200])
+                continue
+            if "id" in response and response.get("id") == self._request_id:
+                if "error" in response:
+                    logger.warning("[VIBE] MCP error: %s", response["error"])
+                    return None
+                return response.get("result")
+            # Not our response ID - skip it
+            continue
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         """Send a JSON-RPC notification (no response expected)."""
@@ -122,23 +220,22 @@ class VibeMCPClient:
             "params": params,
         }
         line = json.dumps(notification) + "\n"
-        self._proc.stdin.write(line.encode("utf-8"))
-        await self._proc.stdin.drain()
+        try:
+            self._proc.stdin.write(line.encode("utf-8"))
+            await self._proc.stdin.drain()
+        except Exception:
+            pass
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
         """Call an MCP tool by name.  Returns the tool result dict or None."""
         if not self.available:
-            logger.debug("[VIBE] Client not available — skipping tool '%s'.", tool_name)
+            logger.debug("[VIBE] Client not available - skipping tool '%s'.", tool_name)
             return None
         async with self._lock:
-            try:
-                return await self._call("tools/call", {
-                    "name": tool_name,
-                    "arguments": arguments,
-                })
-            except Exception as exc:
-                logger.warning("[VIBE] Tool '%s' call failed: %s", tool_name, exc)
-                return None
+            return await self._call("tools/call", {
+                "name": tool_name,
+                "arguments": arguments,
+            })
 
     async def backtest(self, prompt: str) -> dict | None:
         return await self.call_tool("backtest", {"prompt": prompt})
