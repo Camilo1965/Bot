@@ -565,6 +565,8 @@ class MLPredictor:
             return "HOLD", 0.0
 
         cfg = get_symbol_config(symbol)
+        tf_str = cfg.get("timeframe", "15m")
+        tf_min = int(tf_str[:-1]) if tf_str[:-1].isdigit() else 15
         
         # Precompute features once
         features = self._compute_features(
