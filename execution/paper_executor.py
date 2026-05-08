@@ -181,6 +181,7 @@ class PaperExecutor:
             for s, d in raw_pos.items():
                 self.open_positions[s] = OpenPosition.from_dict(d)
             self._risk.sync_open_count(len(self.open_positions))
+            self._risk.recalc_total_risk(self.open_positions)
             return len(self.open_positions)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to load state: %s", exc)

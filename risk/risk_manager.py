@@ -281,6 +281,13 @@ class RiskManager:
         self._open_count = max(0, count)
         logger.info("Open-position counter synchronised to %d.", self._open_count)
 
+    def recalc_total_risk(self, positions: dict) -> None:
+        """Recalculate total risk USD from open positions."""
+        self._total_risk_usd = sum(
+            max(0.0, pos.position_size * pos.sl_pct)
+            for pos in positions.values()
+        )
+
     def is_trading_halted(self) -> bool:
         """Return *True* if trading has been halted due to the daily loss limit."""
         if self._trading_halted_until is None:

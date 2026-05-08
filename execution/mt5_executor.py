@@ -2095,7 +2095,8 @@ class MT5Executor(PaperExecutor):
                 logger.debug("_try_adopt_mt5_position: %s already tracked — skipping.", sym)
                 return False
             self.open_positions[sym] = op
-            self._risk.register_open()
+            risk_usd = position_size * fixed_ad
+            self._risk.register_open(risk_usd=risk_usd)
 
         js = journal_symbol(sym)
         record_trade(
@@ -2548,6 +2549,7 @@ class MT5Executor(PaperExecutor):
                     actual,
                 )
                 self._risk.sync_open_count(actual)
+            self._risk.recalc_total_risk(self.open_positions)
 
         return len(live_symbols)
 
