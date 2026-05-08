@@ -55,7 +55,10 @@ async def weekly_backtest_loop(
     watchlist: list[str],
     interval_s: float = _BACKTEST_INTERVAL_S,
 ) -> None:
-    """Weekly: export DB data and run a backtest for each symbol.
+    """Weekly: run a backtest for each symbol via Vibe-Trading.
+
+    Creates a run directory with config.json and signal_engine.py for
+    each symbol, then calls the backtest MCP tool.
 
     Results are stored in shared_state['vibe_backtest'] for the web dashboard.
     """
@@ -65,10 +68,7 @@ async def weekly_backtest_loop(
     while True:
         for symbol in watchlist:
             try:
-                result = await client.backtest(
-                    "Backtest {} using MACD + RSI strategy, "
-                    "last 30 days, 15m timeframe. Show Sharpe ratio and max drawdown.".format(symbol)
-                )
+                result = await run_backtest(client, symbol)
                 if result:
                     shared_state.setdefault("vibe_backtest", {})[symbol] = result
                     logger.info("[VIBE] Backtest complete for %s.", symbol)
@@ -104,19 +104,18 @@ async def factor_analysis_loop(
     watchlist: list[str],
     interval_s: float = _FACTOR_INTERVAL_S,
 ) -> None:
-    """Monthly: run IC/IR factor analysis for each symbol."""
+    """Monthly: run IC/IR factor analysis across the watchlist."""
     if not client.available:
         return
     await asyncio.sleep(3600)
     while True:
-        for symbol in watchlist:
-            try:
-                result = await analyze_factors(client, symbol)
-                if result:
-                    shared_state.setdefault("vibe_factors", {})[symbol] = result
-                    logger.info("[VIBE] Factor analysis complete for %s.", symbol)
-            except Exception as exc:
-                logger.warning("[VIBE] Factor analysis failed for %s: %s", symbol, exc)
+        try:
+            result = await analyze_factors(client, symbols=watchlist)
+            if result:
+                shared_state["vibe_factors"] = result
+                logger.info("[VIBE] Factor analysis complete for watchlist.")
+        except Exception as exc:
+            logger.warning("[VIBE] Factor analysis failed: %s", exc)
         await asyncio.sleep(interval_s)
 
 

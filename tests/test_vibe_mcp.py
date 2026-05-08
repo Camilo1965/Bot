@@ -30,7 +30,7 @@ class TestVibeMCPClient:
 
     @pytest.mark.asyncio
     async def test_call_tool_when_unavailable(self, client):
-        result = await client.call_tool("backtest", {"prompt": "test"})
+        result = await client.call_tool("backtest", {"run_dir": "/tmp/test"})
         assert result is None
 
     @pytest.mark.asyncio
@@ -40,7 +40,7 @@ class TestVibeMCPClient:
 
     @pytest.mark.asyncio
     async def test_backtest_when_unavailable(self, client):
-        result = await client.backtest("test prompt")
+        result = await client.backtest("/tmp/test_run")
         assert result is None
 
     @pytest.mark.asyncio
@@ -50,17 +50,37 @@ class TestVibeMCPClient:
 
     @pytest.mark.asyncio
     async def test_pattern_recognition_when_unavailable(self, client):
-        result = await client.pattern_recognition("BTC/USDT", "test prompt")
+        result = await client.pattern_recognition("/tmp/test_run")
         assert result is None
 
     @pytest.mark.asyncio
     async def test_factor_analysis_when_unavailable(self, client):
-        result = await client.factor_analysis("test prompt")
+        result = await client.factor_analysis(
+            codes=["BTC/USDT"], factor_name="close",
+            start_date="2025-01-01", end_date="2025-04-01",
+        )
         assert result is None
 
     @pytest.mark.asyncio
     async def test_extract_shadow_strategy_when_unavailable(self, client):
         result = await client.extract_shadow_strategy("/tmp/fake.csv")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_run_shadow_backtest_when_unavailable(self, client):
+        result = await client.run_shadow_backtest("shd_test_123")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_render_shadow_report_when_unavailable(self, client):
+        result = await client.render_shadow_report("shd_test_123")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_get_market_data_when_unavailable(self, client):
+        result = await client.get_market_data(
+            codes=["BTC/USDT"], start_date="2025-01-01", end_date="2025-04-01",
+        )
         assert result is None
 
     @pytest.mark.asyncio
@@ -95,7 +115,7 @@ class TestBacktest:
         from vibe.backtest import run_backtest
 
         client = VibeMCPClient()
-        result = await run_backtest(client, "test prompt")
+        result = await run_backtest(client, "BTC/USDT")
         assert result is None
 
 
@@ -115,7 +135,7 @@ class TestFactorResearch:
         from vibe.factor_research import analyze_factors
 
         client = VibeMCPClient()
-        result = await analyze_factors(client, "BTC/USDT")
+        result = await analyze_factors(client, symbols=["BTC/USDT"])
         assert result is None
 
 

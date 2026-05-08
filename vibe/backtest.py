@@ -2,18 +2,17 @@
 vibe.backtest
 ~~~~~~~~~~~~~
 Runs Vibe-Trading backtest engine using historical data
-from ClawdBot's own TimescaleDB or Vibe-Trading's data sources.
+from Vibe-Trading's data sources (ccxt, yfinance, etc.).
 
-Two modes:
-1. Prompt-based: "Backtest BTC-USDT RSI strategy last 30 days"
-2. Data-based: Export ClawdBot's OHLCV data to CSV, then backtest
+Creates a run directory with config.json and code/signal_engine.py,
+then calls the backtest MCP tool with the run_dir path.
 """
 
 from __future__ import annotations
 
-import csv
+import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,50 +20,81 @@ from vibe.mcp_client import VibeMCPClient
 
 logger = logging.getLogger("clawdbot.vibe.backtest")
 
-_EXPORT_DIR = Path("logs") / "vibe_exports"
+_RUN_DIR_BASE = Path("logs") / "vibe_runs"
 
+_BACKTEST_CONFIG_TEMPLATE: dict[str, Any] = {
+    "source": "ccxt",
+    "codes": [],
+    "start_date": "",
+    "end_date": "",
+    "initial_capital": 10000,
+    "commission": 0.001,
+    "timeframe": "15m",
+}
 
-async def export_db_data_to_csv(symbol: str) -> Path | None:
-    """Export market_data from TimescaleDB to CSV for Vibe-Trading consumption.
+_SIGNAL_ENGINE_CODE = '''\
+"""MACD crossover + RSI filter signal engine for Vibe-Trading backtest."""
 
-    Reads the last N rows from the market_data hypertable for the given symbol
-    and writes to logs/vibe_exports/<symbol>_<timestamp>.csv
-    """
-    from database.db_manager import db
+def signal(df):
+    """Return 1 (buy), -1 (sell), or 0 (flat) based on MACD + RSI."""
+    import pandas as pd
 
-    rows = await db.fetch_market_data_ohlcv(symbol=symbol, limit=5000)
-    if not rows:
-        logger.warning("[VIBE] No DB data for %s — cannot export.", symbol)
-        return None
+    close = df["close"]
+    macd = close.ewm(span=12).mean() - close.ewm(span=26).mean()
+    signal_line = macd.ewm(span=9).mean()
 
-    _EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-    path = _EXPORT_DIR / f"{symbol.replace('/', '_')}_{ts}.csv"
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = delta.abs().rolling(14).mean()
+    rsi = 100 - (100 / (1 + gain / loss))
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "open", "high", "low", "close", "volume"])
-        for row in rows:
-            writer.writerow([
-                row["timestamp"],
-                row["open"],
-                row["high"],
-                row["low"],
-                row["close"],
-                row["volume"],
-            ])
-
-    logger.info("[VIBE] Exported %d rows for %s → %s", len(rows), symbol, path)
-    return path
+    if macd.iloc[-1] > signal_line.iloc[-1] and rsi.iloc[-1] < 70:
+        return 1
+    elif macd.iloc[-1] < signal_line.iloc[-1] and rsi.iloc[-1] > 30:
+        return -1
+    return 0
+'''
 
 
 async def run_backtest(
     client: VibeMCPClient,
-    prompt: str,
+    symbol: str,
+    source: str = "ccxt",
+    days_back: int = 30,
+    timeframe: str = "15m",
 ) -> dict[str, Any] | None:
-    """Run a backtest using Vibe-Trading's backtest engine.
+    """Run a backtest for a symbol via Vibe-Trading's backtest MCP tool.
 
-    The prompt should be a natural language description, e.g.:
-    "Backtest BTC/USDT MACD crossover strategy, last 30 days, 15m timeframe"
+    Creates a run directory with config.json and code/signal_engine.py,
+    then calls the backtest tool with the run_dir path.
+
+    Returns backtest results dict or None.
     """
-    return await client.backtest(prompt)
+    _RUN_DIR_BASE.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_name = symbol.replace("/", "_")
+    run_dir = _RUN_DIR_BASE / f"backtest_{safe_name}_{ts}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    end_dt = datetime.now(tz=timezone.utc)
+    start_dt = end_dt - timedelta(days=days_back)
+
+    config = {
+        **_BACKTEST_CONFIG_TEMPLATE,
+        "source": source,
+        "codes": [symbol],
+        "start_date": start_dt.strftime("%Y-%m-%d"),
+        "end_date": end_dt.strftime("%Y-%m-%d"),
+        "timeframe": timeframe,
+    }
+
+    config_path = run_dir / "config.json"
+    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    code_dir = run_dir / "code"
+    code_dir.mkdir(parents=True, exist_ok=True)
+    signal_path = code_dir / "signal_engine.py"
+    signal_path.write_text(_SIGNAL_ENGINE_CODE, encoding="utf-8")
+
+    logger.info("[VIBE] Created backtest run_dir: %s", run_dir)
+    return await client.backtest(run_dir=str(run_dir.resolve()))

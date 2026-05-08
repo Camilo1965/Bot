@@ -253,32 +253,108 @@ class VibeMCPClient:
                 "arguments": arguments,
             })
 
-    async def backtest(self, prompt: str) -> dict | None:
-        return await self.call_tool("backtest", {"prompt": prompt})
+    async def backtest(self, run_dir: str) -> dict | None:
+        return await self.call_tool("backtest", {"run_dir": run_dir})
 
-    async def analyze_trade_journal(self, csv_path: str) -> dict | None:
-        return await self.call_tool("analyze_trade_journal", {"file_path": csv_path})
+    async def analyze_trade_journal(
+        self,
+        file_path: str,
+        analysis_type: str = "full",
+        filter_expr: str = "",
+    ) -> dict | None:
+        args: dict[str, Any] = {"file_path": file_path, "analysis_type": analysis_type}
+        if filter_expr:
+            args["filter_expr"] = filter_expr
+        return await self.call_tool("analyze_trade_journal", args)
 
-    async def extract_shadow_strategy(self, csv_path: str) -> dict | None:
-        return await self.call_tool("extract_shadow_strategy", {"file_path": csv_path})
+    async def extract_shadow_strategy(
+        self,
+        journal_path: str,
+        min_support: int = 3,
+        max_rules: int = 5,
+    ) -> dict | None:
+        return await self.call_tool("extract_shadow_strategy", {
+            "journal_path": journal_path,
+            "min_support": min_support,
+            "max_rules": max_rules,
+        })
 
-    async def run_shadow_backtest(self, prompt: str) -> dict | None:
-        return await self.call_tool("run_shadow_backtest", {"prompt": prompt})
+    async def run_shadow_backtest(
+        self,
+        shadow_id: str,
+        window_start: str = "",
+        window_end: str = "",
+        markets: list[str] | None = None,
+        journal_path: str = "",
+    ) -> dict | None:
+        args: dict[str, Any] = {"shadow_id": shadow_id}
+        if window_start:
+            args["window_start"] = window_start
+        if window_end:
+            args["window_end"] = window_end
+        if markets:
+            args["markets"] = markets
+        if journal_path:
+            args["journal_path"] = journal_path
+        return await self.call_tool("run_shadow_backtest", args)
 
-    async def render_shadow_report(self, run_id: str) -> dict | None:
-        return await self.call_tool("render_shadow_report", {"run_id": run_id})
+    async def render_shadow_report(
+        self,
+        shadow_id: str,
+        include_today_signals: bool = True,
+        window_start: str = "",
+        window_end: str = "",
+        journal_path: str = "",
+    ) -> dict | None:
+        args: dict[str, Any] = {
+            "shadow_id": shadow_id,
+            "include_today_signals": include_today_signals,
+        }
+        if window_start:
+            args["window_start"] = window_start
+        if window_end:
+            args["window_end"] = window_end
+        if journal_path:
+            args["journal_path"] = journal_path
+        return await self.call_tool("render_shadow_report", args)
 
-    async def pattern_recognition(self, symbol: str, prompt: str) -> dict | None:
-        return await self.call_tool("pattern", {"symbol": symbol, "prompt": prompt})
+    async def pattern_recognition(self, run_dir: str) -> dict | None:
+        return await self.call_tool("pattern_recognition", {"run_dir": run_dir})
 
-    async def factor_analysis(self, prompt: str) -> dict | None:
-        return await self.call_tool("factor_analysis", {"prompt": prompt})
-
-    async def get_market_data(self, symbol: str, start_date: str, end_date: str) -> dict | None:
-        return await self.call_tool("get_market_data", {
-            "symbol": symbol,
+    async def factor_analysis(
+        self,
+        codes: list[str],
+        factor_name: str,
+        start_date: str,
+        end_date: str,
+        source: str = "auto",
+        top_n: int = 10,
+        bottom_n: int = 10,
+    ) -> dict | None:
+        return await self.call_tool("factor_analysis", {
+            "codes": codes,
+            "factor_name": factor_name,
             "start_date": start_date,
             "end_date": end_date,
+            "source": source,
+            "top_n": top_n,
+            "bottom_n": bottom_n,
+        })
+
+    async def get_market_data(
+        self,
+        codes: list[str],
+        start_date: str,
+        end_date: str,
+        source: str = "auto",
+        interval: str = "1D",
+    ) -> dict | None:
+        return await self.call_tool("get_market_data", {
+            "codes": codes,
+            "start_date": start_date,
+            "end_date": end_date,
+            "source": source,
+            "interval": interval,
         })
 
     async def list_skills(self) -> list | None:

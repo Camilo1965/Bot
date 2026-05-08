@@ -72,6 +72,20 @@ def _htf_trend_letters(t15: str, t1h: str, t4h: str) -> str:
     return f"{_one(t15)}/{_one(t1h)}/{_one(t4h)}"
 
 
+def _extract_vibe_text(data: Any) -> str:
+    """Extract readable text from a Vibe MCP tool result dict."""
+    try:
+        if isinstance(data, dict) and "content" in data:
+            parts = []
+            for item in data["content"]:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item["text"])
+            return " ".join(parts).strip()[:300]
+        return str(data)[:300] if data else ""
+    except Exception:
+        return str(data)[:300] if data else ""
+
+
 def _fallback_ceo_payload(report_tz: str) -> dict[str, Any]:
     """Return safe CEO block when DB is unavailable."""
     try:
@@ -987,6 +1001,14 @@ async def start_web_dashboard(
             "market": market_data,
             "events": clean_events,
             "ceo": ceo,
+            "vibe": {
+                "mcp_available": bool(state.get("vibe_client") and state["vibe_client"].available),
+                "patterns": {s: _extract_vibe_text(d) for s, d in state.get("vibe_patterns", {}).items()},
+                "journal": _extract_vibe_text(state.get("vibe_journal_analysis")),
+                "backtest": {s: _extract_vibe_text(d) for s, d in state.get("vibe_backtest", {}).items()},
+                "factors": {s: _extract_vibe_text(d) for s, d in state.get("vibe_factors", {}).items()},
+                "shadow": _extract_vibe_text(state.get("vibe_shadow_report")),
+            },
         }
         
         return web.json_response(resp)
@@ -1039,7 +1061,7 @@ async def start_web_dashboard(
         return web.json_response({
             "available": vibe_c.available if vibe_c else False,
             "tools": [
-                "analyze_trade_journal", "backtest", "pattern",
+                "analyze_trade_journal", "backtest", "pattern_recognition",
                 "factor_analysis", "extract_shadow_strategy",
                 "run_shadow_backtest", "render_shadow_report",
                 "get_market_data", "list_skills",
