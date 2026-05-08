@@ -109,7 +109,7 @@ class VibeMCPClient:
             if result:
                 await self._notify("notifications/initialized", {})
                 self._available = True
-                logger.info("[VIBE] MCP client started successfully.")
+                logger.warning("[VIBE] ✅ MCP client started successfully.")
                 return True
 
             stderr_tail = "\n".join(self._stderr_lines[-20:])

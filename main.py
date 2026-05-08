@@ -899,9 +899,10 @@ async def main() -> None:
             run_tasks.append(pattern_detection_loop(vibe_client, shared_state, WATCHLIST))
             run_tasks.append(factor_analysis_loop(vibe_client, shared_state, WATCHLIST))
             run_tasks.append(shadow_account_loop(vibe_client, shared_state))
-            logger.info("✅ Vibe-Trading MCP client started — 5 scheduled tasks active.")
+            logger.warning("✅ Vibe-Trading MCP client started — 5 scheduled tasks active.")
         else:
-            logger.info("ℹ️ Vibe-Trading MCP start failed — tools disabled. Bot runs normally.")
+            err = vibe_client.last_error or "unknown"
+            logger.warning("ℹ️ Vibe-Trading MCP start failed (%s) — tools disabled. Bot runs normally.", err)
     else:
         logger.info("ℹ️ Vibe-Trading integration disabled (VIBE_TRADING_ENABLED=0 or package not installed).")
 

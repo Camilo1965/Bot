@@ -14,6 +14,21 @@ from strategy.feature_engineer import FeatureEngineer
 from strategy.quant_features import MIN_OHLC_ROWS
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, get_symbol_config
 
+
+def _extract_vibe_pattern_text(data: Any) -> str:
+    """Extract readable text from a Vibe pattern recognition result."""
+    try:
+        if isinstance(data, dict) and "content" in data:
+            parts = []
+            for item in data["content"]:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item["text"])
+            text = " ".join(parts).strip()
+            return text[:200] if text else ""
+        return str(data)[:200]
+    except Exception:
+        return str(data)[:200]
+
 # BUY gate + ML-reversal min confidence = BUY_PROB_THRESHOLD (default 0.50 max-performance).
 
 async def signal_emitter(
@@ -75,11 +90,9 @@ async def signal_emitter(
             # [VIBE] Log pattern recognition overlay (INFORMATIONAL — does NOT gate entries)
             vibe_pattern = state.get("vibe_patterns", {}).get(symbol)
             if vibe_pattern:
-                logger.info(
-                    "🔍 [VIBE] %s pattern overlay: %s",
-                    symbol,
-                    str(vibe_pattern)[:120],
-                )
+                _pdesc = _extract_vibe_pattern_text(vibe_pattern)
+                if _pdesc:
+                    logger.warning("🔍 [VIBE] %s pattern: %s", symbol, _pdesc)
 
             logger.debug(
                 "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d",
