@@ -1002,11 +1002,61 @@ async def start_web_dashboard(
     except ValueError:
         _rpm = 180
     _middlewares = [_make_api_rate_middleware(_rpm)] if _rpm > 0 else []
+
+    # ── Vibe-Trading analysis endpoints ──────────────────────────────────
+    async def _handle_vibe_journal(request: web.Request) -> web.Response:
+        analysis = state.get("vibe_journal_analysis")
+        if not analysis:
+            return web.json_response({"status": "no_data"}, status=404)
+        return web.json_response(analysis)
+
+    async def _handle_vibe_backtest(request: web.Request) -> web.Response:
+        backtests = state.get("vibe_backtest", {})
+        if not backtests:
+            return web.json_response({"status": "no_data"}, status=404)
+        return web.json_response(backtests)
+
+    async def _handle_vibe_patterns(request: web.Request) -> web.Response:
+        patterns = state.get("vibe_patterns", {})
+        if not patterns:
+            return web.json_response({"status": "no_data"}, status=404)
+        return web.json_response(patterns)
+
+    async def _handle_vibe_factors(request: web.Request) -> web.Response:
+        factors = state.get("vibe_factors", {})
+        if not factors:
+            return web.json_response({"status": "no_data"}, status=404)
+        return web.json_response(factors)
+
+    async def _handle_vibe_shadow(request: web.Request) -> web.Response:
+        shadow = state.get("vibe_shadow_report")
+        if not shadow:
+            return web.json_response({"status": "no_data"}, status=404)
+        return web.json_response(shadow)
+
+    async def _handle_vibe_status(request: web.Request) -> web.Response:
+        vibe_c = state.get("vibe_client")
+        return web.json_response({
+            "available": vibe_c.available if vibe_c else False,
+            "tools": [
+                "analyze_trade_journal", "backtest", "pattern",
+                "factor_analysis", "extract_shadow_strategy",
+                "run_shadow_backtest", "render_shadow_report",
+                "get_market_data", "list_skills",
+            ] if (vibe_c and vibe_c.available) else [],
+        })
+
     app = web.Application(middlewares=_middlewares)
     app.add_routes([
         web.get("/", handle_html),
         web.get("/api/state", handle_api),
-        web.get("/api/performance", handle_performance)
+        web.get("/api/performance", handle_performance),
+        web.get("/api/vibe/journal", _handle_vibe_journal),
+        web.get("/api/vibe/backtest", _handle_vibe_backtest),
+        web.get("/api/vibe/patterns", _handle_vibe_patterns),
+        web.get("/api/vibe/factors", _handle_vibe_factors),
+        web.get("/api/vibe/shadow", _handle_vibe_shadow),
+        web.get("/api/vibe/status", _handle_vibe_status),
     ])
 
     # ... existing aiohttp runner code ...

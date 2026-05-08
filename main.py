@@ -100,6 +100,20 @@ from utils.telegram_notifier import (
     telegram_command_poller,
 )
 
+try:
+    from vibe.mcp_client import VibeMCPClient
+    from vibe.scheduled_tasks import (
+        factor_analysis_loop,
+        journal_analysis_loop,
+        pattern_detection_loop,
+        shadow_account_loop,
+        weekly_backtest_loop,
+    )
+
+    _VIBE_AVAILABLE = True
+except ImportError:
+    _VIBE_AVAILABLE = False
+
 # ── ANSI colour helpers (no extra dependency) ─────────────────────────────────
 _YELLOW = "\033[33m"
 _RED    = "\033[31m"
@@ -486,6 +500,13 @@ async def main() -> None:
         "ml_probs": {symbol: 0.0 for symbol in WATCHLIST},
         # [ML] Last generate_signal() per symbol (BUY/SELL/HOLD); drives TUI/web vs raw prob
         "ml_signals": {symbol: "HOLD" for symbol in WATCHLIST},
+        # [VIBE] Vibe-Trading analysis results (populated by scheduled tasks)
+        "vibe_journal_analysis": None,
+        "vibe_backtest": {},
+        "vibe_patterns": {},
+        "vibe_factors": {},
+        "vibe_shadow_report": None,
+        "vibe_client": None,
         # [DASHBOARD] Mega-dashboard telemetry
         "api_latency_ms": 0.0,   # REST/WS round-trip latency in milliseconds
         "max_drawdown": 0.0,     # most negative unrealised PnL seen this session
@@ -865,6 +886,25 @@ async def main() -> None:
         monthly_report_loop(),
         start_web_dashboard(shared_state, paper_executor, risk_manager, WATCHLIST, port=8080),
     ]
+
+    # ── Vibe-Trading MCP integration (optional) ─────────────────────────────
+    vibe_client: VibeMCPClient | None = None
+    if _VIBE_AVAILABLE and os.environ.get("VIBE_TRADING_ENABLED", "1").strip() in ("1", "true", "yes"):
+        vibe_client = VibeMCPClient()
+        vibe_started = await vibe_client.start()
+        if vibe_started:
+            shared_state["vibe_client"] = vibe_client
+            run_tasks.append(journal_analysis_loop(vibe_client, shared_state))
+            run_tasks.append(weekly_backtest_loop(vibe_client, shared_state, WATCHLIST))
+            run_tasks.append(pattern_detection_loop(vibe_client, shared_state, WATCHLIST))
+            run_tasks.append(factor_analysis_loop(vibe_client, shared_state, WATCHLIST))
+            run_tasks.append(shadow_account_loop(vibe_client, shared_state))
+            logger.info("✅ Vibe-Trading MCP client started — 5 scheduled tasks active.")
+        else:
+            logger.info("ℹ️ Vibe-Trading MCP start failed — tools disabled. Bot runs normally.")
+    else:
+        logger.info("ℹ️ Vibe-Trading integration disabled (VIBE_TRADING_ENABLED=0 or package not installed).")
+
     # Default 120s recurring snapshot → logs/runtime_metrics.jsonl (set to 0 to disable).
     _rmi = float(os.environ.get("RUNTIME_METRICS_INTERVAL_S", "120").strip() or "0")
     if _rmi >= 10.0:
@@ -929,6 +969,8 @@ async def main() -> None:
     finally:
         if isinstance(paper_executor, MT5Executor):
             paper_executor.begin_shutdown()
+        if vibe_client:
+            await vibe_client.stop()
         for task in running_tasks:
             if not task.done():
                 task.cancel()

@@ -643,6 +643,51 @@ async def telegram_command_poller(
                                     dedup_key="manual:ceo",
                                     force=True,
                                 )
+                            elif text.startswith("/vibe"):
+                                vibe_c = shared_state.get("vibe_client")
+                                vibe_status = "✅ Activo" if (vibe_c and vibe_c.available) else "❌ No disponible"
+                                await send_telegram_alert(f"🔬 *Vibe-Trading*\nEstado: {vibe_status}")
+                            elif text.startswith("/backtest"):
+                                vibe_c = shared_state.get("vibe_client")
+                                if vibe_c and vibe_c.available:
+                                    parts = text.strip().split()
+                                    bt_sym = parts[1] if len(parts) > 1 else "BTC/USDT"
+                                    await send_telegram_alert(f"📊 Ejecutando backtest {bt_sym}...")
+                                    result = await vibe_c.backtest(
+                                        f"Backtest {bt_sym} MACD + RSI strategy, last 30 days, 15m timeframe"
+                                    )
+                                    if result:
+                                        await send_telegram_alert(
+                                            f"📊 Backtest {bt_sym} completado. Ver details en dashboard /api/vibe/backtest"
+                                        )
+                                    else:
+                                        await send_telegram_alert(f"⚠️ Backtest {bt_sym} falló — sin respuesta del tool.")
+                                else:
+                                    await send_telegram_alert("⚠️ Vibe-Trading no disponible.")
+                            elif text.startswith("/journal"):
+                                vibe_c = shared_state.get("vibe_client")
+                                if vibe_c and vibe_c.available:
+                                    from vibe.journal_analyzer import analyze_journal
+                                    result = await analyze_journal(vibe_c)
+                                    if result:
+                                        await send_telegram_alert("📋 Journal analysis completado. Ver dashboard /api/vibe/journal")
+                                    else:
+                                        await send_telegram_alert("⚠️ Journal analysis falló — sin datos.")
+                                else:
+                                    await send_telegram_alert("⚠️ Vibe-Trading no disponible.")
+                            elif text.startswith("/patterns"):
+                                vibe_c = shared_state.get("vibe_client")
+                                if vibe_c and vibe_c.available:
+                                    from vibe.pattern_recognition import detect_patterns
+                                    parts = text.strip().split()
+                                    pat_sym = parts[1] if len(parts) > 1 else "BTC/USDT"
+                                    result = await detect_patterns(vibe_c, pat_sym)
+                                    if result:
+                                        await send_telegram_alert(f"🔍 Patrones {pat_sym} detectados. Ver /api/vibe/patterns")
+                                    else:
+                                        await send_telegram_alert(f"⚠️ Pattern detection {pat_sym} falló.")
+                                else:
+                                    await send_telegram_alert("⚠️ Vibe-Trading no disponible.")
                             elif text.startswith("/help") or text.startswith("/ayuda"):
                                 help_report = (
                                     "🤖 *COMANDOS DISPONIBLES*\n"
@@ -654,6 +699,10 @@ async def telegram_command_poller(
                                     "/history 7 -> Historial diario últimos 7 días\n"
                                     "/history 30 -> Historial diario últimos 30 días\n"
                                     "/ceo -> Snapshot ejecutivo (7D/30D)\n"
+                                    "/vibe -> Estado de Vibe-Trading\n"
+                                    "/backtest BTC/USDT -> Backtest con Vibe-Trading\n"
+                                    "/journal -> Análisis de sesgos del trade journal\n"
+                                    "/patterns BTC/USDT -> Detección de patrones técnicos\n"
                                     "────────────────────────"
                                 )
                                 await send_priority_telegram_alert(

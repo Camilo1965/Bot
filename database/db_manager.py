@@ -363,6 +363,20 @@ class DatabaseManager:
             )
             return [float(r["close"]) for r in reversed(rows)]
 
+    async def fetch_market_data_ohlcv(self, symbol: str, limit: int = 5000) -> list[dict]:
+        """Fetch OHLCV rows from market_data for Vibe-Trading CSV export."""
+        if not self._pool:
+            return []
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT timestamp, open, high, low, close, volume "
+                "FROM market_data WHERE symbol = $1 AND close IS NOT NULL "
+                "ORDER BY timestamp DESC LIMIT $2",
+                symbol,
+                limit,
+            )
+            return [dict(r) for r in reversed(rows)]
+
     async def insert_ml_prediction(self, symbol: str, confidence: float, side: str) -> None:
         if not self._pool: return
         ts = datetime.now(tz=timezone.utc)

@@ -72,6 +72,15 @@ async def signal_emitter(
             # Store the latest ML confidence so dashboard_logger can display it.
             state["ml_probs"][symbol] = win_prob
 
+            # [VIBE] Log pattern recognition overlay (INFORMATIONAL — does NOT gate entries)
+            vibe_pattern = state.get("vibe_patterns", {}).get(symbol)
+            if vibe_pattern:
+                logger.info(
+                    "🔍 [VIBE] %s pattern overlay: %s",
+                    symbol,
+                    str(vibe_pattern)[:120],
+                )
+
             logger.debug(
                 "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d",
                 symbol,

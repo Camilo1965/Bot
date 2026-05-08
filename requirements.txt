@@ -43,6 +43,9 @@ pyqtgraph
 # MetaTrader 5 execution layer (Windows only – requires local MT5 terminal)
 MetaTrader5
 
+# Vibe-Trading MCP integration (optional — bot runs without it)
+vibe-trading-ai
+
 # Tests
 pytest
 pytest-asyncio
