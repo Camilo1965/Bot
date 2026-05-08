@@ -170,6 +170,8 @@ class PaperExecutor:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to save state: %s", exc)
 
+    _save_state = save_state
+
     def load_state(self) -> int:
         if not self._state_file.exists():
             return 0

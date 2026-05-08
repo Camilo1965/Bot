@@ -1771,7 +1771,7 @@ class MT5Executor(PaperExecutor):
             sentiment_score_at_entry=sentiment_score,
             idempotency_key=f"BUY:{js}:ticket:{mt5_ticket or trade_id}",
         )
-        self._save_state()
+        self.save_state()
 
         if sl_distance is not None and sl_distance > 0:
             logger.info(
@@ -1905,7 +1905,7 @@ class MT5Executor(PaperExecutor):
             journal_entry_price=pos.entry_price,
             journal_exit_price=exit_price,
         )
-        self._save_state()
+        self.save_state()
 
         if telegram_after:
             asyncio.create_task(
@@ -2109,7 +2109,7 @@ class MT5Executor(PaperExecutor):
             sentiment_score_at_entry=0.0,
             idempotency_key=f"BUY:{js}:ticket:{int(p.ticket)}",
         )
-        self._save_state()
+        self.save_state()
 
         logger.info(
             "[MT5 SYNC] ✅ Adopted orphan MT5 position sym=%s ticket=%s entry=%.5f sl=%.5f",
@@ -2301,7 +2301,7 @@ class MT5Executor(PaperExecutor):
         if close_error is not None:
             pos.close_pending = True
             pos.last_close_error = close_error
-            self._save_state()
+            self.save_state()
             return False
 
         await self._apply_mt5_closed_bookkeeping(
