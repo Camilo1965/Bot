@@ -41,11 +41,14 @@ class VibeMCPClient:
             )
             return False
         try:
+            import os
+            env = dict(os.environ)
             self._proc = await asyncio.create_subprocess_exec(
                 _MCP_BINARY,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             result = await self._call(
                 "initialize",
