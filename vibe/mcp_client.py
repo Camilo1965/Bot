@@ -6,6 +6,10 @@ Async MCP client for Vibe-Trading tools.
 Launches ``vibe-trading-mcp`` as a subprocess and communicates
 via JSON-RPC 2.0 over stdio.  All methods are no-ops if the
 binary is not installed or the subprocess fails to start.
+
+Uses subprocess.Popen + asyncio.to_thread() instead of
+asyncio.create_subprocess_exec so it works on Windows with
+SelectorEventLoop (the bot's required event loop for MT5).
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +33,7 @@ class VibeMCPClient:
     """Manages the MCP subprocess lifecycle and tool calls."""
 
     def __init__(self) -> None:
-        self._proc: asyncio.subprocess.Process | None = None
+        self._proc: subprocess.Popen | None = None
         self._request_id = 0
         self._available = False
         self._lock = asyncio.Lock()
@@ -70,11 +75,11 @@ class VibeMCPClient:
             )
 
         try:
-            self._proc = await asyncio.create_subprocess_exec(
-                _MCP_BINARY,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            self._proc = subprocess.Popen(
+                [_MCP_BINARY],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env=env,
             )
 
@@ -85,7 +90,7 @@ class VibeMCPClient:
             await asyncio.sleep(3)
 
             # Check if process is still alive
-            if self._proc.returncode is not None:
+            if self._proc.poll() is not None:
                 stderr_tail = "\n".join(self._stderr_lines[-20:])
                 self._init_error = (
                     f"vibe-trading-mcp exited with code {self._proc.returncode}.\n"
@@ -127,7 +132,7 @@ class VibeMCPClient:
             return
         try:
             while True:
-                raw = await self._proc.stderr.readline()
+                raw = await asyncio.to_thread(self._proc.stderr.readline)
                 if not raw:
                     break
                 line = raw.decode("utf-8", errors="replace").rstrip()
@@ -141,11 +146,14 @@ class VibeMCPClient:
 
     async def stop(self) -> None:
         """Gracefully shut down the MCP subprocess."""
-        if self._proc and self._proc.returncode is None:
+        if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(
+                    asyncio.to_thread(lambda: self._proc.wait(timeout=5)),
+                    timeout=6.0,
+                )
+            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
                 self._proc.kill()
             self._proc = None
         self._available = False
@@ -153,7 +161,7 @@ class VibeMCPClient:
 
     @property
     def available(self) -> bool:
-        return self._available and self._proc is not None and self._proc.returncode is None
+        return self._available and self._proc is not None and self._proc.poll() is None
 
     @property
     def last_error(self) -> str | None:
@@ -172,8 +180,8 @@ class VibeMCPClient:
         }
         line = json.dumps(request) + "\n"
         try:
-            self._proc.stdin.write(line.encode("utf-8"))
-            await self._proc.stdin.drain()
+            await asyncio.to_thread(self._proc.stdin.write, line.encode("utf-8"))
+            await asyncio.to_thread(self._proc.stdin.flush)
         except Exception as exc:
             logger.warning("[VIBE] Failed to write to MCP stdin: %s", exc)
             return None
@@ -187,7 +195,8 @@ class VibeMCPClient:
                 return None
             try:
                 raw = await asyncio.wait_for(
-                    self._proc.stdout.readline(), timeout=min(remaining, 30)
+                    asyncio.to_thread(self._proc.stdout.readline),
+                    timeout=min(remaining, 30),
                 )
             except asyncio.TimeoutError:
                 logger.warning("[VIBE] Timeout reading MCP response line.")
@@ -221,8 +230,8 @@ class VibeMCPClient:
         }
         line = json.dumps(notification) + "\n"
         try:
-            self._proc.stdin.write(line.encode("utf-8"))
-            await self._proc.stdin.drain()
+            await asyncio.to_thread(self._proc.stdin.write, line.encode("utf-8"))
+            await asyncio.to_thread(self._proc.stdin.flush)
         except Exception:
             pass
 
