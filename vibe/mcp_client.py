@@ -86,8 +86,13 @@ class VibeMCPClient:
             # Drain stderr in background so it doesn't block
             asyncio.create_task(self._drain_stderr())
 
-            # Give the subprocess a moment to start
-            await asyncio.sleep(3)
+            # Give the subprocess a moment to start (1s, not blocking Ctrl+C)
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                self._proc.kill()
+                self._proc = None
+                raise
 
             # Check if process is still alive
             if self._proc.poll() is not None:
@@ -120,6 +125,8 @@ class VibeMCPClient:
             logger.warning("[VIBE] %s", self._init_error)
             await self.stop()
             return False
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             self._init_error = str(exc)
             logger.warning("[VIBE] MCP client start failed: %s - tools disabled.", exc)
