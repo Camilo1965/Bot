@@ -1576,6 +1576,12 @@ class MT5Executor(PaperExecutor):
                 win_probability,
                 risk_pct=risk_pct_sym,
             )
+            if position_size <= 0.0:
+                logger.warning(
+                    "⚠️ [ALERT] Position size is 0 for %s — portfolio risk budget exhausted or drawdown limit.",
+                    sym,
+                )
+                return False
             if not self._risk.has_sufficient_balance(position_size):
                 logger.warning(
                     "⚠️ [ALERT] Insufficient balance (%.2f) for position size %.2f.",

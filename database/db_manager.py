@@ -87,6 +87,73 @@ BEGIN
 END $$;
 """
 
+# ── trades_history schema migration ─────────────────────────────────────────────────
+# The trades_history schema was refactored (timestamp→timestamp_open, pnl→pnl_usd, etc.).
+# This migration runs BEFORE CREATE TABLE IF NOT EXISTS so that any old table is
+# upgraded in-place. Drop + recreate is also safe if historical data is expendable.
+_MIGRATE_TRADES_HISTORY = """
+DO $$
+BEGIN
+  IF to_regclass('public.trades_history') IS NULL THEN RETURN; END IF;
+
+  -- Rename legacy timestamp column (old schema used 'timestamp' or 'entry_time')
+  IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='trades_history' AND column_name='timestamp'
+  ) AND NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='trades_history' AND column_name='timestamp_open'
+  ) THEN
+      ALTER TABLE trades_history RENAME COLUMN timestamp TO timestamp_open;
+  END IF;
+  IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='trades_history' AND column_name='entry_time'
+  ) AND NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='trades_history' AND column_name='timestamp_open'
+  ) THEN
+      ALTER TABLE trades_history RENAME COLUMN entry_time TO timestamp_open;
+  END IF;
+
+  -- Add missing columns (idempotent — skips if already present)
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='timestamp_open') THEN
+      ALTER TABLE trades_history ADD COLUMN timestamp_open TIMESTAMPTZ;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='timestamp_close') THEN
+      ALTER TABLE trades_history ADD COLUMN timestamp_close TIMESTAMPTZ;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='side') THEN
+      ALTER TABLE trades_history ADD COLUMN side TEXT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='timeframe') THEN
+      ALTER TABLE trades_history ADD COLUMN timeframe TEXT DEFAULT '15m';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='lots') THEN
+      ALTER TABLE trades_history ADD COLUMN lots DOUBLE PRECISION;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='pnl_usd') THEN
+      ALTER TABLE trades_history ADD COLUMN pnl_usd DOUBLE PRECISION;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='pnl_pct') THEN
+      ALTER TABLE trades_history ADD COLUMN pnl_pct DOUBLE PRECISION;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='exit_reason') THEN
+      ALTER TABLE trades_history ADD COLUMN exit_reason TEXT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='win_probability') THEN
+      ALTER TABLE trades_history ADD COLUMN win_probability DOUBLE PRECISION;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='atr_at_entry') THEN
+      ALTER TABLE trades_history ADD COLUMN atr_at_entry DOUBLE PRECISION;
+  END IF;
+
+  -- Fill any NULL side values (old rows may lack this column)
+  UPDATE trades_history SET side = 'LONG' WHERE side IS NULL;
+  UPDATE trades_history SET timeframe = '15m' WHERE timeframe IS NULL;
+END $$;
+"""
+
 _CREATE_ML_PREDICTIONS = """
 CREATE TABLE IF NOT EXISTS ml_predictions (
     timestamp TIMESTAMPTZ NOT NULL,
@@ -203,7 +270,11 @@ class DatabaseManager:
             await conn.execute(_CREATE_HTF_TREND)
             try: await conn.execute(_CREATE_HYPERTABLE_HTF)
             except Exception: pass
-            
+
+            try:
+                await conn.execute(_MIGRATE_TRADES_HISTORY)
+            except Exception:  # noqa: BLE001
+                pass
             await conn.execute(_CREATE_TRADE_HISTORY)
             try: await conn.execute(_CREATE_HYPERTABLE_TRADES)
             except Exception: pass
@@ -379,8 +450,8 @@ class DatabaseManager:
         if not rows:
             return None
         names = {str(r["column_name"]) for r in rows}
-        pnl_c = next((c for c in ("pnl", "net_pnl", "pnl_usdt", "gross_pnl") if c in names), None)
-        exit_c = next((c for c in ("exit_time", "closed_at", "close_time") if c in names), None)
+        pnl_c = next((c for c in ("pnl", "net_pnl", "pnl_usdt", "gross_pnl", "pnl_usd") if c in names), None)
+        exit_c = next((c for c in ("exit_time", "closed_at", "close_time", "timestamp_close") if c in names), None)
         sym_c = "symbol" if "symbol" in names else None
         if not pnl_c or not exit_c or not sym_c:
             return None
@@ -411,7 +482,7 @@ class DatabaseManager:
                 if meta is None:
                     return dict(_EMPTY_PERIOD_SUMMARY)
                 pnl_c, exit_c, sym_c, st_c = meta
-                st_sql = f'"{st_c}" = \'closed\'' if st_c else "TRUE"
+                st_sql = f'"{st_c}" = \'closed\'' if st_c else "timestamp_close IS NOT NULL"
                 q_agg = f"""
                     SELECT
                       COALESCE(SUM("{pnl_c}"), 0.0) AS pnl_total,
@@ -491,7 +562,7 @@ class DatabaseManager:
                 if meta is None:
                     return []
                 pnl_c, exit_c, sym_c, st_c = meta
-                st_sql = f'"{st_c}" = \'closed\'' if st_c else "TRUE"
+                st_sql = f'"{st_c}" = \'closed\'' if st_c else "timestamp_close IS NOT NULL"
                 q = f"""
                     SELECT "{sym_c}" AS symbol, COALESCE(SUM("{pnl_c}"), 0.0) AS pnl_total
                     FROM trades_history
@@ -517,7 +588,7 @@ class DatabaseManager:
                 if meta is None:
                     return []
                 pnl_c, exit_c, sym_c, st_c = meta
-                st_sql = f'"{st_c}" = \'closed\'' if st_c else "TRUE"
+                st_sql = f'"{st_c}" = \'closed\'' if st_c else "timestamp_close IS NOT NULL"
                 q = f"""
                     SELECT "{sym_c}" AS symbol, "{exit_c}" AS exit_time,
                            "{pnl_c}" AS pnl, "{pnl_c}" AS pnl_net
@@ -553,7 +624,7 @@ class DatabaseManager:
                 if meta is None:
                     return []
                 pnl_c, exit_c, _, st_c = meta
-                st_sql = f'"{st_c}" = \'closed\'' if st_c else "TRUE"
+                st_sql = f'"{st_c}" = \'closed\'' if st_c else "timestamp_close IS NOT NULL"
                 q = f"""
                     SELECT date_trunc('day', "{exit_c}" AT TIME ZONE 'UTC')::date AS day_utc,
                            COALESCE(SUM("{pnl_c}"), 0.0) AS pnl_total

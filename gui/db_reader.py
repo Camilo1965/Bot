@@ -55,16 +55,16 @@ ORDER BY bucket ASC;
 """
 
 _TOTAL_PNL_QUERY = """
-SELECT COALESCE(SUM(pnl), 0.0) AS total_pnl
+SELECT COALESCE(SUM(pnl_usd), 0.0) AS total_pnl
 FROM trades_history
-WHERE status = 'closed';
+WHERE timestamp_close IS NOT NULL;
 """
 
 _ACTIVE_TRADES_QUERY = """
-SELECT id, symbol, entry_price, position_size, entry_time
+SELECT id, symbol, entry_price, lots, timestamp_open
 FROM trades_history
-WHERE status = 'open'
-ORDER BY entry_time DESC;
+WHERE timestamp_close IS NULL
+ORDER BY timestamp_open DESC;
 """
 
 _LATEST_SENTIMENT_QUERY = """
@@ -77,10 +77,11 @@ LIMIT 1;
 # Fetch both open and closed trades for plotting sniper-point overlays.
 # Returns entry info for BUY markers and exit info for SELL/trailing-stop markers.
 _TRADES_MARKERS_QUERY = """
-SELECT symbol, entry_price, entry_time, exit_price, exit_time, status
+SELECT symbol, entry_price, timestamp_open, exit_price, timestamp_close,
+       CASE WHEN timestamp_close IS NOT NULL THEN 'closed' ELSE 'open' END AS status
 FROM trades_history
 WHERE symbol = $1
-ORDER BY entry_time ASC;
+ORDER BY timestamp_open ASC;
 """
 
 # Fetch all HTF trend statuses for the Trend Radar widget.
@@ -274,8 +275,8 @@ class DBReaderThread(QThread):
                 "id": row["id"],
                 "symbol": row["symbol"],
                 "entry_price": float(row["entry_price"]),
-                "position_size": float(row["position_size"]),
-                "entry_time": row["entry_time"],
+                "position_size": float(row["lots"]),
+                "entry_time": row["timestamp_open"],
             }
             for row in trade_rows
         ]
@@ -288,9 +289,9 @@ class DBReaderThread(QThread):
             {
                 "symbol": row["symbol"],
                 "entry_price": float(row["entry_price"]),
-                "entry_time": row["entry_time"],
+                "entry_time": row["timestamp_open"],
                 "exit_price": float(row["exit_price"]) if row["exit_price"] is not None else None,
-                "exit_time": row["exit_time"],
+                "exit_time": row["timestamp_close"],
                 "status": row["status"],
             }
             for row in marker_rows
