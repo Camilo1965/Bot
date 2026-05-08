@@ -146,6 +146,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </style>
 </head>
 <body>
+    <div id="error-banner" class="hidden" style="position:fixed;top:0;left:0;right:0;z-index:50;background:var(--negative-dim);color:var(--negative);border-bottom:1px solid rgba(255,51,102,.3);padding:8px 16px;text-align:center;font-size:12px;font-weight:600"></div>
     <div class="max-w-7xl mx-auto space-y-5">
         <header class="surface p-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
             <div class="flex items-center gap-4">
@@ -258,8 +259,41 @@ function rsiC(v){return v>=70?'var(--negative)':v<=30?'var(--positive)':'var(--a
 function tB(t){return t==='bullish'?'<span style="color:var(--positive);font-weight:600">B</span>':t==='bearish'?'<span style="color:var(--negative);font-weight:600">S</span>':'<span style="color:var(--text-secondary)">N</span>'}
 function sB(i){if(i.has_position)return'<span class="badge badge-active">● ACTIVA</span>';if(i.can_enter)return'<span class="badge badge-buy">▲ COMPRAR</span>';return'<span class="badge badge-hold">● ESPERAR</span>'}
 function renderVibe(v){const b=document.getElementById('vibe-status-badge');if(v.mcp_available){b.className='badge badge-vibe';b.textContent='Conectado'}else{b.className='badge badge-wait';b.textContent='Desconectado'}const d=document.getElementById('dot-vibe');if(d)d.style.color=v.mcp_available?'var(--vibe)':'var(--text-dim)';const c=document.getElementById('vibe-content');let h='';const p=v.patterns||{};const pk=Object.keys(p);if(pk.length){for(const s of pk){const t=p[s]||'';h+=`<div class="vibe-item"><span class="mono text-xs" style="color:var(--vibe);font-weight:600">${s}</span> <span class="text-sm text-gray-300">${t.substring(0,150)}</span></div>`}}else{h+='<div class="text-gray-500 text-sm">🔍 Patrones: esperando datos…</div>'}const j=v.journal||'';if(j){h+=`<div class="vibe-item"><span class="text-xs" style="color:var(--vibe);font-weight:600">📋 Journal</span> <span class="text-sm text-gray-300">${j.substring(0,150)}</span></div>`}else{h+='<div class="text-gray-500 text-sm">📋 Journal: sin analizar</div>'}const bt=v.backtest||{};const bk=Object.keys(bt);if(bk.length){for(const s of bk){const t=bt[s]||'';h+=`<div class="vibe-item"><span class="text-xs" style="color:var(--vibe);font-weight:600">📊 Backtest ${s}</span> <span class="text-sm text-gray-300">${t.substring(0,150)}</span></div>`}}else{h+='<div class="text-gray-500 text-sm">📊 Backtest: semanal…</div>'}const f=v.factors||{};const fk=Object.keys(f);if(fk.length){for(const s of fk){const t=f[s]||'';h+=`<div class="vibe-item"><span class="text-xs" style="color:var(--vibe);font-weight:600">🧬 Factors ${s}</span> <span class="text-sm text-gray-300">${t.substring(0,150)}</span></div>`}}else{h+='<div class="text-gray-500 text-sm">🧬 Factors: mensual…</div>'}const sh=v.shadow||'';if(sh){h+=`<div class="vibe-item"><span class="text-xs" style="color:var(--vibe);font-weight:600">🌙 Shadow</span> <span class="text-sm text-gray-300">${sh.substring(0,150)}</span></div>`}else{h+='<div class="text-gray-500 text-sm">🌙 Shadow: semanal…</div>'}c.innerHTML=h}
-async function fetchState(){try{const r=await fetch('/api/state');const d=await r.json();window.__lastData=d;render(d)}catch(e){console.error("Error fetching state",e)}}
-function render(data){document.getElementById('uptime').innerText=data.uptime;const pair=data.primary_pair||(Array.isArray(data.watchlist)&&data.watchlist[0])||'—';document.getElementById('sentiment').innerText=pair.replace('/',' / ');document.getElementById('sentiment-detail').innerText=data.strategy_blurb||'';const bs=document.getElementById('bot-status');if(data.global_hold){bs.innerHTML='<span style="color:var(--negative)">⛔ Pausa</span>'}else if(data.open_count>0){bs.innerHTML='<span style="color:var(--accent)">⚡ Operando</span>'}else{bs.innerHTML='<span style="color:var(--positive)">✅ Listo</span>'}
+let _abortCtrl=null;let _retryAfter=0;
+async function fetchState(){
+  if(_retryAfter>0){_retryAfter=Math.max(0,_retryAfter-2.5);return}
+  if(_abortCtrl){_abortCtrl.abort()}
+  _abortCtrl=new AbortController();
+  const to=setTimeout(()=>_abortCtrl.abort(),8000);
+  try{
+    const r=await fetch('/api/state',{signal:_abortCtrl.signal});
+    clearTimeout(to);
+    if(r.status===429){
+      const ra=parseInt(r.headers.get('Retry-After')||'30',10);
+      _retryAfter=ra;
+      console.warn('Rate limited, backing off for',ra,'s');
+      showError('Rate limit — esperando '+ra+'s');
+      return
+    }
+    if(!r.ok){
+      showError('HTTP '+r.status);
+      return
+    }
+    const d=await r.json();
+    hideError();
+    window.__lastData=d;
+    render(d)
+  }catch(e){
+    clearTimeout(to);
+    if(e.name==='AbortError'){console.warn('Fetch timeout');showError('Timeout — servidor lento')}
+    else{console.error('Error fetching state',e);showError('Error de conexión')}
+  }
+}
+function showError(msg){const el=document.getElementById('error-banner');if(el){el.style.display='block';el.textContent=msg}}
+function hideError(){const el=document.getElementById('error-banner');if(el)el.style.display='none'}
+function render(data){
+  if(!data||typeof data!=='object'){console.error('Invalid data',data);return}
+  document.getElementById('uptime').innerText=data.uptime||'00:00:00';const pair=data.primary_pair||(Array.isArray(data.watchlist)&&data.watchlist[0])||'—';document.getElementById('sentiment').innerText=pair.replace('/',' / ');document.getElementById('sentiment-detail').innerText=data.strategy_blurb||'';const bs=document.getElementById('bot-status');if(data.global_hold){bs.innerHTML='<span style="color:var(--negative)">⛔ Pausa</span>'}else if(data.open_count>0){bs.innerHTML='<span style="color:var(--accent)">⚡ Operando</span>'}else{bs.innerHTML='<span style="color:var(--positive)">✅ Listo</span>'}
 updateValue('pos-count',`${data.open_count||0}/${data.max_positions||3}`);updateValue('s-wins',data.session_wins||0);updateValue('s-losses',data.session_losses||0);updateValue('s-winrate',data.session_winrate||'0%');
 const th=Number.isFinite(data.buy_prob_threshold_pct)?data.buy_prob_threshold_pct:70;updateValue('sent-num',th+'%');const sb=document.getElementById('sent-bar');if(sb)sb.style.width=Math.min(100,Math.max(0,th))+'%';
 const la=document.getElementById('api-latency');if(la){const ms=Number(data.api_latency_ms||0);la.innerText=ms>0?(Math.round(ms)+' ms'):'—'}
@@ -267,14 +301,14 @@ updateValue('balance',data.balance);updateValue('balance-lg',data.balance);updat
 const pnlEl=document.getElementById('session-pnl');updateValue('session-pnl',data.session_pnl);if(pnlEl)pnlEl.style.color=data.session_pnl_num>=0?'var(--positive)':'var(--negative)';
 const ddEl=document.getElementById('drawdown');updateValue('drawdown',data.max_drawdown);if(ddEl)ddEl.style.color=data.max_drawdown_num<0?'var(--negative)':'var(--text-primary)';
 const buyTh=Number.isFinite(data.buy_prob_threshold_pct)?data.buy_prob_threshold_pct:70;
-let rh='';data.market.forEach(i=>{const ml=Math.min(100,Math.max(0,parseFloat(String(i.ml_conf).replace(/[%\s]/g,''))||0)));const mc=ml>=buyTh?'var(--positive)':'var(--accent)';const rn=(i.rsi==='--'||i.rsi===undefined)?NaN:parseFloat(i.rsi);const rs=Number.isFinite(rn)?rn.toFixed(0):'—';const rv=Number.isFinite(rn)?Math.min(100,Math.max(0,rn)):0;const cc=i.change_ok===true;const chC=!cc?'color:var(--text-dim)':(i.change_num>=0?'color:var(--positive)':'color:var(--negative)');const chG=!cc?'•':(i.change_num>=0?'↗':'↘');const st=i.symbol_pair?String(i.symbol_pair).replace('/',' / '):i.symbol;const rb=i.has_position?'background:rgba(0,212,255,.04)':'';let ph='<span style="color:var(--text-dim)">—</span>';if(i.has_position&&i.unrealized_pnl_num!==undefined){const c=i.unrealized_pnl_num>=0?'var(--positive)':'var(--negative)';ph=`<span class="mono font-medium" style="${c}">${i.unrealized_pnl_num>=0?'+':''}${i.unrealized_pnl_num.toFixed(2)}</span>`}
+        let rh='';const marketArr=Array.isArray(data.market)?data.market:[];marketArr.forEach(i=>{const ml=Math.min(100,Math.max(0,parseFloat(String(i.ml_conf).replace(/[%\s]/g,''))||0)));const mc=ml>=buyTh?'var(--positive)':'var(--accent)';const rn=(i.rsi==='--'||i.rsi===undefined)?NaN:parseFloat(i.rsi);const rs=Number.isFinite(rn)?rn.toFixed(0):'—';const rv=Number.isFinite(rn)?Math.min(100,Math.max(0,rn)):0;const cc=i.change_ok===true;const chC=!cc?'color:var(--text-dim)':(i.change_num>=0?'color:var(--positive)':'color:var(--negative)');const chG=!cc?'•':(i.change_num>=0?'↗':'↘');const st=i.symbol_pair?String(i.symbol_pair).replace('/',' / '):i.symbol;const rb=i.has_position?'background:rgba(0,212,255,.04)':'';let ph='<span style="color:var(--text-dim)">—</span>';if(i.has_position&&i.unrealized_pnl_num!==undefined){const c=i.unrealized_pnl_num>=0?'var(--positive)':'var(--negative)';ph=`<span class="mono font-medium" style="${c}">${i.unrealized_pnl_num>=0?'+':''}${i.unrealized_pnl_num.toFixed(2)}</span>`}
 rh+=`<tr class="mkt-row border-b" style="border-color:var(--border);${rb}"><td class="px-4 py-3"><span class="font-semibold text-white">${st}</span><div class="text-[10px] text-gray-500 mono">${i.symbol}</div></td><td class="px-4 py-3 text-right mono font-medium text-white">${i.price}</td><td class="px-4 py-3 text-right hide-mobile" style="${chC}">${chG} ${i.change}</td><td class="px-4 py-3 text-center hide-mobile"><span class="mono" style="color:${rsiC(Number.isFinite(rn)?rn:50)}">${rs}</span><div class="bar-track mt-1"><div class="bar-fill" style="width:${rv}%;background:${rsiC(Number.isFinite(rn)?rn:50)}"></div></div></td><td class="px-4 py-3 text-center"><span class="mono" style="color:${mc}">${i.ml_conf}</span><div class="bar-track mt-1"><div class="bar-fill" style="width:${ml}%;background:${mc}"></div></div></td><td class="px-4 py-3 text-center hide-mobile">${tB(i.trend_detail?.['15m']||'neutral')}/${tB(i.trend_detail?.['1h']||'neutral')}/${tB(i.trend_detail?.['4h']||'neutral')}</td><td class="px-4 py-3 text-center">${ph}</td><td class="px-4 py-3 text-center">${sB(i)}</td></tr>`});document.getElementById('market-tbody').innerHTML=rh;
-let ph2='';let hp=false;data.market.forEach(i=>{if(!i.has_position)return;hp=true;const pc=i.unrealized_pnl_num>=0?'var(--positive)':'var(--negative)';ph2+=`<tr class="border-b" style="border-color:var(--border)"><td class="px-4 py-2 font-semibold text-white">${i.symbol_pair||i.symbol}</td><td class="px-4 py-2 text-right mono">${i.position_str||'—'}</td><td class="px-4 py-2 text-right mono text-white">${i.price}</td><td class="px-4 py-2 text-right mono" style="color:var(--warning)">${i.stop_loss||'—'}</td><td class="px-4 py-2 text-right mono" style="color:var(--positive)">${i.take_profit||'—'}</td><td class="px-4 py-2 text-right mono font-medium" style="${pc}">${i.unrealized_pnl||'—'}</td><td class="px-4 py-2 text-center">${i.trailing_active?'<span class="badge badge-buy" style="font-size:10px">🔒 TRAIL</span>':'<span class="text-gray-500 text-xs">OFF</span>'}</td></tr>`});document.getElementById('pos-tbody').innerHTML=ph2||'<tr><td colspan="7" class="text-center text-gray-500 py-4">Sin posiciones</td></tr>';document.getElementById('positions-section').classList.toggle('hidden',!hp);
+        let ph2='';let hp=false;marketArr.forEach(i=>{if(!i.has_position)return;hp=true;const pc=i.unrealized_pnl_num>=0?'var(--positive)':'var(--negative)';ph2+=`<tr class="border-b" style="border-color:var(--border)"><td class="px-4 py-2 font-semibold text-white">${i.symbol_pair||i.symbol}</td><td class="px-4 py-2 text-right mono">${i.position_str||'—'}</td><td class="px-4 py-2 text-right mono text-white">${i.price}</td><td class="px-4 py-2 text-right mono" style="color:var(--warning)">${i.stop_loss||'—'}</td><td class="px-4 py-2 text-right mono" style="color:var(--positive)">${i.take_profit||'—'}</td><td class="px-4 py-2 text-right mono font-medium" style="${pc}">${i.unrealized_pnl||'—'}</td><td class="px-4 py-2 text-center">${i.trailing_active?'<span class="badge badge-buy" style="font-size:10px">🔒 TRAIL</span>':'<span class="text-gray-500 text-xs">OFF</span>'}</td></tr>`});document.getElementById('pos-tbody').innerHTML=ph2||'<tr><td colspan="7" class="text-center text-gray-500 py-4">Sin posiciones</td></tr>';document.getElementById('positions-section').classList.toggle('hidden',!hp);
 renderVibe(data.vibe||{});
 const ceo=data.ceo||{};const ms=v=>v>=0?'color:var(--positive);font-weight:500':'color:var(--negative);font-weight:500';const p7n=Number(ceo.pnl_7d_num||0);const p30n=Number(ceo.pnl_30d_num||0);updateValue('ceo-pnl-7d',ceo.pnl_7d||'—');const p7e=document.getElementById('ceo-pnl-7d');if(p7e)p7e.style.cssText=ms(p7n);updateValue('ceo-winrate-7d',ceo.winrate_7d||'—');updateValue('ceo-pf-30d',ceo.profit_factor_30d||'—');updateValue('ceo-pnl-30d',ceo.pnl_30d||'—');const p30e=document.getElementById('ceo-pnl-30d');if(p30e)p30e.style.cssText=ms(p30n);document.getElementById('ceo-updated').innerText=`Actualizado: ${ceo.last_updated_local||'—'}`;
 const syEl=document.getElementById('ceo-symbols');const sy=ceo.symbols_month||[];syEl.innerHTML=sy.length===0?'<div class="text-gray-500">Sin datos</div>':sy.slice(0,6).map(s=>`<div class="flex justify-between"><span class="text-gray-300">${s.symbol}</span><span class="mono" style="${Number(s.pnl_total)>=0?'color:var(--positive)':'color:var(--negative)'}">${s.pnl_label}</span></div>`).join('');
 const trEl=document.getElementById('ceo-trades');const tr=ceo.recent_trades||[];ceoTradeRows=tr;const ft=filterCeoTrades(ceoTradeRows);const rc=Math.min(ceoTradeVisibleCount,ft.length);trEl.innerHTML=ft.length===0?'<div class="text-gray-500">Sin trades cerrados</div>':ft.slice(0,rc).map(t=>`<div class="flex justify-between"><span class="text-gray-300">${t.symbol} <span class="text-gray-500">(${t.exit_time_local})</span></span><span class="mono" style="${Number(t.pnl_num)>=0?'color:var(--positive)':'color:var(--negative)'}">${t.pnl}</span></div>`).join('');updateCeoFilterButtons();const mb=document.getElementById('ceo-trades-more');mb.classList.toggle('hidden',ft.length<=rc);mb.innerText=`Cargar más (${ft.length-rc})`;
-const evEl=document.getElementById('events-log');if(data.events.length>0){evEl.innerHTML=data.events.map((e,i)=>`<div class="flex items-start gap-3 py-1.5"><div class="w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0" style="background:${i===0?'var(--accent)':'var(--text-dim)'}"></div><div class="text-sm text-gray-300">${e}</div></div>`).join('')}else{evEl.innerHTML='<div class="text-gray-500 text-sm">Sin eventos recientes…</div>'}}
+        const evEl=document.getElementById('events-log');const evArr=Array.isArray(data.events)?data.events:[];if(evArr.length>0){evEl.innerHTML=evArr.map((e,i)=>`<div class="flex items-start gap-3 py-1.5"><div class="w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0" style="background:${i===0?'var(--accent)':'var(--text-dim)'}"></div><div class="text-sm text-gray-300">${e}</div></div>`).join('')}else{evEl.innerHTML='<div class="text-gray-500 text-sm">Sin eventos recientes…</div>'}}
 fetchState();setInterval(fetchState,2500);document.getElementById('ceo-trades-more').addEventListener('click',()=>{ceoTradeVisibleCount+=20;render({...window.__lastData,ceo:{...(window.__lastData?.ceo||{}),recent_trades:ceoTradeRows}})});document.querySelectorAll('#ceo-trades-filters button[data-filter]').forEach(b=>{b.addEventListener('click',()=>{ceoTradeFilter=b.dataset.filter||'all';ceoTradeVisibleCount=10;render({...window.__lastData,ceo:{...(window.__lastData?.ceo||{}),recent_trades:ceoTradeRows}})})});
     </script>
 </body>
@@ -292,11 +326,11 @@ async def start_web_dashboard(
     report_tz = os.environ.get("REPORT_TIMEZONE", "America/Bogota")
     ceo_cache: dict[str, Any] = {"expires_mono": 0.0, "data": None}
     api_mt5_sync_last_mono = 0.0
-    # Min seconds between full MT5↔memory syncs on /api/state. 0 = sync every request
-    # (matches SPA poll ~2.5s ⇒ dashboard rarely >~3s stale vs broker).
+    # Min seconds between full MT5↔memory syncs on /api/state.
+    # Default 5s avoids hammering MT5 on every browser poll (~2.5s).
     _raw_api_iv = os.environ.get(
         "WEB_API_MT5_SYNC_MIN_INTERVAL_S",
-        os.environ.get("WEB_API_MT5_SYNC_EVERY_S", "0"),
+        os.environ.get("WEB_API_MT5_SYNC_EVERY_S", "5"),
     ).strip()
     try:
         api_mt5_sync_iv = float(_raw_api_iv) if _raw_api_iv else 0.0
@@ -367,7 +401,18 @@ async def start_web_dashboard(
         return ceo_payload
     
     async def handle_html(request: web.Request) -> web.Response:
-        return web.Response(text=HTML_TEMPLATE, content_type="text/html")
+        return web.Response(
+            text=HTML_TEMPLATE,
+            content_type="text/html",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    async def handle_health(request: web.Request) -> web.Response:
+        return web.json_response({
+            "status": "ok",
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "version": "1.0",
+        })
 
     async def handle_api(request: web.Request) -> web.Response:
         nonlocal api_mt5_sync_last_mono
@@ -399,7 +444,7 @@ async def start_web_dashboard(
             uptime_str = "00:00:00"
 
         sentiment = state.get("sentiment")
-        global_hold = False
+        global_hold = bool(state.get("global_hold", False))
         sentiment_label = "ETH/USDT ML-only"
         sentiment_detail = "Sin Gemini / noticias — solo XGB ≥ 70%"
 
@@ -449,7 +494,7 @@ async def start_web_dashboard(
                 mt5_symbol_open_bot = set()
         
         for sym in watchlist:
-            prices = list(state["prices"].get(sym, []))
+            prices = list(state.get("prices", {}).get(sym, []))
             candle_last = prices[-1] if prices else None
             price = mt5_dashboard_mark(state, sym, candle_last)
             
@@ -652,16 +697,51 @@ async def start_web_dashboard(
         return web.json_response(resp)
 
     async def handle_performance(request: web.Request) -> web.Response:
-        from bot.performance_analyzer import analyzer
-        metrics = await analyzer.get_metrics()
-        return web.json_response(metrics)
+        try:
+            from bot.performance_analyzer import analyzer
+            metrics = await analyzer.get_metrics()
+            return web.json_response(metrics)
+        except Exception as exc:
+            logger.warning("Web /api/performance failed: %s", exc)
+            return web.json_response(
+                {"error": "service_unavailable", "detail": str(exc)},
+                status=503,
+            )
 
     _rpm_raw = os.environ.get("DASH_API_RATE_PER_MIN", "180").strip()
     try:
         _rpm = max(0, int(_rpm_raw))
     except ValueError:
         _rpm = 180
-    _middlewares = [_make_api_rate_middleware(_rpm)] if _rpm > 0 else []
+
+    _dash_token = os.environ.get("DASHBOARD_TOKEN", "").strip()
+
+    @web.middleware
+    async def _auth_middleware(request: web.Request, handler):
+        """Require DASHBOARD_TOKEN on sensitive endpoints if set."""
+        if _dash_token and request.path not in ("/", "/health"):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer ") or auth[7:].strip() != _dash_token:
+                return web.json_response(
+                    {"error": "unauthorized"},
+                    status=401,
+                    headers={"WWW-Authenticate": 'Bearer realm="dashboard"'},
+                )
+        return await handler(request)
+
+    @web.middleware
+    async def _cors_middleware(request: web.Request, handler):
+        """Add CORS headers for API endpoints."""
+        response = await handler(request)
+        if request.path.startswith("/api/"):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        return response
+
+    _middlewares = [_auth_middleware, _cors_middleware]
+    if _rpm > 0:
+        _middlewares.append(_make_api_rate_middleware(_rpm))
 
     # ── Vibe-Trading analysis endpoints ──────────────────────────────────
     async def _handle_vibe_journal(request: web.Request) -> web.Response:
@@ -709,6 +789,7 @@ async def start_web_dashboard(
     app = web.Application(middlewares=_middlewares)
     app.add_routes([
         web.get("/", handle_html),
+        web.get("/health", handle_health),
         web.get("/api/state", handle_api),
         web.get("/api/performance", handle_performance),
         web.get("/api/vibe/journal", _handle_vibe_journal),
