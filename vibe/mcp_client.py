@@ -112,11 +112,17 @@ class VibeMCPClient:
                 return False
 
             # Send initialize
-            result = await self._call("initialize", {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "clawdbot", "version": "1.0"},
-            })
+            try:
+                result = await self._call("initialize", {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "clawdbot", "version": "1.0"},
+                })
+            except Exception as exc:
+                self._init_error = f"Initialize exception: {exc}"
+                logger.warning("[VIBE] MCP initialize exception: %s", exc)
+                await self.stop()
+                return False
             if result:
                 await self._notify("notifications/initialized", {})
                 self._available = True
@@ -288,6 +294,9 @@ class VibeMCPClient:
                 )
             except asyncio.TimeoutError:
                 logger.warning("[VIBE] Timeout reading MCP response line.")
+                return None
+            except Exception as exc:
+                logger.warning("[VIBE] Error reading MCP stdout: %s", exc)
                 return None
             if not raw:
                 return None

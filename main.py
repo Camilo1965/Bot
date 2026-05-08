@@ -891,7 +891,11 @@ async def main() -> None:
     vibe_client: VibeMCPClient | None = None
     if _VIBE_AVAILABLE and os.environ.get("VIBE_TRADING_ENABLED", "1").strip() in ("1", "true", "yes"):
         vibe_client = VibeMCPClient()
-        vibe_started = await vibe_client.start()
+        try:
+            vibe_started = await vibe_client.start()
+        except Exception as exc:
+            logger.warning("ℹ️ Vibe-Trading MCP start raised exception (%s) — tools disabled.", exc)
+            vibe_started = False
         if vibe_started:
             shared_state["vibe_client"] = vibe_client
             run_tasks.append(journal_analysis_loop(vibe_client, shared_state))
