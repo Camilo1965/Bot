@@ -212,6 +212,7 @@ class PaperExecutor:
         duration = (exit_time - pos.entry_time).total_seconds() / 60.0
         row = [pos.trade_id, pos.symbol, pos.entry_time.isoformat(), exit_time.isoformat(), f"{pos.entry_price:.8f}", f"{exit_price:.8f}", f"{pos.position_size:.2f}", f"{gross_pnl:.4f}", f"{net_pnl:.4f}", reason, f"{pos.ml_confidence:.4f}", f"{duration:.1f}"]
         try:
+            self._journal_file.parent.mkdir(exist_ok=True)
             write_header = not self._journal_file.exists()
             with self._journal_file.open("a", newline="") as f:
                 writer = csv.writer(f)

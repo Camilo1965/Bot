@@ -65,7 +65,7 @@ async def extract_and_backtest_shadow(
     """
     path = journal_path or JOURNAL_PATH
     if not path.is_file():
-        logger.warning("[VIBE] Trade journal not found: %s", path)
+        logger.debug("[VIBE] Trade journal not found (will extract once trades exist): %s", path)
         return None
 
     shadow_result = await client.extract_shadow_strategy(str(path.resolve()))

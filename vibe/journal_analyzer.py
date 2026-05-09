@@ -31,7 +31,7 @@ async def analyze_journal(
     """
     path = journal_path or JOURNAL_PATH
     if not path.is_file():
-        logger.warning("[VIBE] Trade journal not found: %s", path)
+        logger.debug("[VIBE] Trade journal not found (will analyze once trades exist): %s", path)
         return None
     result = await client.analyze_trade_journal(str(path.resolve()))
     if result:

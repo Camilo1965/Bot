@@ -247,10 +247,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div>
             <div class="section-title px-1">LÍNEA DE TIEMPO</div>
-            <div class="surface p-5" id="events-log"></div>
+            <div class="surface p-5" id="events-log"><div class="text-gray-500 text-sm">Cargando dashboard...</div></div>
         </div>
     </div>
     <script>
+console.log('Dashboard JS loading...');
 const stateCache={};let ceoTradeVisibleCount=10;let ceoTradeRows=[];let ceoTradeFilter='all';
 function filterCeoTrades(rows){if(ceoTradeFilter==='all')return rows;const now=new Date();const st=new Date(now.getFullYear(),now.getMonth(),now.getDate());const dMs=864e5;return rows.filter(t=>{if(!t.exit_time_iso)return false;const d=new Date(t.exit_time_iso);if(isNaN(d))return false;if(ceoTradeFilter==='today')return d>=st;if(ceoTradeFilter==='7d')return(now-d)<=7*dMs;if(ceoTradeFilter==='30d')return(now-d)<=30*dMs;return true})}
 function updateCeoFilterButtons(){document.querySelectorAll('#ceo-trades-filters button[data-filter]').forEach(b=>{const a=b.dataset.filter===ceoTradeFilter;b.style.borderColor=a?'var(--accent)':'var(--border)';b.style.color=a?'var(--accent)':'';b.className='px-2 py-1 text-xs rounded border'+(a?'':' text-gray-400')})}
@@ -259,7 +260,7 @@ function rsiC(v){return v>=70?'var(--negative)':v<=30?'var(--positive)':'var(--a
 function tB(t){return t==='bullish'?'<span style="color:var(--positive);font-weight:600">B</span>':t==='bearish'?'<span style="color:var(--negative);font-weight:600">S</span>':'<span style="color:var(--text-secondary)">N</span>'}
 function sB(i){if(i.has_position)return'<span class="badge badge-active">● ACTIVA</span>';if(i.can_enter)return'<span class="badge badge-buy">▲ COMPRAR</span>';return'<span class="badge badge-hold">● ESPERAR</span>'}
 function renderVibe(v){const b=document.getElementById('vibe-status-badge');if(v.mcp_available){b.className='badge badge-vibe';b.textContent='Conectado'}else{b.className='badge badge-wait';b.textContent='Desconectado'}const d=document.getElementById('dot-vibe');if(d)d.style.color=v.mcp_available?'var(--vibe)':'var(--text-dim)';const c=document.getElementById('vibe-content');let h='';const p=v.patterns||{};const pk=Object.keys(p);if(pk.length){for(const s of pk){const t=p[s]||'';h+=`<div class="vibe-item"><span class="mono text-xs" style="color:var(--vibe);font-weight:600">${s}</span> <span class="text-sm text-gray-300">${t.substring(0,150)}</span></div>`}}else{h+='<div class="text-gray-500 text-sm">🔍 Patrones: esperando datos…</div>'}const j=v.journal||'';if(j){h+=`<div class="vibe-item"><span class="text-xs" style="color:var(--vibe);font-weight:600">📋 Journal</span> <span class="text-sm text-gray-300">${j.substring(0,150)}</span></div>`}else{h+='<div class="text-gray-500 text-sm">📋 Journal: sin analizar</div>'}const bt=v.backtest||{};const bk=Object.keys(bt);if(bk.length){for(const s of bk){const t=bt[s]||'';h+=`<div class="vibe-item"><span class="text-xs" style="color:var(--vibe);font-weight:600">📊 Backtest ${s}</span> <span class="text-sm text-gray-300">${t.substring(0,150)}</span></div>`}}else{h+='<div class="text-gray-500 text-sm">📊 Backtest: semanal…</div>'}const f=v.factors||{};const fk=Object.keys(f);if(fk.length){for(const s of fk){const t=f[s]||'';h+=`<div class="vibe-item"><span class="text-xs" style="color:var(--vibe);font-weight:600">🧬 Factors ${s}</span> <span class="text-sm text-gray-300">${t.substring(0,150)}</span></div>`}}else{h+='<div class="text-gray-500 text-sm">🧬 Factors: mensual…</div>'}const sh=v.shadow||'';if(sh){h+=`<div class="vibe-item"><span class="text-xs" style="color:var(--vibe);font-weight:600">🌙 Shadow</span> <span class="text-sm text-gray-300">${sh.substring(0,150)}</span></div>`}else{h+='<div class="text-gray-500 text-sm">🌙 Shadow: semanal…</div>'}c.innerHTML=h}
-async function fetchState(){try{const r=await fetch('/api/state');const d=await r.json();window.__lastData=d;render(d)}catch(e){console.error("Error fetching state",e)}}
+async function fetchState(){try{const r=await fetch('/api/state');if(!r.ok){console.error('API error:',r.status);return}const d=await r.json();window.__lastData=d;render(d)}catch(e){console.error('Error fetching state:',e)}}
 function render(data){document.getElementById('uptime').innerText=data.uptime;const pair=data.primary_pair||(Array.isArray(data.watchlist)&&data.watchlist[0])||'—';document.getElementById('sentiment').innerText=pair.replace('/',' / ');document.getElementById('sentiment-detail').innerText=data.strategy_blurb||'';const bs=document.getElementById('bot-status');if(data.global_hold){bs.innerHTML='<span style="color:var(--negative)">⛔ Pausa</span>'}else if(data.open_count>0){bs.innerHTML='<span style="color:var(--accent)">⚡ Operando</span>'}else{bs.innerHTML='<span style="color:var(--positive)">✅ Listo</span>'}
 updateValue('pos-count',`${data.open_count||0}/${data.max_positions||3}`);updateValue('s-wins',data.session_wins||0);updateValue('s-losses',data.session_losses||0);updateValue('s-winrate',data.session_winrate||'0%');
 const th=Number.isFinite(data.buy_prob_threshold_pct)?data.buy_prob_threshold_pct:70;updateValue('sent-num',th+'%');const sb=document.getElementById('sent-bar');if(sb)sb.style.width=Math.min(100,Math.max(0,th))+'%';
@@ -379,13 +380,19 @@ async def start_web_dashboard(
         return ceo_payload
     
     async def handle_html(request: web.Request) -> web.Response:
-        return web.Response(
-            text=HTML_TEMPLATE,
-            content_type="text/html",
-            headers={"Cache-Control": "public, max-age=3600"},
-        )
+        logger.debug("Web GET / from %s", request.remote)
+        try:
+            return web.Response(
+                text=HTML_TEMPLATE,
+                content_type="text/html",
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+        except Exception as exc:
+            logger.error("Web failed to serve HTML: %s", exc)
+            raise
 
     async def handle_health(request: web.Request) -> web.Response:
+        logger.debug("Web GET /health from %s", request.remote)
         return web.json_response({
             "status": "ok",
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
@@ -393,6 +400,7 @@ async def start_web_dashboard(
         })
 
     async def handle_api(request: web.Request) -> web.Response:
+        logger.debug("Web GET /api/state from %s", request.remote)
         nonlocal api_mt5_sync_last_mono
         now_utc = datetime.now(tz=timezone.utc)
 
