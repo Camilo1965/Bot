@@ -97,4 +97,4 @@ async def run_backtest(
     signal_path.write_text(_SIGNAL_ENGINE_CODE, encoding="utf-8")
 
     logger.info("[VIBE] Created backtest run_dir: %s", run_dir)
-    return await client.backtest(run_dir=str(run_dir.resolve()))
+    return await client.backtest(run_dir=run_dir.resolve().as_posix())

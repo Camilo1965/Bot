@@ -77,4 +77,4 @@ async def detect_patterns(
     if not csv_path:
         return None
 
-    return await client.pattern_recognition(run_dir=str(run_dir.resolve()))
+    return await client.pattern_recognition(run_dir=run_dir.resolve().as_posix())
