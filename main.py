@@ -985,6 +985,15 @@ async def main() -> None:
             startup_alert_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await startup_alert_task
+        
+        from utils.telegram_notifier import _pending_tasks
+        if _pending_tasks:
+            for t in list(_pending_tasks):
+                if not t.done():
+                    t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(*_pending_tasks, return_exceptions=True)
+                
         _live.stop()
         await close_db()
         if _mt5_initialized:

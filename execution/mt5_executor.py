@@ -251,7 +251,6 @@ _RETRYABLE_RETCODES: frozenset[int] = frozenset({
     10011,  # REQUEST_ERROR
     10012,  # REQUEST_TIMEOUT
     10020,  # PRICE_CHANGED
-    10021,  # PRICE_OFF
     10024,  # TOO_MANY_REQUESTS
     10031,  # CONNECTION
 })
@@ -259,6 +258,7 @@ _RETRYABLE_RETCODES: frozenset[int] = frozenset({
 # Expected pauses (weekend / session) — must not trip the circuit breaker.
 _MT5_SOFT_SESSION_RETCODES: frozenset[int] = frozenset({
     10018,  # MARKET_CLOSED
+    10021,  # PRICE_OFF
 })
 
 

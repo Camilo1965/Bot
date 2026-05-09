@@ -399,6 +399,18 @@ class PaperExecutor:
     async def sync_positions_with_exchange(self, confirmations_required: int = 1) -> int:
         return len(self.open_positions)
 
+    async def retry_close_pending_positions(self, latest_prices: dict[str, float]) -> int:
+        """Retry closing positions marked as close_pending. Overridden in MT5Executor."""
+        closed_count = 0
+        for sym, price in latest_prices.items():
+            pos = self.open_positions.get(sym)
+            if pos and pos.close_pending:
+                logger.info("[RECONCILER] Retrying paper close for %s", sym)
+                reason = pos.last_close_error or "retry_close"
+                await self._close_position(sym, price, reason)
+                closed_count += 1
+        return closed_count
+
 def _build_trade_report(*args: Any, **kwargs: Any) -> str:
     """Legacy stub for MT5Executor."""
     return ""

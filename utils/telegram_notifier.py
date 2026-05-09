@@ -251,6 +251,8 @@ def _format_record_body(record: logging.LogRecord) -> str:
     return msg
 
 
+_pending_tasks: set[asyncio.Task] = set()
+
 class TelegramForwardingHandler(logging.Handler):
     """Forward WARNING+ (configurable) log records to Telegram; cooldown + dedup.
 
@@ -287,8 +289,12 @@ class TelegramForwardingHandler(logging.Handler):
             dedup_key = f"logline:{record.name}:{hash(body[:400]) % 10_000_000}"
             priority = "critical" if record.levelno >= logging.ERROR else "warning_log"
 
-            loop = asyncio.get_running_loop()
-            loop.create_task(
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+                
+            task = loop.create_task(
                 send_priority_telegram_alert(
                     text,
                     priority=priority,
@@ -296,7 +302,10 @@ class TelegramForwardingHandler(logging.Handler):
                     parse_mode="HTML",
                 )
             )
-        except RuntimeError:
+            # Prevent "task destroyed but pending" error
+            _pending_tasks.add(task)
+            task.add_done_callback(_pending_tasks.discard)
+        except Exception:
             pass
         except Exception:  # noqa: BLE001
             pass
