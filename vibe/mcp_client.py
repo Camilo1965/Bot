@@ -26,11 +26,12 @@ from typing import Any
 logger = logging.getLogger("clawdbot.vibe")
 
 _MCP_BINARY = "vibe-trading-mcp"
-_REQUEST_TIMEOUT = 180
+_REQUEST_TIMEOUT = 300
 _MAX_CONSECUTIVE_FAILURES = 2
 _HEALTH_CHECK_INTERVAL = 120
-_HEALTH_CHECK_TIMEOUT = 30
+_HEALTH_CHECK_TIMEOUT = 90
 _RESTART_BACKOFF_BASE = 5
+_TOOL_CALL_COOLDOWN = 60
 
 
 class VibeMCPClient:
@@ -48,6 +49,7 @@ class VibeMCPClient:
         self._health_check_task: asyncio.Task | None = None
         self._restarting = False
         self._busy = False
+        self._last_tool_call_time = 0.0
 
     async def start(self) -> bool:
         """Start the MCP subprocess.  Returns True if successful."""
@@ -152,7 +154,7 @@ class VibeMCPClient:
             return False
 
     async def _health_check_loop(self) -> None:
-        """Background health check: restart MCP if unresponsive."""
+        """Background health check: restart MCP if process dies or becomes unresponsive."""
         while True:
             await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
             if self._restarting:
@@ -161,39 +163,27 @@ class VibeMCPClient:
                 continue
             if not self._available or not self._proc:
                 continue
+
+            # Cooldown: skip check right after a tool call finishes
+            elapsed = asyncio.get_event_loop().time() - self._last_tool_call_time
+            if 0 < elapsed < _TOOL_CALL_COOLDOWN:
+                continue
+
+            # Only check if the subprocess is still alive — no stdin/stdout traffic
             if self._proc.poll() is not None:
-                logger.warning("[VIBE] MCP process died - triggering restart.")
+                stderr = "\n".join(self._stderr_lines[-5:])
+                logger.warning(
+                    "[VIBE] MCP process died (exit=%s, stderr: %s) — triggering restart.",
+                    self._proc.returncode,
+                    stderr[:300],
+                )
                 await self._trigger_restart()
                 continue
-            try:
-                result = await asyncio.wait_for(
-                    self._call("tools/list", {}),
-                    timeout=_HEALTH_CHECK_TIMEOUT,
-                )
-                if result is None:
-                    self._consecutive_failures += 1
-                    logger.warning(
-                        "[VIBE] Health check failed (consecutive=%d/%d)",
-                        self._consecutive_failures,
-                        _MAX_CONSECUTIVE_FAILURES,
-                    )
-                    if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                        stderr = "\n".join(self._stderr_lines[-5:])
-                        logger.warning("[VIBE] Too many failures (stderr tail: %s) - restarting.", stderr[:200])
-                        await self._trigger_restart()
-                else:
-                    if self._consecutive_failures > 0:
-                        logger.info("[VIBE] Health check recovered.")
-                    self._consecutive_failures = 0
-            except asyncio.TimeoutError:
-                self._consecutive_failures += 1
-                logger.warning("[VIBE] Health check timeout (consecutive=%d/%d).", self._consecutive_failures, _MAX_CONSECUTIVE_FAILURES)
-                if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                    stderr = "\n".join(self._stderr_lines[-5:])
-                    logger.warning("[VIBE] Too many timeouts (stderr tail: %s) - restarting.", stderr[:200])
-                    await self._trigger_restart()
-            except Exception as exc:
-                logger.debug("[VIBE] Health check exception: %s", exc)
+
+            # Verify stdout pipe is still open (process alive but pipe broken)
+            if self._proc.stdout and self._proc.stdout.closed:
+                logger.warning("[VIBE] MCP stdout pipe closed — triggering restart.")
+                await self._trigger_restart()
 
     async def _trigger_restart(self) -> None:
         """Trigger MCP restart with backoff."""
@@ -227,7 +217,12 @@ class VibeMCPClient:
         else:
             self._restart_backoff = min(self._restart_backoff * 2, 60)
 
-        logger.warning("[VIBE] Restarting MCP in %ds...", self._restart_backoff)
+        stderr = "\n".join(self._stderr_lines[-5:])
+        logger.warning(
+            "[VIBE] Restarting MCP in %ds... (stderr: %s)",
+            self._restart_backoff,
+            stderr[:300],
+        )
         await asyncio.sleep(self._restart_backoff)
 
         success = await self.start()
@@ -253,7 +248,12 @@ class VibeMCPClient:
                     self._stderr_lines.append(line)
                     if len(self._stderr_lines) > 200:
                         self._stderr_lines = self._stderr_lines[-100:]
-                    logger.debug("[VIBE MCP stderr] %s", line)
+                    # Log errors/warnings at WARNING, rest at DEBUG
+                    lower = line.lower()
+                    if "error" in lower or "traceback" in lower or "exception" in lower:
+                        logger.warning("[VIBE MCP stderr] %s", line)
+                    else:
+                        logger.debug("[VIBE MCP stderr] %s", line)
         except Exception:
             pass
 
@@ -326,6 +326,7 @@ class VibeMCPClient:
                 logger.warning("[VIBE] Error reading MCP stdout: %s", exc)
                 return None
             if not raw:
+                logger.warning("[VIBE] MCP stdout EOF (method=%s) — subprocess likely died.", method)
                 return None
             decoded = raw.decode("utf-8", errors="replace").strip()
             if not decoded:
@@ -388,6 +389,7 @@ class VibeMCPClient:
             return None
         finally:
             self._busy = False
+            self._last_tool_call_time = asyncio.get_event_loop().time()
 
     async def backtest(self, run_dir: str) -> dict | None:
         return await self.call_tool("backtest", {"run_dir": run_dir})
