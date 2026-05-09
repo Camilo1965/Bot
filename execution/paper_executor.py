@@ -246,7 +246,7 @@ class PaperExecutor:
         atr_mult = float(os.environ.get("TP_ATR_MULTIPLIER", "2.5"))
         tp_price = entry_price + (current_atr * atr_mult) if current_atr else None
         
-        trade_id = uuid.uuid4().hex[:8]
+        trade_id = str(uuid.uuid4())
         now = datetime.now(tz=timezone.utc)
         tf = cfg.get("timeframe", "15m")
 

@@ -427,7 +427,7 @@ class DatabaseManager:
 
     # ── Legacy Aliases for MT5Executor ───────────────────────────────────────
     async def insert_open_trade(self, symbol: str, entry_price: float, position_size: float, entry_time: datetime) -> Any:
-        trade_id = uuid.uuid4().hex[:8]
+        trade_id = str(uuid.uuid4())
         await self.insert_trade_open(
             trade_id=trade_id,
             timestamp_open=entry_time,
