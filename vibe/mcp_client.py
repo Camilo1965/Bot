@@ -27,7 +27,9 @@ logger = logging.getLogger("clawdbot.vibe")
 
 _MCP_BINARY = "vibe-trading-mcp"
 _REQUEST_TIMEOUT = 180
-_MAX_CONSECUTIVE_FAILURES = 3
+_MAX_CONSECUTIVE_FAILURES = 2
+_HEALTH_CHECK_INTERVAL = 120
+_HEALTH_CHECK_TIMEOUT = 30
 _RESTART_BACKOFF_BASE = 5
 
 
@@ -45,6 +47,7 @@ class VibeMCPClient:
         self._restart_backoff = 0
         self._health_check_task: asyncio.Task | None = None
         self._restarting = False
+        self._busy = False
 
     async def start(self) -> bool:
         """Start the MCP subprocess.  Returns True if successful."""
@@ -151,8 +154,10 @@ class VibeMCPClient:
     async def _health_check_loop(self) -> None:
         """Background health check: restart MCP if unresponsive."""
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
             if self._restarting:
+                continue
+            if self._busy:
                 continue
             if not self._available or not self._proc:
                 continue
@@ -163,7 +168,7 @@ class VibeMCPClient:
             try:
                 result = await asyncio.wait_for(
                     self._call("tools/list", {}),
-                    timeout=10,
+                    timeout=_HEALTH_CHECK_TIMEOUT,
                 )
                 if result is None:
                     self._consecutive_failures += 1
@@ -173,15 +178,20 @@ class VibeMCPClient:
                         _MAX_CONSECUTIVE_FAILURES,
                     )
                     if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                        logger.warning("[VIBE] Too many failures - triggering restart.")
+                        stderr = "\n".join(self._stderr_lines[-5:])
+                        logger.warning("[VIBE] Too many failures (stderr tail: %s) - restarting.", stderr[:200])
                         await self._trigger_restart()
                 else:
                     if self._consecutive_failures > 0:
                         logger.info("[VIBE] Health check recovered.")
                     self._consecutive_failures = 0
             except asyncio.TimeoutError:
-                logger.warning("[VIBE] Health check timeout - triggering restart.")
-                await self._trigger_restart()
+                self._consecutive_failures += 1
+                logger.warning("[VIBE] Health check timeout (consecutive=%d/%d).", self._consecutive_failures, _MAX_CONSECUTIVE_FAILURES)
+                if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    stderr = "\n".join(self._stderr_lines[-5:])
+                    logger.warning("[VIBE] Too many timeouts (stderr tail: %s) - restarting.", stderr[:200])
+                    await self._trigger_restart()
             except Exception as exc:
                 logger.debug("[VIBE] Health check exception: %s", exc)
 
@@ -193,7 +203,24 @@ class VibeMCPClient:
         self._available = False
         self._consecutive_failures = 0
 
-        await self.stop()
+        if self._proc and self._proc.poll() is None:
+            self._proc.kill()
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(lambda: self._proc.wait(timeout=3)),
+                    timeout=4.0,
+                )
+            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+                pass
+            self._proc = None
+
+        if self._health_check_task and not self._health_check_task.done():
+            self._health_check_task.cancel()
+            try:
+                await asyncio.wait_for(self._health_check_task, timeout=2)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._health_check_task = None
 
         if self._restart_backoff == 0:
             self._restart_backoff = _RESTART_BACKOFF_BASE
@@ -338,25 +365,29 @@ class VibeMCPClient:
             logger.debug("[VIBE] Client not available - skipping tool '%s'.", tool_name)
             return None
 
-        last_error: str | None = None
-        for attempt in range(max_retries + 1):
-            async with self._lock:
-                result = await self._call("tools/call", {
-                    "name": tool_name,
-                    "arguments": arguments,
-                })
-            if result is not None:
-                if attempt > 0:
-                    logger.info("[VIBE] %s succeeded after %d retries.", tool_name, attempt)
-                return result
-            last_error = f"Attempt {attempt + 1}/{max_retries + 1} failed"
-            if attempt < max_retries:
-                backoff = 2 ** attempt
-                logger.warning("[VIBE] %s failed - retrying in %ds...", tool_name, backoff)
-                await asyncio.sleep(backoff)
+        self._busy = True
+        try:
+            last_error: str | None = None
+            for attempt in range(max_retries + 1):
+                async with self._lock:
+                    result = await self._call("tools/call", {
+                        "name": tool_name,
+                        "arguments": arguments,
+                    })
+                if result is not None:
+                    if attempt > 0:
+                        logger.info("[VIBE] %s succeeded after %d retries.", tool_name, attempt)
+                    return result
+                last_error = f"Attempt {attempt + 1}/{max_retries + 1} failed"
+                if attempt < max_retries:
+                    backoff = 2 ** attempt
+                    logger.warning("[VIBE] %s failed - retrying in %ds...", tool_name, backoff)
+                    await asyncio.sleep(backoff)
 
-        logger.warning("[VIBE] %s failed after %d attempts.", tool_name, max_retries + 1)
-        return None
+            logger.warning("[VIBE] %s failed after %d attempts.", tool_name, max_retries + 1)
+            return None
+        finally:
+            self._busy = False
 
     async def backtest(self, run_dir: str) -> dict | None:
         return await self.call_tool("backtest", {"run_dir": run_dir})

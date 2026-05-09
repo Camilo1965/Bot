@@ -276,7 +276,18 @@ const ceo=data.ceo||{};const ms=v=>v>=0?'color:var(--positive);font-weight:500':
 const syEl=document.getElementById('ceo-symbols');const sy=ceo.symbols_month||[];syEl.innerHTML=sy.length===0?'<div class="text-gray-500">Sin datos</div>':sy.slice(0,6).map(s=>`<div class="flex justify-between"><span class="text-gray-300">${s.symbol}</span><span class="mono" style="${Number(s.pnl_total)>=0?'color:var(--positive)':'color:var(--negative)'}">${s.pnl_label}</span></div>`).join('');
 const trEl=document.getElementById('ceo-trades');const tr=ceo.recent_trades||[];ceoTradeRows=tr;const ft=filterCeoTrades(ceoTradeRows);const rc=Math.min(ceoTradeVisibleCount,ft.length);trEl.innerHTML=ft.length===0?'<div class="text-gray-500">Sin trades cerrados</div>':ft.slice(0,rc).map(t=>`<div class="flex justify-between"><span class="text-gray-300">${t.symbol} <span class="text-gray-500">(${t.exit_time_local})</span></span><span class="mono" style="${Number(t.pnl_num)>=0?'color:var(--positive)':'color:var(--negative)'}">${t.pnl}</span></div>`).join('');updateCeoFilterButtons();const mb=document.getElementById('ceo-trades-more');mb.classList.toggle('hidden',ft.length<=rc);mb.innerText=`Cargar más (${ft.length-rc})`;
         const evEl=document.getElementById('events-log');if(data.events.length>0){evEl.innerHTML=data.events.map((e,i)=>`<div class="flex items-start gap-3 py-1.5"><div class="w-1.5 h-1.5 rounded-full mt-1.5 flex-shrink-0" style="background:${i===0?'var(--accent)':'var(--text-dim)'}"></div><div class="text-sm text-gray-300">${e}</div></div>`).join('')}else{evEl.innerHTML='<div class="text-gray-500 text-sm">Sin eventos recientes…</div>'}}
-fetchState();setInterval(fetchState,2500);document.getElementById('ceo-trades-more').addEventListener('click',()=>{ceoTradeVisibleCount+=20;render({...window.__lastData,ceo:{...(window.__lastData?.ceo||{}),recent_trades:ceoTradeRows}})});document.querySelectorAll('#ceo-trades-filters button[data-filter]').forEach(b=>{b.addEventListener('click',()=>{ceoTradeFilter=b.dataset.filter||'all';ceoTradeVisibleCount=10;render({...window.__lastData,ceo:{...(window.__lastData?.ceo||{}),recent_trades:ceoTradeRows}})})});
+fetchState();setInterval(fetchState,2500);
+document.getElementById('ceo-trades-more').addEventListener('click',()=>{
+  ceoTradeVisibleCount+=20;
+  render({...window.__lastData,ceo:{...(window.__lastData?.ceo||{}),recent_trades:ceoTradeRows}})
+});
+document.querySelectorAll('#ceo-trades-filters button[data-filter]').forEach(b=>{
+  b.addEventListener('click',()=>{
+    ceoTradeFilter=b.dataset.filter||'all';
+    ceoTradeVisibleCount=10;
+    render({...window.__lastData,ceo:{...(window.__lastData?.ceo||{}),recent_trades:ceoTradeRows}})
+  })
+});
     </script>
 </body>
 </html>"""

@@ -165,8 +165,10 @@ class PaperExecutor:
         }
         try:
             self._state_file.parent.mkdir(exist_ok=True)
-            with self._state_file.open("w") as f:
+            tmp = self._state_file.with_suffix(".tmp")
+            with tmp.open("w") as f:
                 json.dump(state, f, indent=2)
+            tmp.replace(self._state_file)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to save state: %s", exc)
 
@@ -185,6 +187,21 @@ class PaperExecutor:
             self._risk.sync_open_count(len(self.open_positions))
             self._risk.recalc_total_risk(self.open_positions)
             return len(self.open_positions)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            backup = self._state_file.with_suffix(".json.corrupted")
+            try:
+                self._state_file.rename(backup)
+                logger.warning(
+                    "State file corrupted (%s) — backed up to %s, starting fresh.",
+                    exc, backup,
+                )
+            except Exception:
+                logger.warning("State file corrupted (%s) — could not backup, removing.", exc)
+                try:
+                    self._state_file.unlink()
+                except Exception:
+                    pass
+            return 0
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to load state: %s", exc)
             return 0
