@@ -99,6 +99,7 @@ from utils.telegram_notifier import (
     send_telegram_alert,
     telegram_command_poller,
 )
+from vibe_mcp.server import start_mcp_server, SERVER_PORT as VIBE_MCP_PORT
 
 try:
     from vibe.mcp_client import VibeMCPClient
@@ -896,6 +897,7 @@ async def main() -> None:
         weekly_report_loop(),
         monthly_report_loop(),
         start_web_dashboard(shared_state, paper_executor, risk_manager, WATCHLIST, port=8080),
+        start_mcp_server(port=VIBE_MCP_PORT),
     ]
 
     # ── Vibe-Trading MCP integration (optional) ─────────────────────────────

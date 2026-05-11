@@ -213,6 +213,21 @@ def create_app() -> web.Application:
     return app
 
 
+async def start_mcp_server(host: str = SERVER_HOST, port: int = SERVER_PORT) -> None:
+    """Start the VIBE MCP server as an asyncio task."""
+    app = create_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    try:
+        logger.info("🧠 VIBE MCP internal server listening on http://%s:%d", host, port)
+        await site.start()
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await runner.cleanup()
+
+
 def main() -> None:  # pragma: no cover
     logging.basicConfig(
         level=logging.INFO,
