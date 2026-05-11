@@ -26,9 +26,9 @@ from typing import Any
 logger = logging.getLogger("clawdbot.vibe")
 
 _MCP_BINARY = "vibe-trading-mcp"
-_REQUEST_TIMEOUT = 300
+_REQUEST_TIMEOUT = 90
 _MAX_CONSECUTIVE_FAILURES = 2
-_HEALTH_CHECK_INTERVAL = 120
+_HEALTH_CHECK_INTERVAL = 60
 _HEALTH_CHECK_TIMEOUT = 90
 _RESTART_BACKOFF_BASE = 5
 _TOOL_CALL_COOLDOWN = 60
@@ -288,7 +288,7 @@ class VibeMCPClient:
     def last_error(self) -> str | None:
         return self._init_error
 
-    async def _call(self, method: str, params: dict[str, Any]) -> Any | None:
+    async def _call(self, method: str, params: dict[str, Any], timeout: float | None = None) -> Any | None:
         """Send a JSON-RPC request and return the result."""
         if not self._proc or not self._proc.stdin or not self._proc.stdout:
             return None
@@ -308,7 +308,8 @@ class VibeMCPClient:
             return None
 
         # Read lines until we get a valid JSON-RPC response with our ID
-        deadline = asyncio.get_event_loop().time() + _REQUEST_TIMEOUT
+        effective_timeout = timeout if timeout is not None else _REQUEST_TIMEOUT
+        deadline = asyncio.get_event_loop().time() + effective_timeout
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
@@ -317,7 +318,7 @@ class VibeMCPClient:
             try:
                 raw = await asyncio.wait_for(
                     asyncio.to_thread(self._proc.stdout.readline),
-                    timeout=min(remaining, 30),
+                    timeout=min(remaining, 45),
                 )
             except asyncio.TimeoutError:
                 logger.warning("[VIBE] Timeout reading MCP response line.")
@@ -360,7 +361,19 @@ class VibeMCPClient:
         except Exception:
             pass
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any], max_retries: int = 2) -> dict[str, Any] | None:
+    async def _ensure_process_alive(self) -> None:
+        """Restart MCP subprocess if it has died."""
+        if self._proc is not None and self._proc.poll() is not None:
+            logger.warning("[VIBE] MCP process dead detected mid-call — triggering restart.")
+            await self._trigger_restart()
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        max_retries: int = 2,
+        timeout: float | None = None,
+    ) -> dict[str, Any] | None:
         """Call an MCP tool with retry. Returns the tool result dict or None."""
         if not self.available:
             logger.debug("[VIBE] Client not available - skipping tool '%s'.", tool_name)
@@ -374,16 +387,17 @@ class VibeMCPClient:
                     result = await self._call("tools/call", {
                         "name": tool_name,
                         "arguments": arguments,
-                    })
+                    }, timeout=timeout)
                 if result is not None:
                     if attempt > 0:
                         logger.info("[VIBE] %s succeeded after %d retries.", tool_name, attempt)
                     return result
                 last_error = f"Attempt {attempt + 1}/{max_retries + 1} failed"
                 if attempt < max_retries:
-                    backoff = 2 ** attempt
+                    backoff = 2 ** (attempt + 1)
                     logger.warning("[VIBE] %s failed - retrying in %ds...", tool_name, backoff)
                     await asyncio.sleep(backoff)
+                    await self._ensure_process_alive()
 
             logger.warning("[VIBE] %s failed after %d attempts.", tool_name, max_retries + 1)
             return None
@@ -456,8 +470,8 @@ class VibeMCPClient:
             args["journal_path"] = journal_path
         return await self.call_tool("render_shadow_report", args)
 
-    async def pattern_recognition(self, run_dir: str) -> dict | None:
-        return await self.call_tool("pattern_recognition", {"run_dir": run_dir})
+    async def pattern_recognition(self, run_dir: str, timeout: float | None = None) -> dict | None:
+        return await self.call_tool("pattern_recognition", {"run_dir": run_dir}, timeout=timeout)
 
     async def factor_analysis(
         self,
@@ -497,3 +511,14 @@ class VibeMCPClient:
 
     async def list_skills(self) -> list | None:
         return await self.call_tool("list_skills", {})
+
+    async def run_swarm(
+        self,
+        preset: str,
+        variables: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict | None:
+        args: dict[str, Any] = {"preset": preset}
+        if variables:
+            args["variables"] = variables
+        return await self.call_tool("run_swarm", args, timeout=timeout)

@@ -16,6 +16,12 @@ from rich.live import Live
 from bot.constants import DEBUG_LOG_HINT
 from bot.dashboard import generate_dashboard
 from bot.dashboard_helpers import display_timezone, mt5_dashboard_mark
+from bot.monitoring import (
+    check_daily_pnl_alert,
+    check_stale_feed_alert,
+    check_vibe_down_alert,
+    check_open_positions_alert,
+)
 from database.db_manager import db
 from execution.mt5_executor import MT5Executor, fetch_mt5_wallet_snapshot
 from execution.paper_executor import PaperExecutor
@@ -188,6 +194,7 @@ async def health_monitor_loop(
     state: dict[str, Any],
     market_queue: asyncio.Queue[dict[str, Any]],
     paper_executor: PaperExecutor,
+    risk_manager: RiskManager,
     interval: int = 30,
 ) -> None:
     """Periodic health checks for feed freshness and processing backlog."""
@@ -326,6 +333,24 @@ async def health_monitor_loop(
                 )
         else:
             pending_alert_streak = 0
+
+        # ── Production monitoring alerts (deduplicated) ───────────────────────
+        try:
+            await check_stale_feed_alert(state)
+        except Exception:
+            pass
+        try:
+            await check_daily_pnl_alert(risk_manager, paper_executor)
+        except Exception:
+            pass
+        try:
+            await check_vibe_down_alert(state)
+        except Exception:
+            pass
+        try:
+            await check_open_positions_alert(paper_executor)
+        except Exception:
+            pass
 
 
 async def close_pending_reconciler_loop(

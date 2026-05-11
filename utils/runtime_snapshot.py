@@ -70,6 +70,20 @@ def write_startup_snapshot(
     return path
 
 
+_MAX_METRICS_BYTES = 50 * 1024 * 1024
+
+
+def _rotate_metrics(path: Path) -> None:
+    import gzip, shutil
+
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out = path.parent / f"runtime_metrics_{ts}.jsonl.gz"
+    with path.open("rb") as fi, gzip.open(out, "wb") as fo:
+        shutil.copyfileobj(fi, fo)
+    path.write_text("")
+    logger.info("Metrics rotated → %s", out.name)
+
+
 def append_runtime_metrics_jsonl(
     *,
     session_id: str,
@@ -94,6 +108,12 @@ def append_runtime_metrics_jsonl(
     }
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+    # Rotate if file exceeds size limit
+    try:
+        if path.stat().st_size > _MAX_METRICS_BYTES:
+            _rotate_metrics(path)
+    except OSError:
+        pass
 
 
 async def runtime_metrics_loop(

@@ -189,10 +189,12 @@ class RiskManager:
         self,
         initial_balance: float = 10_000.0,
         max_positions: int = MAX_POSITIONS,
+        position_counter_fn: Any | None = None,
     ) -> None:
         self.balance: float = initial_balance
         self.max_positions: int = max_positions
         self._open_count: int = 0
+        self._position_counter_fn: Any | None = position_counter_fn
         # Portfolio drawdown circuit-breaker – fixed reference, never modified
         self._initial_balance: float = initial_balance
         self._portfolio_dd_floor: float = initial_balance * (1.0 - MAX_PORTFOLIO_DD_PCT)
@@ -216,13 +218,21 @@ class RiskManager:
         *,
         risk_pct: float | None = None,
         sl_distance_pct: float = 0.02,
+        vibe_quality: float = 1.0,
     ) -> float:
         """Return the position size in quote currency for the next trade.
 
-        Includes dynamic risk reduction based on drawdown and portfolio exposure.
+        Includes dynamic risk reduction based on drawdown, portfolio exposure,
+        and VIBE quality multiplier (Phase-2).
         """
         base_r = RISK_PER_TRADE if risk_pct is None else float(risk_pct)
-        
+
+        # [VIBE FASE 2] Aplicar multiplicador de calidad acotado
+        _quality_min = float(os.environ.get("VIBE_QUALITY_MIN", "0.5").strip() or "0.5")
+        _quality_max = float(os.environ.get("VIBE_QUALITY_MAX", "1.5").strip() or "1.5")
+        effective_quality = max(_quality_min, min(_quality_max, float(vibe_quality)))
+        base_r *= effective_quality
+
         # 1. Drawdown 'Thermometer' - reduce risk if weekly performance is poor
         weekly_dd = (self._weekly_start_balance - self.balance) / self._weekly_start_balance
         if weekly_dd > DRAWDOWN_HALFRISK_THRESHOLD:
@@ -245,14 +255,14 @@ class RiskManager:
         # 3. Size by SL distance: risk_amount = balance * base_r
         # position_size = risk_amount / sl_distance_pct
         position_size = (self.balance * base_r) / max(0.001, sl_distance_pct)
-        
+
         # Cap allocation to an equal share of the current balance
         max_allocation = (self.balance / self.max_positions) * LEVERAGE
         position_size = min(position_size, max_allocation)
-        
+
         logger.debug(
-            "position_size=%.2f  balance=%.2f  risk_per_trade=%.4f  max_allocation=%.2f",
-            position_size, self.balance, base_r, max_allocation,
+            "position_size=%.2f  balance=%.2f  risk_per_trade=%.4f  max_allocation=%.2f  vibe_q=%.2f",
+            position_size, self.balance, base_r, max_allocation, effective_quality,
         )
         return position_size
 
@@ -267,14 +277,36 @@ class RiskManager:
             self._open_count -= 1
         self._total_risk_usd = max(0.0, self._total_risk_usd - risk_usd)
 
+    def set_position_counter_fn(self, fn: Any | None) -> None:
+        """Register an external callable that returns the live open-position count."""
+        self._position_counter_fn = fn
+
     @property
     def open_count(self) -> int:
-        """Current number of open positions."""
+        """Current number of open positions.
+
+        When a live position-counter function is registered (e.g. MT5
+        positions_get) it is used as the source of truth to prevent counter
+        drift.  Falls back to the internal counter for paper mode.
+        """
+        if self._position_counter_fn is not None:
+            try:
+                actual = int(self._position_counter_fn())
+                if actual != self._open_count:
+                    logger.info(
+                        "Open-position counter auto-synced: %d → %d (live source).",
+                        self._open_count,
+                        actual,
+                    )
+                    self._open_count = max(0, actual)
+                return self._open_count
+            except Exception:
+                pass
         return self._open_count
 
     def can_open_position(self) -> bool:
         """Return *True* if another position may be opened (below max_positions)."""
-        return self._open_count < self.max_positions
+        return self.open_count < self.max_positions
 
     def sync_open_count(self, count: int) -> None:
         """Set the open-position counter to *count*."""

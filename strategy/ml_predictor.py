@@ -29,11 +29,13 @@ from strategy.quant_features import (
     DEFAULT_LABEL_ROUND_TRIP,
     MIN_OHLC_ROWS,
     QUANT_FEATURE_COLS,
+    VIBE_FEATURE_COLS,
     add_quant_features,
     compute_quant_vector_from_lists,
     forward_return_label,
     htf_sma200_1h_allows_long,
 )
+from vibe.feature_bridge import extract_vibe_features, VIBE_FEATURE_NEUTRAL
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +109,9 @@ _SELL_SENTIMENT_THRESHOLD = -0.3
 
 
 def model_json_path_for_symbol(symbol: str) -> Path:
-    """``models/BTC_USDT_v1.json`` style path for *symbol*."""
-    return MODELS_DIR / f"{symbol.replace('/', '_')}_v1.json"
+    """``models/BTC_USDT_v1.json`` (legacy) or ``models/BTC_USDT_v2.json`` (VIBE features)."""
+    suffix = "_v2" if _VIBE_ENABLED else "_v1"
+    return MODELS_DIR / f"{symbol.replace('/', '_')}{suffix}.json"
 
 
 def get_symbol_config(symbol: str) -> dict[str, Any]:
@@ -171,7 +174,9 @@ HTF_TREND_NEUTRAL = "neutral"
 # Minimum number of HTF candles required to compute a trend
 _HTF_MIN_CANDLES = 3
 
-_FEATURE_COLS = QUANT_FEATURE_COLS
+_VIBE_ENABLED: bool = os.environ.get("VIBE_FEATURES_ENABLED", "0").strip() in ("1", "true", "yes")
+_BASE_FEATURE_COLS = QUANT_FEATURE_COLS
+_FEATURE_COLS = _BASE_FEATURE_COLS + VIBE_FEATURE_COLS if _VIBE_ENABLED else list(_BASE_FEATURE_COLS)
 
 Signal = str  # literal: "BUY" | "SELL" | "HOLD"
 TrendStatus = str  # literal: "bullish" | "bearish" | "neutral"
@@ -387,6 +392,13 @@ class MLPredictor:
         )
         feat = add_quant_features(df)
         feat["label"] = forward_return_label(feat["close"], horizon, _LABEL_ROUND_TRIP)
+
+        # [VIBE FASE 4] Add neutral VIBE columns to historical training data
+        if _VIBE_ENABLED:
+            for col, val in zip(VIBE_FEATURE_COLS, VIBE_FEATURE_NEUTRAL):
+                if col not in feat.columns:
+                    feat[col] = val
+
         feat = feat.dropna(subset=_FEATURE_COLS + ["label"])
 
         X = feat[_FEATURE_COLS]
@@ -467,6 +479,7 @@ class MLPredictor:
         *,
         symbol: str | None = None,
         precomputed_features: list[float] | None = None,
+        vibe_features: list[float] | None = None,
     ) -> float | None:
         """Return the probability of an upward price move.
 
@@ -481,6 +494,8 @@ class MLPredictor:
         obi_ratio:       Ignored (API compatibility).
         symbol:          When set and not in ``ALLOWED_SYMBOLS``, returns ``None``.
         precomputed_features: Optional precomputed feature vector to avoid redundant calculation.
+        vibe_features:   Optional 4 VIBE-derived features (Fase 4).  When ``None``
+                         and ``VIBE_FEATURES_ENABLED=1``, neutral values are padded.
 
         Returns
         -------
@@ -491,7 +506,7 @@ class MLPredictor:
             return None
 
         if precomputed_features is not None:
-            features = precomputed_features
+            features = list(precomputed_features)
         else:
             if len(prices) < _MIN_PRICES_FOR_INFERENCE:
                 logger.debug(
@@ -507,6 +522,22 @@ class MLPredictor:
 
         if features is None:
             return None
+
+        # [VIBE FASE 4] Append VIBE features if enabled
+        if _VIBE_ENABLED:
+            if vibe_features is not None and len(vibe_features) == len(VIBE_FEATURE_COLS):
+                features.extend(vibe_features)
+            else:
+                features.extend(VIBE_FEATURE_NEUTRAL)
+
+        # Ensure vector length matches column expectation
+        expected_len = len(_FEATURE_COLS)
+        actual_len = len(features)
+        if actual_len < expected_len:
+            features.extend([0.0] * (expected_len - actual_len))
+        elif actual_len > expected_len:
+            features = features[:expected_len]
+
         X = pd.DataFrame([features], columns=_FEATURE_COLS)
         sym = symbol or "ETH/USDT"
         booster: XGBClassifier | None = None
@@ -554,6 +585,7 @@ class MLPredictor:
         volumes: list[float] | None = None,
         *,
         symbol: str = "ETH/USDT",
+        vibe_features: list[float] | None = None,
     ) -> tuple[Signal, float]:
         """BUY only when HTF (precio > SMA200 1h) passes, then ``probability ≥ BUY_PROB_THRESHOLD``.
         
@@ -582,6 +614,7 @@ class MLPredictor:
             volumes=volumes,
             symbol=symbol,
             precomputed_features=features,
+            vibe_features=vibe_features,
         )
 
         if probability is None:

@@ -8,7 +8,9 @@ All tasks are no-ops if VibeMCPClient is not available.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,49 @@ _PATTERN_INTERVAL_S = 900
 _FACTOR_INTERVAL_S = 2592000
 _SHADOW_INTERVAL_S = 604800
 
+_VIBE_STATE_FILE = Path("logs") / "vibe_state.json"
+
+
+def _load_vibe_state() -> dict[str, Any]:
+    if _VIBE_STATE_FILE.is_file():
+        try:
+            return json.loads(_VIBE_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_vibe_state(state: dict[str, Any]) -> None:
+    try:
+        _VIBE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _VIBE_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, default=str, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.debug("[VIBE] Could not save state: %s", exc)
+
+
+def _initial_sleep_with_state(loop_name: str, default_sleep: float, interval_s: float) -> float:
+    """Return sleep seconds respecting last_run timestamp from persisted state."""
+    state = _load_vibe_state()
+    last_run = state.get(f"last_run_{loop_name}")
+    if last_run is not None:
+        try:
+            elapsed = (datetime.now(tz=timezone.utc) - datetime.fromisoformat(last_run)).total_seconds()
+            remaining = interval_s - elapsed
+            if remaining > 5:
+                return remaining
+        except Exception:
+            pass
+    return default_sleep
+
+
+def _record_run(loop_name: str) -> None:
+    state = _load_vibe_state()
+    state[f"last_run_{loop_name}"] = datetime.now(tz=timezone.utc).isoformat()
+    _save_vibe_state(state)
+
 
 async def journal_analysis_loop(
     client: VibeMCPClient,
@@ -37,13 +82,14 @@ async def journal_analysis_loop(
     if not client.available:
         logger.info("[VIBE] Client not available — journal analysis disabled.")
         return
-    await asyncio.sleep(60)
+    await asyncio.sleep(_initial_sleep_with_state("journal", 60, interval_s))
     while True:
         try:
             result = await analyze_journal(client)
             if result:
                 shared_state["vibe_journal_analysis"] = result
                 logger.info("[VIBE] Journal analysis stored in shared_state.")
+                _record_run("journal")
         except Exception as exc:
             logger.warning("[VIBE] Journal analysis failed: %s", exc)
         await asyncio.sleep(interval_s)
@@ -64,7 +110,7 @@ async def weekly_backtest_loop(
     """
     if not client.available:
         return
-    await asyncio.sleep(86400)
+    await asyncio.sleep(_initial_sleep_with_state("backtest", 86400, interval_s))
     while True:
         for symbol in watchlist:
             try:
@@ -74,6 +120,7 @@ async def weekly_backtest_loop(
                     logger.info("[VIBE] Backtest complete for %s.", symbol)
             except Exception as exc:
                 logger.warning("[VIBE] Backtest failed for %s: %s", symbol, exc)
+        _record_run("backtest")
         await asyncio.sleep(interval_s)
 
 
@@ -86,7 +133,7 @@ async def pattern_detection_loop(
     """Periodically detect technical patterns for each watched symbol."""
     if not client.available:
         return
-    await asyncio.sleep(120)
+    await asyncio.sleep(_initial_sleep_with_state("pattern", 120, interval_s))
     while True:
         for symbol in watchlist:
             try:
@@ -95,6 +142,7 @@ async def pattern_detection_loop(
                     shared_state.setdefault("vibe_patterns", {})[symbol] = result
             except Exception as exc:
                 logger.warning("[VIBE] Pattern detection failed for %s: %s", symbol, exc)
+        _record_run("pattern")
         await asyncio.sleep(interval_s)
 
 
@@ -107,13 +155,14 @@ async def factor_analysis_loop(
     """Monthly: run IC/IR factor analysis across the watchlist."""
     if not client.available:
         return
-    await asyncio.sleep(3600)
+    await asyncio.sleep(_initial_sleep_with_state("factor", 3600, interval_s))
     while True:
         try:
             result = await analyze_factors(client, symbols=watchlist)
             if result:
                 shared_state["vibe_factors"] = result
                 logger.info("[VIBE] Factor analysis complete for watchlist.")
+                _record_run("factor")
         except Exception as exc:
             logger.warning("[VIBE] Factor analysis failed: %s", exc)
         await asyncio.sleep(interval_s)
@@ -127,13 +176,14 @@ async def shadow_account_loop(
     """Weekly: generate shadow account report from trade journal."""
     if not client.available:
         return
-    await asyncio.sleep(172800)
+    await asyncio.sleep(_initial_sleep_with_state("shadow", 172800, interval_s))
     while True:
         try:
             result = await extract_and_backtest_shadow(client)
             if result:
                 shared_state["vibe_shadow_report"] = result
                 logger.info("[VIBE] Shadow account report generated.")
+                _record_run("shadow")
         except Exception as exc:
             logger.warning("[VIBE] Shadow account failed: %s", exc)
         await asyncio.sleep(interval_s)

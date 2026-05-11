@@ -1,0 +1,22 @@
+{
+  "auc": 0.605,
+  "trained_at": "2026-05-11T05:05:45.901411+00:00",
+  "symbol": "ETH/USDT",
+  "samples": 387,
+  "splits": 3,
+  "features": [
+    "rsi",
+    "macd_line",
+    "macd_signal",
+    "macd_hist",
+    "atr",
+    "bb_pct_b",
+    "bb_width",
+    "vol_delta_norm",
+    "log_ret_1",
+    "log_ret_5",
+    "close_vs_sma200_1h",
+    "vol_rel"
+  ],
+  "vibe_enabled": false
+}

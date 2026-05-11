@@ -23,11 +23,14 @@ logger = logging.getLogger("clawdbot.vibe.pattern")
 _RUN_DIR_BASE = Path("logs") / "vibe_runs"
 
 
+_MAX_OHLCV_ROWS = 1000
+
+
 async def _export_ohlcv_to_run_dir(symbol: str, run_dir: Path) -> Path | None:
     """Export OHLCV data from TimescaleDB to run_dir/artifacts/ohlcv_<symbol>.csv."""
     from database.db_manager import db
 
-    rows = await db.fetch_market_data_ohlcv(symbol=symbol, limit=5000)
+    rows = await db.fetch_market_data_ohlcv(symbol=symbol, limit=_MAX_OHLCV_ROWS)
     if not rows:
         logger.warning("[VIBE] No DB data for %s — cannot export.", symbol)
         return None
@@ -77,4 +80,7 @@ async def detect_patterns(
     if not csv_path:
         return None
 
-    return await client.pattern_recognition(run_dir=run_dir.resolve().as_posix())
+    return await client.pattern_recognition(
+        run_dir=run_dir.resolve().as_posix(),
+        timeout=120,
+    )

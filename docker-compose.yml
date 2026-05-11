@@ -13,6 +13,16 @@ services:
       - "5432:5432"
     volumes:
       - timescale_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    command: >
+      postgres
+      -c max_connections=30
+      -c shared_buffers=128MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=64MB
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-clawdbot}"]
       interval: 10s
@@ -28,6 +38,10 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

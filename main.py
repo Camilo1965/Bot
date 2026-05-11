@@ -109,6 +109,7 @@ try:
         shadow_account_loop,
         weekly_backtest_loop,
     )
+    from vibe.swarm_loops import crypto_desk_swarm_loop
 
     _VIBE_AVAILABLE = True
 except ImportError:
@@ -642,6 +643,16 @@ async def main() -> None:
                 shutdown_mt5()
             await close_db()
             return
+
+        # Adopt orphan MT5 positions after reboot
+        try:
+            recovered = await paper_executor.recover_positions_on_startup()
+            if recovered:
+                await send_telegram_alert(
+                    f"♻️ *Recovery*: {recovered} posición(es) adoptada(s) al reiniciar."
+                )
+        except Exception as exc:
+            logger.warning("[RECOVERY] Startup recovery failed: %s", exc)
     else:
         paper_executor = PaperExecutor(db=db, risk_manager=risk_manager, exchange=None)
 
@@ -879,7 +890,7 @@ async def main() -> None:
             paper_executor,
             interval=max(3, min(int(float(os.environ.get("MT5_POSITION_SYNC_S", "4"))), 300)),
         ),
-        health_monitor_loop(shared_state, market_queue, paper_executor, interval=30),
+        health_monitor_loop(shared_state, market_queue, paper_executor, risk_manager, interval=30),
         close_pending_reconciler_loop(shared_state, paper_executor, interval=20),
         telegram_command_poller(shared_state, paper_executor, risk_manager, interval=5),
         weekly_report_loop(),
@@ -903,7 +914,11 @@ async def main() -> None:
             run_tasks.append(pattern_detection_loop(vibe_client, shared_state, WATCHLIST))
             run_tasks.append(factor_analysis_loop(vibe_client, shared_state, WATCHLIST))
             run_tasks.append(shadow_account_loop(vibe_client, shared_state))
-            logger.warning("✅ Vibe-Trading MCP client started — 5 scheduled tasks active.")
+            if os.environ.get("VIBE_SWARM_ENABLED", "0").strip() in ("1", "true", "yes"):
+                run_tasks.append(crypto_desk_swarm_loop(vibe_client, shared_state, WATCHLIST))
+                logger.warning("✅ Vibe-Trading MCP client started — 5 scheduled tasks + SWARM active.")
+            else:
+                logger.warning("✅ Vibe-Trading MCP client started — 5 scheduled tasks active (swarm disabled).")
         else:
             err = vibe_client.last_error or "unknown"
             logger.warning("ℹ️ Vibe-Trading MCP start failed (%s) — tools disabled. Bot runs normally.", err)

@@ -114,5 +114,13 @@ async def market_consumer(
         # Check and move trailing stops
         if sym in paper_executor.open_positions:
             await paper_executor.check_and_close(sym, price)
+            # Push ratcheted SL/TP to MT5 for live positions (trailing-stop sync)
+            if sym in paper_executor.open_positions:
+                sync_fn = getattr(paper_executor, "_sync_exchange_stops", None)
+                if sync_fn is not None:
+                    try:
+                        await sync_fn(sym, paper_executor.open_positions[sym], price, None)
+                    except Exception:
+                        pass
 
         queue.task_done()

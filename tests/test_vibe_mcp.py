@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -204,3 +206,51 @@ class TestScheduledTasks:
         state: dict = {}
         await shadow_account_loop(client, state, interval_s=0.01)
         assert "vibe_shadow_report" not in state
+
+
+class TestVibeStatePersistence:
+    def test_initial_sleep_respects_last_run(self, tmp_path):
+        from vibe.scheduled_tasks import _initial_sleep_with_state, _save_vibe_state
+
+        state_file = tmp_path / "vibe_state.json"
+        with patch("vibe.scheduled_tasks._VIBE_STATE_FILE", state_file):
+            now = datetime.now(tz=timezone.utc)
+            _save_vibe_state({"last_run_pattern": now.isoformat()})
+            sleep = _initial_sleep_with_state("pattern", 120, 900)
+            assert 0 <= sleep <= 900
+
+    def test_record_run_persists_timestamp(self, tmp_path):
+        from vibe.scheduled_tasks import _record_run, _load_vibe_state
+
+        state_file = tmp_path / "vibe_state.json"
+        with patch("vibe.scheduled_tasks._VIBE_STATE_FILE", state_file):
+            _record_run("journal")
+            state = _load_vibe_state()
+            assert "last_run_journal" in state
+
+
+class TestVibeMCPResilience:
+    @pytest.mark.asyncio
+    async def test_mcp_timeout_doesnt_crash_bot(self, client):
+        """Timeout in _call must return None, not raise."""
+        with patch.object(client, "_call", new_callable=AsyncMock, return_value=None):
+            result = await client.call_tool("pattern_recognition", {"run_dir": "/tmp"})
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_mcp_retries_with_backoff(self, client):
+        """Failed calls should retry up to max_retries times."""
+        client._available = True
+        client._proc = MagicMock()
+        client._proc.poll = MagicMock(return_value=None)
+        with patch.object(client, "_call", new_callable=AsyncMock, side_effect=[None, None, {"ok": True}]) as mock_call:
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await client.call_tool("backtest", {"run_dir": "/tmp"}, max_retries=2)
+                assert result == {"ok": True}
+                assert mock_call.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_pattern_recognition_limits_ohlcv_rows(self):
+        """Pattern recognition must request ≤ 1000 OHLCV rows."""
+        from vibe.pattern_recognition import _MAX_OHLCV_ROWS
+        assert _MAX_OHLCV_ROWS == 1000

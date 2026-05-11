@@ -1,0 +1,21 @@
+[Unit]
+Description=ClawdBot Trading Bot
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Bot-master
+EnvironmentFile=/home/ubuntu/Bot-master/.env
+ExecStart=/home/ubuntu/Bot-master/.venv312/bin/python main.py
+Restart=on-failure
+RestartSec=15
+StartLimitBurst=5
+StartLimitIntervalSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clawdbot
+
+[Install]
+WantedBy=multi-user.target

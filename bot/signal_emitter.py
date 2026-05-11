@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,6 +14,13 @@ from execution.paper_executor import PaperExecutor
 from strategy.feature_engineer import FeatureEngineer
 from strategy.quant_features import MIN_OHLC_ROWS
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, get_symbol_config
+from vibe.decision_bridge import (
+    check_vibe_force_exit,
+    compute_entry_score,
+    compute_quality_multiplier,
+    is_extreme_macro_veto,
+)
+from vibe.feature_bridge import extract_vibe_features
 
 
 def _extract_vibe_pattern_text(data: Any) -> str:
@@ -28,6 +36,68 @@ def _extract_vibe_pattern_text(data: Any) -> str:
         return str(data)[:200]
     except Exception:
         return str(data)[:200]
+
+def _swarm_adjusted_threshold(base_threshold: float, state: dict[str, Any], symbol: str) -> float:
+    """Adjust probability threshold based on swarm recommendation (Fase 5).
+
+    * STRONG_BUY  → threshold * 0.9  (easier entry)
+    * BUY         → threshold * 0.95 (slightly easier)
+    * REDUCE      → threshold * 1.2  (harder entry)
+    * EXIT        → threshold * 1.5  (much harder entry)
+    * NEUTRAL     → no change
+
+    Bounds: never below 0.50, never above 0.99.
+    """
+    swarm_rec = state.get("vibe_swarm_recommendation", {}).get(symbol, "NEUTRAL")
+    multipliers = {
+        "STRONG_BUY": 0.90,
+        "BUY": 0.95,
+        "NEUTRAL": 1.0,
+        "REDUCE": 1.2,
+        "EXIT": 1.5,
+    }
+    mult = multipliers.get(swarm_rec, 1.0)
+    adjusted = base_threshold * mult
+    return max(0.50, min(0.99, adjusted))
+
+
+def _apply_vibe_gating(
+    state: dict[str, Any],
+    symbol: str,
+    signal: str,
+    win_prob: float,
+) -> tuple[str, str | None]:
+    """Apply VIBE Phase-1 probabilistic hybrid gating to a BUY signal.
+
+    Returns ``(possibly_modified_signal, reason_or_None)``.  When the
+    returned signal is ``"HOLD"`` the caller should skip the trade-open
+    path but still let the smart-exit logic run for existing positions.
+    """
+    if signal != "BUY":
+        return signal, None
+
+    _vibe_gate = os.environ.get("VIBE_GATE_TRADES", "0").strip()
+    if _vibe_gate not in ("1", "true", "yes"):
+        return signal, None
+
+    # a) Extreme macro veto (absolute)
+    if is_extreme_macro_veto(state):
+        return "HOLD", "VIBE_EXTREME_VETO"
+
+    # b-d) Probabilistic modulation
+    vibe_score = compute_entry_score(state, symbol)
+    cfg = get_symbol_config(symbol)
+
+    # [VIBE FASE 5] Swarm-adjusted threshold
+    base_th = float(cfg["prob_threshold"])
+    effective_th = _swarm_adjusted_threshold(base_th, state, symbol)
+    effective_prob = win_prob * vibe_score
+
+    if effective_prob < effective_th:
+        return "HOLD", f"VIBE_SCORE_{vibe_score:.2f}"
+
+    return signal, None
+
 
 # BUY gate + ML-reversal min confidence = BUY_PROB_THRESHOLD (default 0.50 max-performance).
 
@@ -72,6 +142,11 @@ async def signal_emitter(
             else:
                 current_atr = state.get("atrs", {}).get(symbol)
 
+            # [VIBE FASE 4] Extraer features numéricas para el modelo XGBoost
+            vibe_vec = None
+            if os.environ.get("VIBE_FEATURES_ENABLED") == "1":
+                vibe_vec = extract_vibe_features(state, symbol)
+
             # Single-pass prediction
             signal, win_prob = predictor.generate_signal(
                 prices,
@@ -82,6 +157,7 @@ async def signal_emitter(
                 funding_rate=funding_rate,
                 volumes=volumes or None,
                 symbol=symbol,
+                vibe_features=vibe_vec,
             )
             state["ml_signals"][symbol] = signal
             # Store the latest ML confidence so dashboard_logger can display it.
@@ -115,6 +191,31 @@ async def signal_emitter(
                     current_price = float(q_live["mid"])
                 else:
                     current_price = prices[-1]
+
+                # ------------------------------------------------------------------
+                # [VIBE FASE 3] Exit Augmentation — EMERGENCY (antes que ML exit)
+                # ------------------------------------------------------------------
+                if os.environ.get("VIBE_FORCE_EXIT") == "1":
+                    vibe_reason = check_vibe_force_exit(state, symbol)
+                    if vibe_reason:
+                        logger.warning(
+                            "[VIBE] EXIT FORZADO en %s por patrón crítico: %s",
+                            symbol,
+                            vibe_reason,
+                        )
+                        forced_pnl = await paper_executor._close_position(
+                            symbol,
+                            current_price,
+                            f"VIBE_EXIT_{vibe_reason}",
+                        )
+                        logger.info(
+                            "[VIBE] Posición %s cerrada forzosamente. PnL=%.4f",
+                            symbol,
+                            forced_pnl if forced_pnl is not None else 0.0,
+                        )
+                        # Skip ML exit and BUY entry logic for this cycle
+                        continue
+
                 try:
                     smart_pnl = await paper_executor.check_ml_exit(
                         current_price=current_price,
@@ -140,7 +241,41 @@ async def signal_emitter(
                         DEBUG_LOG_HINT,
                     )
 
+            # ------------------------------------------------------------------
+            # [VIBE FASE 1] Gating de entradas — Veto Probabilístico Híbrido
+            # ------------------------------------------------------------------
+            # Se evalúa DESPUÉS del smart-exit para que posiciones abiertas
+            # sigan gestionándose independientemente del gating de nuevas entradas.
+            gated_signal, gate_reason = _apply_vibe_gating(state, symbol, signal, win_prob)
+            if gated_signal != signal:
+                if gate_reason == "VIBE_EXTREME_VETO":
+                    logger.warning(
+                        "[VIBE] VETO ABSOLUTO: Riesgo macro extremo detectado. %s bloqueado.",
+                        symbol,
+                    )
+                else:
+                    logger.info(
+                        "[VIBE] Entrada bloqueada para %s: prob %.2f reducida por "
+                        "contexto macro/técnico (%s)",
+                        symbol,
+                        win_prob,
+                        gate_reason,
+                    )
+                signal = gated_signal
+
             if signal == "BUY" and prices:
+                # [VIBE FASE 2] Sizing dinámico por calidad del setup
+                _vibe_adj = os.environ.get("VIBE_ADJUST_SIZE", "1").strip()
+                if _vibe_adj not in ("1", "true", "yes"):
+                    vibe_quality = 1.0
+                else:
+                    vibe_quality = compute_quality_multiplier(state, symbol)
+                    if vibe_quality != 1.0:
+                        logger.info(
+                            "[VIBE] Sizing ajustado para %s: quality=%.2f",
+                            symbol, vibe_quality,
+                        )
+
                 q_live = state.get("mt5_last_quote", {}).get(symbol)
                 if isinstance(q_live, dict) and float(q_live.get("ask") or 0.0) > 0.0:
                     entry_price = float(q_live["ask"])
@@ -153,6 +288,7 @@ async def signal_emitter(
                         symbol=symbol,
                         sentiment_score=0.0,
                         current_atr=current_atr,
+                        vibe_quality=vibe_quality,
                     )
                     if not opened:
                         logger.debug(

@@ -222,7 +222,7 @@ class PaperExecutor:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to append to journal: %s", exc)
 
-    async def try_open_trade(self, entry_price: float, win_probability: float, symbol: str, sentiment_score: float = 0.0, current_atr: float | None = None) -> bool:
+    async def try_open_trade(self, entry_price: float, win_probability: float, symbol: str, sentiment_score: float = 0.0, current_atr: float | None = None, vibe_quality: float = 1.0) -> bool:
         if symbol in self.open_positions: return False
         if not self._risk.can_open_position(): return False
         cfg = get_symbol_config(symbol)
@@ -232,7 +232,8 @@ class PaperExecutor:
         pos_size_quote = self._risk.calculate_position_size(
             win_probability, 
             risk_pct=float(cfg.get("risk", 0.02)),
-            sl_distance_pct=sl_frac
+            sl_distance_pct=sl_frac,
+            vibe_quality=vibe_quality,
         )
         
         if pos_size_quote <= 0 or not self._risk.has_sufficient_balance(pos_size_quote): 
@@ -305,6 +306,11 @@ class PaperExecutor:
         if not pos: return None
         
         # 1. Update Peak and Trailing Stop
+        gain = (current_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+        logger.debug(
+            "TRAIL CHECK sym=%s gain=%.4f activation=%.4f trail=%s peak=%.4f",
+            symbol, gain, pos.activation_pct, pos.trailing_stop_active, pos.peak_price,
+        )
         if current_price > pos.peak_price:
             pos.peak_price = current_price
             if current_price >= pos.activation_price:
@@ -315,6 +321,8 @@ class PaperExecutor:
                 if new_sl > pos.sl_price:
                     pos.sl_price = new_sl
                     pos.current_stop_loss = new_sl
+                    logger.info("SL RATCHET %s: %.4f → %.4f (peak=%.4f)", symbol, pos.stop_loss_price, new_sl, pos.peak_price)
+                    pos.stop_loss_price = new_sl
 
         # 2. Check Exits
         exit_reason = None

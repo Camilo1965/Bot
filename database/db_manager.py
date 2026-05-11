@@ -196,6 +196,14 @@ CREATE TABLE IF NOT EXISTS trades_history (
 _CREATE_HYPERTABLE_HTF = "SELECT create_hypertable('htf_trend', 'timestamp', if_not_exists => TRUE);"
 _CREATE_HYPERTABLE_TRADES = "SELECT create_hypertable('trades_history', 'timestamp_open', if_not_exists => TRUE);"
 
+_CREATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades_history(symbol);
+CREATE INDEX IF NOT EXISTS idx_trades_timestamp_open ON trades_history(timestamp_open);
+CREATE INDEX IF NOT EXISTS idx_trades_exit_reason ON trades_history(exit_reason);
+CREATE INDEX IF NOT EXISTS idx_market_data_symbol_ts ON market_data(symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_ml_predictions_symbol_ts ON ml_predictions(symbol, timestamp DESC);
+"""
+
 _INSERT_TRADE = """
 INSERT INTO trades_history (
     id, timestamp_open, symbol, timeframe, side, entry_price, lots, win_probability, atr_at_entry
@@ -277,6 +285,8 @@ class DatabaseManager:
                 pass
             await conn.execute(_CREATE_TRADE_HISTORY)
             try: await conn.execute(_CREATE_HYPERTABLE_TRADES)
+            except Exception: pass
+            try: await conn.execute(_CREATE_INDEXES)
             except Exception: pass
             
             await self._refresh_market_columns(conn)

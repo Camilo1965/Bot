@@ -610,6 +610,8 @@ class MT5Executor(PaperExecutor):
         self._live = live
         self._magic = magic
         self._deviation = deviation
+        # Register live position counter to eliminate counter drift.
+        risk_manager.set_position_counter_fn(self._live_open_count)
 
         # Issue 3 – warn if risk_pct clearly above typical prop cap (skip noise at 2.5% aggressive).
         if risk_pct > 0.025 + 1e-9:
@@ -657,6 +659,73 @@ class MT5Executor(PaperExecutor):
         except Exception:  # noqa: BLE001
             return False
         return tinfo is not None and ainfo is not None
+
+    def _live_open_count(self) -> int:
+        """Return the number of live MT5 positions tagged with our magic.
+
+        Used by RiskManager as the source of truth to prevent counter drift.
+        Falls back to the local open_positions count when MT5 is unavailable.
+        """
+        if not self._live or not _MT5_AVAILABLE:
+            return len(self.open_positions)
+        try:
+            raw = mt5.positions_get()
+            if raw is None:
+                return len(self.open_positions)
+            ours = [p for p in raw if p.magic == self._magic]
+            return len(ours)
+        except Exception:
+            return len(self.open_positions)
+
+    async def recover_positions_on_startup(self) -> int:
+        """Adopt MT5 positions that are open but not tracked locally.
+
+        Called once at bot startup to survive EC2 reboots with live positions.
+        """
+        if not self._live or not _MT5_AVAILABLE:
+            return 0
+        raw = mt5.positions_get()
+        if raw is None:
+            logger.warning("[RECOVERY] MT5 positions_get returned None — skip recovery.")
+            return 0
+        ours = [p for p in raw if p.magic == self._magic and p.type == mt5.POSITION_TYPE_BUY]
+        recovered = 0
+        for p in ours:
+            sym = self._local_symbol_from_broker(p.symbol)
+            if sym in self.open_positions:
+                continue
+            entry_price = float(p.price_open)
+            sl_price = float(p.sl) if p.sl else entry_price * 0.975
+            ts = datetime.now(tz=timezone.utc)
+            th = get_execution_thresholds()
+            pos = OpenPosition(
+                trade_id=str(p.ticket),
+                symbol=sym,
+                entry_time=ts,
+                entry_price=entry_price,
+                position_size=float(p.volume) * entry_price,
+                sl_price=sl_price,
+                activation_price=entry_price * (1.0 + th.activation_pct),
+                trailing_distance_pct=th.trailing_distance_pct,
+                peak_price=entry_price,
+                ml_confidence=0.0,
+                sl_pct=th.sl_pct,
+                activation_pct=th.activation_pct,
+                stop_loss_price=sl_price,
+                current_stop_loss=sl_price,
+                mt5_position_ticket=int(p.ticket),
+            )
+            self.open_positions[sym] = pos
+            self._risk.register_open(risk_usd=pos.position_size * pos.sl_pct)
+            recovered += 1
+            logger.warning(
+                "♻️ [RECOVERY] Adopted orphan position %s ticket=%s entry=%.4f",
+                sym, p.ticket, entry_price,
+            )
+        if recovered:
+            self.save_state()
+            logger.info("[RECOVERY] %d orphan position(s) adopted.", recovered)
+        return recovered
 
     def _ghost_key(self, sym: str, ticket: int | None) -> str:
         if isinstance(ticket, int) and ticket > 0:
@@ -1502,6 +1571,7 @@ class MT5Executor(PaperExecutor):
         timestamp: datetime | None = None,
         sentiment_score: float = 0.0,
         current_atr: float | None = None,
+        vibe_quality: float = 1.0,
     ) -> bool:
         """Open a new long position using MT5 OrderSend (when *live=True*).
 
@@ -1575,6 +1645,7 @@ class MT5Executor(PaperExecutor):
             position_size = self._risk.calculate_position_size(
                 win_probability,
                 risk_pct=risk_pct_sym,
+                vibe_quality=vibe_quality,
             )
             if position_size <= 0.0:
                 logger.warning(
@@ -1626,7 +1697,7 @@ class MT5Executor(PaperExecutor):
                 )
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
-                    self._risk.register_close()
+                    self._risk.register_close(risk_usd=0.0)
                 return False
 
             # mt5_sym is guaranteed non-None here (resolved before deductions).
@@ -1642,7 +1713,7 @@ class MT5Executor(PaperExecutor):
                 )
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
-                    self._risk.register_close()
+                    self._risk.register_close(risk_usd=0.0)
                 return False
 
             sym_info = mt5.symbol_info(mt5_sym)
@@ -1654,7 +1725,7 @@ class MT5Executor(PaperExecutor):
                 logger.error("[MT5] Tick freshness check failed – aborting trade for %s.", sym)
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
-                    self._risk.register_close()
+                    self._risk.register_close(risk_usd=0.0)
                 return False
 
             ask_price = self._normalize_price(tick.ask, digits)
@@ -1674,7 +1745,7 @@ class MT5Executor(PaperExecutor):
                 )
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
-                    self._risk.register_close()
+                    self._risk.register_close(risk_usd=0.0)
                 return False
             stop_loss_price = sl_clamped
 
@@ -1696,7 +1767,7 @@ class MT5Executor(PaperExecutor):
                 )
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
-                    self._risk.register_close()
+                    self._risk.register_close(risk_usd=0.0)
                 return False
 
             # Issue 2 – verify sufficient margin before sending the order.
@@ -1704,7 +1775,7 @@ class MT5Executor(PaperExecutor):
                 logger.error("[MT5] Margin check failed – aborting trade for %s.", sym)
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
-                    self._risk.register_close()
+                    self._risk.register_close(risk_usd=0.0)
                 return False
 
             request = self._build_buy_request(
@@ -1718,7 +1789,7 @@ class MT5Executor(PaperExecutor):
                 # Order rejected – roll back counter (balance wasn't deducted)
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
-                    self._risk.register_close()
+                    self._risk.register_close(risk_usd=0.0)
                 return False
             mt5_ticket = await self._resolve_position_ticket_after_buy(mt5_sym, result)
 
@@ -1733,7 +1804,7 @@ class MT5Executor(PaperExecutor):
             logger.exception("[MT5][DB] insert_open_trade failed for %s — rolling back: %s", sym, exc)
             async with self._positions_lock:
                 self._pending_symbols.discard(sym)
-                self._risk.register_close()
+                self._risk.register_close(risk_usd=0.0)
             return False
 
         act_px = float(entry_price) * (1.0 + thresholds.activation_pct)

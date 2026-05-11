@@ -16,6 +16,7 @@ from bot.dashboard_helpers import (
     mt5_dashboard_mark,
     pct_change_24h_vs_h1,
 )
+from bot.monitoring import get_health_metrics
 from database.db_manager import db
 from execution.mt5_executor import MT5Executor
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
@@ -23,6 +24,23 @@ from risk.risk_manager import RiskManager
 from strategy.ml_predictor import BUY_PROB_THRESHOLD
 
 logger = logging.getLogger(__name__)
+
+
+@web.middleware
+async def _security_and_error_guard(request: web.Request, handler):
+    """Suppress malformed requests and catch-all exceptions to avoid server crashes."""
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Bad request suppressed from %s: %s (%s)",
+            request.remote,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        return web.Response(status=400, text="Bad Request")
 
 
 def _dashboard_client_ip(request: web.Request) -> str:
@@ -617,11 +635,12 @@ async def start_web_dashboard(
 
     async def handle_health(request: web.Request) -> web.Response:
         logger.debug("Web GET /health from %s", request.remote)
-        return web.json_response({
-            "status": "ok",
-            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-            "version": "1.0",
-        })
+        # Use a dummy queue with qsize=0 since web server does not hold the market queue
+        class _DummyQueue:
+            def qsize(self) -> int:
+                return 0
+        metrics = get_health_metrics(state, _DummyQueue(), paper_executor, risk_manager)
+        return web.json_response(metrics)
 
     async def handle_api(request: web.Request) -> web.Response:
         logger.debug("Web GET /api/state from %s", request.remote)
@@ -949,7 +968,7 @@ async def start_web_dashboard(
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return response
 
-    _middlewares = [_auth_middleware, _cors_middleware]
+    _middlewares = [_security_and_error_guard, _auth_middleware, _cors_middleware]
     if _rpm > 0:
         _middlewares.append(_make_api_rate_middleware(_rpm))
 

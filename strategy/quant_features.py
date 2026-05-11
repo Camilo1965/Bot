@@ -26,6 +26,14 @@ QUANT_FEATURE_COLS: list[str] = [
     "vol_rel",
 ]
 
+# Fase 4: VIBE-Trading features injected at inference time (optional)
+VIBE_FEATURE_COLS: list[str] = [
+    "vibe_pattern_score",
+    "vibe_factor_ic",
+    "vibe_journal_health",
+    "vibe_backtest_sharpe",
+]
+
 _RSI_PERIOD = 14
 _MACD_FAST = 12
 _MACD_SLOW = 26
