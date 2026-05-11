@@ -518,7 +518,8 @@ class VibeMCPClient:
         variables: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> dict | None:
-        args: dict[str, Any] = {"preset": preset}
-        if variables:
-            args["variables"] = variables
+        args: dict[str, Any] = {
+            "preset_name": preset,
+            "variables": variables if variables is not None else {},
+        }
         return await self.call_tool("run_swarm", args, timeout=timeout)
