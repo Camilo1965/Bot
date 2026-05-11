@@ -12,6 +12,8 @@ import aiohttp
 
 import aiohttp
 
+import aiohttp
+
 from bot.constants import DEBUG_LOG_HINT
 from database.db_manager import db
 from execution.paper_executor import PaperExecutor
@@ -25,6 +27,46 @@ from vibe.decision_bridge import (
     is_extreme_macro_veto,
 )
 from vibe.feature_bridge import extract_vibe_features
+
+_VIBE_MCP_URL: str = os.environ.get("VIBE_MCP_URL", "http://localhost:5000/predict")
+_VIBE_MCP_TIMEOUT: float = float(os.environ.get("VIBE_MCP_TIMEOUT_S", "30"))
+_VIBE_MCP_ENABLED: bool = os.environ.get("VIBE_MCP_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+
+async def _fetch_vibe_mcp_decision(
+    session: aiohttp.ClientSession,
+    features: list[float],
+    ohlcv: list[dict[str, Any]],
+    symbol: str,
+) -> dict[str, Any] | None:
+    payload = {
+        "features": features,
+        "ohlcv": ohlcv,
+        "symbol": symbol,
+    }
+    try:
+        async with session.post(
+            _VIBE_MCP_URL,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=_VIBE_MCP_TIMEOUT),
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            text = await resp.text()
+            logging.getLogger("clawdbot.signal").warning(
+                "[VIBE MCP] HTTP %d: %s", resp.status, text[:200]
+            )
+            return None
+    except asyncio.TimeoutError:
+        logging.getLogger("clawdbot.signal").warning(
+            "[VIBE MCP] Timeout after %.0fs", _VIBE_MCP_TIMEOUT
+        )
+        return None
+    except Exception as exc:
+        logging.getLogger("clawdbot.signal").warning(
+            "[VIBE MCP] Request failed: %s", exc
+        )
+        return None
+
 
 _VIBE_MCP_URL: str = os.environ.get("VIBE_MCP_URL", "http://localhost:5000/predict")
 _VIBE_MCP_TIMEOUT: float = float(os.environ.get("VIBE_MCP_TIMEOUT_S", "30"))
@@ -238,12 +280,16 @@ async def signal_emitter(
             if _VIBE_MCP_ENABLED:
                 ohlcv_list = []
                 n = min(len(prices), len(highs) if highs else len(prices), len(lows) if lows else len(prices), len(volumes) if volumes else len(prices))
+                compress_ohlcv = n > 200
                 for i in range(n):
                     o_val = prices[i]
-                    h_val = highs[i] if highs else o_val
-                    l_val = lows[i] if lows else o_val
                     v_val = volumes[i] if volumes else 0.0
-                    ohlcv_list.append({"open": o_val, "high": h_val, "low": l_val, "close": o_val, "volume": v_val})
+                    if compress_ohlcv:
+                        ohlcv_list.append({"close": o_val, "volume": v_val})
+                    else:
+                        h_val = highs[i] if highs else o_val
+                        l_val = lows[i] if lows else o_val
+                        ohlcv_list.append({"open": o_val, "high": h_val, "low": l_val, "close": o_val, "volume": v_val})
                 
                 q_feat = predictor._compute_features(
                     prices, 0.0, highs=highs or None, lows=lows or None,

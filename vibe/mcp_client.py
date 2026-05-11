@@ -307,43 +307,68 @@ class VibeMCPClient:
             logger.warning("[VIBE] Failed to write to MCP stdin: %s", exc)
             return None
 
-        # Read lines until we get a valid JSON-RPC response with our ID
+        # Read bytes until we get a valid JSON-RPC response with our ID
         effective_timeout = timeout if timeout is not None else _REQUEST_TIMEOUT
         deadline = asyncio.get_event_loop().time() + effective_timeout
+        buffer = b""
+        
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
                 logger.warning("[VIBE] Timeout waiting for MCP response (method=%s).", method)
                 return None
             try:
-                raw = await asyncio.wait_for(
-                    asyncio.to_thread(self._proc.stdout.readline),
-                    timeout=min(remaining, 45),
+                # Read chunks instead of readline to handle large responses without blocking
+                chunk = await asyncio.wait_for(
+                    asyncio.to_thread(self._proc.stdout.read, 4096),
+                    timeout=5.0,  # Wake up every 5s for heartbeat
                 )
+                if not chunk:
+                    logger.warning("[VIBE] MCP stdout EOF (method=%s) — subprocess likely died.", method)
+                    return None
+                buffer += chunk
             except asyncio.TimeoutError:
-                logger.warning("[VIBE] Timeout reading MCP response line.")
-                return None
+                # Heartbeat every 5 seconds while waiting
+                logger.debug("[VIBE] MCP is still processing... (heartbeat)")
+                # Verificamos si el proceso murió
+                if self._proc.poll() is not None:
+                    logger.warning("[VIBE] MCP process died while waiting for response.")
+                    return None
+                continue
             except Exception as exc:
                 logger.warning("[VIBE] Error reading MCP stdout: %s", exc)
                 return None
-            if not raw:
-                logger.warning("[VIBE] MCP stdout EOF (method=%s) — subprocess likely died.", method)
-                return None
-            decoded = raw.decode("utf-8", errors="replace").strip()
-            if not decoded:
-                continue
-            try:
-                response = json.loads(decoded)
-            except json.JSONDecodeError:
-                logger.debug("[VIBE] Non-JSON line from MCP: %s", decoded[:200])
-                continue
-            if "id" in response and response.get("id") == self._request_id:
-                if "error" in response:
-                    logger.warning("[VIBE] MCP error: %s", response["error"])
-                    return None
-                return response.get("result")
-            # Not our response ID - skip it
-            continue
+
+            # Try to decode what we have so far
+            decoded = buffer.decode("utf-8", errors="replace")
+            
+            # JSON-RPC messages are separated by newlines
+            lines = decoded.split("\n")
+            
+            # If we don't end with a newline, the last line is incomplete
+            if not decoded.endswith("\n"):
+                buffer = lines.pop().encode("utf-8")
+            else:
+                buffer = b""
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    response = json.loads(line)
+                except json.JSONDecodeError:
+                    # Not a valid JSON yet, could be standard error or partial buffer logic mismatch
+                    # Actually, stdio from MCP can have random logs. We just ignore lines that aren't JSON.
+                    logger.debug("[VIBE] Non-JSON line from MCP: %s", line[:200])
+                    continue
+                
+                if "id" in response and response.get("id") == self._request_id:
+                    if "error" in response:
+                        logger.warning("[VIBE] MCP error: %s", response["error"])
+                        return None
+                    return response.get("result")
+                # Not our response ID - skip it
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         """Send a JSON-RPC notification (no response expected)."""

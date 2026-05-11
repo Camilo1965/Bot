@@ -118,10 +118,19 @@ async def _call_gemini(prompt: str) -> dict[str, Any]:
         )
         return response.text or ""
 
+    print("Enviando a Gemini...")
+    logger.info("[SERVER] Enviando a Gemini...")
+    
+    # Force 30 seconds timeout to prevent hanging the bot
+    timeout_s = min(GEMINI_TIMEOUT_S, 30)
+    
     text = await asyncio.wait_for(
         asyncio.to_thread(_sync_call),
-        timeout=GEMINI_TIMEOUT_S,
+        timeout=timeout_s,
     )
+    
+    print("Respuesta de Gemini recibida")
+    logger.info("[SERVER] Respuesta de Gemini recibida")
 
     # Strip markdown fences if present
     raw = text.strip()
