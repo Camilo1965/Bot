@@ -117,13 +117,17 @@ class VibeMCPClient:
                 return False
 
             # Send initialize
+            init_delay = float(os.environ.get("VIBE_MCP_INIT_DELAY_S", "2").strip() or "2")
+            if init_delay > 0:
+                await asyncio.sleep(init_delay)
+            init_timeout = float(os.environ.get("VIBE_MCP_INIT_TIMEOUT_S", "120").strip() or "120")
             try:
                 # Force a larger timeout specifically for the initialization handshake
                 result = await self._call("initialize", {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
                     "clientInfo": {"name": "clawdbot", "version": "1.0"},
-                }, timeout=120.0)
+                }, timeout=init_timeout)
             except Exception as exc:
                 self._init_error = f"Initialize exception: {exc}"
                 logger.warning("[VIBE] MCP initialize exception: %s", exc)
