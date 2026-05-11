@@ -118,11 +118,12 @@ class VibeMCPClient:
 
             # Send initialize
             try:
+                # Force a larger timeout specifically for the initialization handshake
                 result = await self._call("initialize", {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
                     "clientInfo": {"name": "clawdbot", "version": "1.0"},
-                })
+                }, timeout=120.0)
             except Exception as exc:
                 self._init_error = f"Initialize exception: {exc}"
                 logger.warning("[VIBE] MCP initialize exception: %s", exc)

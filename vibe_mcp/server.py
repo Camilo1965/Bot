@@ -2,15 +2,11 @@
 vibe_mcp/server.py
 ~~~~~~~~~~~~~~~~~~
 
-HTTP MCP server for VIBE trading decisions.
+Dual HTTP and FastMCP server for VIBE trading decisions.
 Receives market data (features + OHLCV), calls Gemini for a trading decision,
 and returns a structured JSON response.
 
-Designed to eliminate Pydantic ValidationErrors and timeouts by:
-- Using a flexible Pydantic schema (extra="allow", no strict feature count).
-- Sampling OHLCV data to keep prompts lightweight.
-- Setting a 120s internal timeout for Gemini.
-- Returning a safe NEUTRAL fallback on any error.
+Heavy initializations are deferred to request time.
 """
 
 from __future__ import annotations
@@ -25,11 +21,15 @@ from typing import Any
 from aiohttp import web
 from pydantic import BaseModel, ConfigDict, Field
 
-# google-genai (sync client — we run it in a thread)
+try:
+    from mcp.server.fastmcp import FastMCP
+    _FASTMCP_AVAILABLE = True
+except ImportError:
+    _FASTMCP_AVAILABLE = False
+
 try:
     from google.genai import Client
     from google.genai.types import GenerateContentConfig
-
     _GENAI_AVAILABLE = True
 except Exception:  # pragma: no cover
     _GENAI_AVAILABLE = False
@@ -45,10 +45,16 @@ SERVER_HOST = os.environ.get("VIBE_MCP_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("VIBE_MCP_PORT", "5000"))
 
 
+# ── FastMCP Instance ──────────────────────────────────────────────────────────
+# We instantiate FastMCP without heavy tasks (no API clients initialized here).
+if _FASTMCP_AVAILABLE:
+    mcp = FastMCP("vibe-trading")
+else:
+    mcp = None
+
+
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
 class MarketDataInput(BaseModel):
-    """Flexible input schema: features can be any length (target 16)."""
-
     model_config = ConfigDict(extra="allow")
 
     features: list[float] = Field(default_factory=list)
@@ -64,27 +70,23 @@ class PredictionResponse(BaseModel):
 
 # ── Data sampler ──────────────────────────────────────────────────────────────
 def _sample_ohlcv(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """If we receive > MAX_OHLCV_ROWS, take every 2nd row or the last N."""
     n = len(rows)
     if n <= MAX_OHLCV_ROWS:
         return rows
-    # Strategy: every 2nd row, then cap to last MAX_OHLCV_ROWS if still too many
     sampled = rows[::2]
     if len(sampled) > MAX_OHLCV_ROWS:
         return sampled[-MAX_OHLCV_ROWS:]
     return sampled
 
 
-# ── Prompt builder ────────────────────────────────────────────────────────────
-def _build_prompt(data: MarketDataInput) -> str:
-    features_str = json.dumps(data.features)
-    ohlcv_sample = _sample_ohlcv(data.ohlcv)
-    # Show only first/last few rows in the prompt to save tokens
+def _build_prompt(features: list[float], ohlcv: list[dict[str, Any]], symbol: str) -> str:
+    features_str = json.dumps(features)
+    ohlcv_sample = _sample_ohlcv(ohlcv)
     preview = json.dumps(ohlcv_sample[:3]) + f" ... ({len(ohlcv_sample)} rows total)"
     prompt = (
         f"You are a quantitative crypto trading assistant. "
-        f"Analyze the following market data for {data.symbol}.\n\n"
-        f"Feature vector ({len(data.features)} values): {features_str}\n\n"
+        f"Analyze the following market data for {symbol}.\n\n"
+        f"Feature vector ({len(features)} values): {features_str}\n\n"
         f"Recent OHLCV (sampled to {len(ohlcv_sample)} rows): {preview}\n\n"
         "Respond with a single JSON object containing exactly these keys:\n"
         '  "decision": one of ["BUY", "SELL", "NEUTRAL"],\n'
@@ -99,12 +101,16 @@ def _build_prompt(data: MarketDataInput) -> str:
 async def _call_gemini(prompt: str) -> dict[str, Any]:
     if not _GENAI_AVAILABLE:
         logger.warning("[SERVER] google-genai not available.")
-        raise RuntimeError("google-genai not installed")
+        return {"decision": "NEUTRAL", "confidence": 0.5, "reasoning": "google-genai missing"}
 
     if not GEMINI_API_KEY:
         logger.warning("[SERVER] No GEMINI_API_KEY configured.")
-        raise RuntimeError("Missing GEMINI_API_KEY")
+        return {"decision": "NEUTRAL", "confidence": 0.5, "reasoning": "Missing GEMINI_API_KEY"}
 
+    print("Enviando a Gemini...", flush=True)
+    logger.info("[SERVER] Enviando a Gemini...")
+
+    # Instantiate the client inside the call (no heavy startup)
     client = Client(api_key=GEMINI_API_KEY)
 
     def _sync_call() -> str:
@@ -118,18 +124,22 @@ async def _call_gemini(prompt: str) -> dict[str, Any]:
         )
         return response.text or ""
 
-    print("Enviando a Gemini...")
-    logger.info("[SERVER] Enviando a Gemini...")
-    
-    # Force 30 seconds timeout to prevent hanging the bot
+    # Force max 30 seconds timeout to prevent hanging the bot
     timeout_s = min(GEMINI_TIMEOUT_S, 30)
-    
-    text = await asyncio.wait_for(
-        asyncio.to_thread(_sync_call),
-        timeout=timeout_s,
-    )
-    
-    print("Respuesta de Gemini recibida")
+
+    try:
+        text = await asyncio.wait_for(
+            asyncio.to_thread(_sync_call),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        logger.error("[SERVER] Timeout from Gemini")
+        return {"decision": "NEUTRAL", "confidence": 0.5, "reasoning": "Timeout from Gemini"}
+    except Exception as exc:
+        logger.error("[SERVER] Error from Gemini: %s", exc)
+        return {"decision": "NEUTRAL", "confidence": 0.5, "reasoning": f"Error: {exc}"}
+
+    print("Respuesta de Gemini recibida", flush=True)
     logger.info("[SERVER] Respuesta de Gemini recibida")
 
     # Strip markdown fences if present
@@ -144,7 +154,7 @@ async def _call_gemini(prompt: str) -> dict[str, Any]:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
         logger.error("[SERVER] JSON decode failed: %s | raw=%s", exc, raw[:200])
-        raise
+        return {"decision": "NEUTRAL", "confidence": 0.5, "reasoning": f"JSON parse error: {exc}"}
 
     decision = str(parsed.get("decision", "NEUTRAL")).upper()
     if decision not in ("BUY", "SELL", "NEUTRAL"):
@@ -157,57 +167,47 @@ async def _call_gemini(prompt: str) -> dict[str, Any]:
     }
 
 
+# ── FastMCP Tool ──────────────────────────────────────────────────────────────
+if mcp is not None:
+    @mcp.tool()
+    async def predict(features: list[float], ohlcv: list[dict[str, Any]], symbol: str = "ETH/USDT") -> dict[str, Any]:
+        """Analyze market data and return a trading decision."""
+        prompt = _build_prompt(features, ohlcv, symbol)
+        return await _call_gemini(prompt)
+
+
 # ── HTTP handlers ─────────────────────────────────────────────────────────────
 async def handle_predict(request: web.Request) -> web.Response:
-    """Main prediction endpoint with global try/except fallback."""
     start_time = time.time()
 
     try:
         body = await request.json()
     except Exception as exc:
-        logger.error("[SERVER] Invalid JSON body: %s", exc)
         return web.json_response(
-            PredictionResponse(
-                decision="NEUTRAL", confidence=0.5, reasoning="Invalid JSON"
-            ).model_dump(),
+            PredictionResponse(decision="NEUTRAL", confidence=0.5, reasoning="Invalid JSON").model_dump(),
             status=400,
         )
 
     try:
         data = MarketDataInput.model_validate(body)
     except Exception as exc:
-        logger.error("[SERVER] Validation error: %s", exc)
         return web.json_response(
-            PredictionResponse(
-                decision="NEUTRAL", confidence=0.5, reasoning=f"Validation error: {exc}"
-            ).model_dump(),
+            PredictionResponse(decision="NEUTRAL", confidence=0.5, reasoning=f"Validation error: {exc}").model_dump(),
             status=422,
         )
 
-    print(f"[SERVER] Recibidas {len(data.features)} columnas y {len(data.ohlcv)} filas. Procesando...")
-    logger.info("[SERVER] Recibidas %d columnas y %d filas. Procesando...", len(data.features), len(data.ohlcv))
+    prompt = _build_prompt(data.features, data.ohlcv, data.symbol)
+    result = await _call_gemini(prompt)
+    
+    elapsed = time.time() - start_time
+    logger.info("[SERVER] Request processed in %.2fs", elapsed)
 
-    try:
-        prompt = _build_prompt(data)
-        result = await _call_gemini(prompt)
-        elapsed = time.time() - start_time
-        print(f"[SERVER] Gemini respondió en {elapsed:.2f}s")
-        logger.info("[SERVER] Gemini responded in %.2fs", elapsed)
-
-        resp = PredictionResponse(
-            decision=result.get("decision", "NEUTRAL"),
-            confidence=result.get("confidence", 0.5),
-            reasoning=result.get("reasoning", ""),
-        )
-        return web.json_response(resp.model_dump(), status=200)
-    except Exception as exc:  # noqa: BLE001
-        elapsed = time.time() - start_time
-        logger.error("[SERVER] Error after %.2fs: %s", elapsed, exc)
-        print(f"[SERVER] Error after {elapsed:.2f}s: {exc}")
-        fallback = PredictionResponse(
-            decision="NEUTRAL", confidence=0.5, reasoning=f"Error: {exc}"
-        )
-        return web.json_response(fallback.model_dump(), status=200)
+    resp = PredictionResponse(
+        decision=result.get("decision", "NEUTRAL"),
+        confidence=result.get("confidence", 0.5),
+        reasoning=result.get("reasoning", ""),
+    )
+    return web.json_response(resp.model_dump(), status=200)
 
 
 async def handle_health(_request: web.Request) -> web.Response:
@@ -223,7 +223,7 @@ def create_app() -> web.Application:
 
 
 async def start_mcp_server(host: str = SERVER_HOST, port: int = SERVER_PORT) -> None:
-    """Start the VIBE MCP server as an asyncio task."""
+    """Start the VIBE MCP HTTP server as an asyncio task."""
     app = create_app()
     runner = web.AppRunner(app)
     await runner.setup()
@@ -238,13 +238,13 @@ async def start_mcp_server(host: str = SERVER_HOST, port: int = SERVER_PORT) -> 
 
 
 def main() -> None:  # pragma: no cover
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    )
-    app = create_app()
-    logger.info("Starting VIBE MCP server on %s:%d", SERVER_HOST, SERVER_PORT)
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+    logging.basicConfig(level=logging.INFO)
+    # If run directly as a script, default to FastMCP if available, else HTTP
+    if _FASTMCP_AVAILABLE:
+        mcp.run()
+    else:
+        app = create_app()
+        web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
 
 
 if __name__ == "__main__":  # pragma: no cover
