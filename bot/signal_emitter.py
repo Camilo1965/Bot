@@ -8,6 +8,8 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+import aiohttp
+
 from bot.constants import DEBUG_LOG_HINT
 from database.db_manager import db
 from execution.paper_executor import PaperExecutor
@@ -21,6 +23,47 @@ from vibe.decision_bridge import (
     is_extreme_macro_veto,
 )
 from vibe.feature_bridge import extract_vibe_features
+
+_VIBE_MCP_URL: str = os.environ.get("VIBE_MCP_URL", "http://localhost:5000/predict")
+_VIBE_MCP_TIMEOUT: float = float(os.environ.get("VIBE_MCP_TIMEOUT_S", "30"))
+_VIBE_MCP_ENABLED: bool = os.environ.get("VIBE_MCP_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+
+
+async def _fetch_vibe_mcp_decision(
+    session: aiohttp.ClientSession,
+    features: list[float],
+    ohlcv: list[dict[str, Any]],
+    symbol: str,
+) -> dict[str, Any] | None:
+    """Send features + OHLCV to the VIBE MCP server and return the JSON decision."""
+    payload = {
+        "features": features,
+        "ohlcv": ohlcv,
+        "symbol": symbol,
+    }
+    try:
+        async with session.post(
+            _VIBE_MCP_URL,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=_VIBE_MCP_TIMEOUT),
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            text = await resp.text()
+            logging.getLogger("clawdbot.signal").warning(
+                "[VIBE MCP] HTTP %d: %s", resp.status, text[:200]
+            )
+            return None
+    except asyncio.TimeoutError:
+        logging.getLogger("clawdbot.signal").warning(
+            "[VIBE MCP] Timeout after %.0fs", _VIBE_MCP_TIMEOUT
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("clawdbot.signal").warning(
+            "[VIBE MCP] Request failed: %s", exc
+        )
+        return None
 
 
 def _extract_vibe_pattern_text(data: Any) -> str:
@@ -109,11 +152,15 @@ async def signal_emitter(
     interval: int = 15,
 ) -> None:
     logger = logging.getLogger("clawdbot.signal")
-    while True:
-        await asyncio.sleep(interval)
-        now = datetime.now(tz=timezone.utc)
-
-        for symbol in watchlist:
+    
+    # Create a persistent session for MCP requests
+    session_timeout = aiohttp.ClientTimeout(total=_VIBE_MCP_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=session_timeout) as http_session:
+        while True:
+            await asyncio.sleep(interval)
+            now = datetime.now(tz=timezone.utc)
+    
+            for symbol in watchlist:
             prices: list[float] = list(state["prices"].get(symbol, []))
 
             if len(prices) < MIN_OHLC_ROWS:
@@ -147,6 +194,32 @@ async def signal_emitter(
             if os.environ.get("VIBE_FEATURES_ENABLED") == "1":
                 vibe_vec = extract_vibe_features(state, symbol)
 
+            # [VIBE MCP SERVER] Lógica opcional para llamar al MCP server externo HTTP
+            if _VIBE_MCP_ENABLED:
+                # Reconstruir OHLCV a partir de las listas separadas para enviar al MCP
+                ohlcv_list = []
+                n = min(len(prices), len(highs) if highs else len(prices), len(lows) if lows else len(prices), len(volumes) if volumes else len(prices))
+                for i in range(n):
+                    o_val = prices[i]  # Usamos mid como proxy de open/close si no hay más info
+                    h_val = highs[i] if highs else o_val
+                    l_val = lows[i] if lows else o_val
+                    v_val = volumes[i] if volumes else 0.0
+                    ohlcv_list.append({"open": o_val, "high": h_val, "low": l_val, "close": o_val, "volume": v_val})
+                
+                # Obtener quant features para construir el vector completo de 16 features
+                q_feat = predictor._compute_features(
+                    prices, 0.0, highs=highs or None, lows=lows or None,
+                    obi_ratio=obi_ratio, volumes=volumes or None, symbol=symbol
+                )
+                full_features = (q_feat or []) + (vibe_vec or [0.0, 0.0, 1.0, 0.5])
+                
+                # Llamada async al servidor VIBE MCP (si está configurado)
+                mcp_task = asyncio.create_task(
+                    _fetch_vibe_mcp_decision(http_session, full_features, ohlcv_list, symbol)
+                )
+                # No bloqueamos el bot esperando al MCP; se ejecutará en background y guardará la info
+                # O si se quiere síncrono para influir: mcp_result = await mcp_task
+            
             # Single-pass prediction
             signal, win_prob = predictor.generate_signal(
                 prices,

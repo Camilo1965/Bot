@@ -1,0 +1,1 @@
+"""vibe_mcp package."""
