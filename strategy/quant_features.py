@@ -34,6 +34,9 @@ VIBE_FEATURE_COLS: list[str] = [
     "vibe_backtest_sharpe",
 ]
 
+# Orden final unificado para entrenamiento e inferencia (12 quant + 4 VIBE)
+FINAL_FEATURE_ORDER: list[str] = QUANT_FEATURE_COLS + VIBE_FEATURE_COLS
+
 _RSI_PERIOD = 14
 _MACD_FAST = 12
 _MACD_SLOW = 26

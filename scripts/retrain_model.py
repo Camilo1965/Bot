@@ -29,6 +29,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from strategy.quant_features import (
+    FINAL_FEATURE_ORDER,
     QUANT_FEATURE_COLS,
     VIBE_FEATURE_COLS,
     add_quant_features,
@@ -155,10 +156,11 @@ def retrain_and_validate(
     # ------------------------------------------------------------------
     # 3. Inject VIBE features if requested
     # ------------------------------------------------------------------
-    feature_cols = list(QUANT_FEATURE_COLS)
     if use_vibe:
         feat = _add_vibe_features(feat)
-        feature_cols.extend(VIBE_FEATURE_COLS)
+        feature_cols = list(FINAL_FEATURE_ORDER)
+    else:
+        feature_cols = list(QUANT_FEATURE_COLS)
 
     # Drop rows with NaN in features or label
     feat = feat.dropna(subset=feature_cols + ["label"])
@@ -249,6 +251,8 @@ def retrain_and_validate(
     final_model.fit(X, y)
 
     _MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    # Ensure booster feature names match the exact training column order
+    final_model.get_booster().feature_names = list(feature_cols)
     final_model.save_model(str(model_path))
 
     meta = {

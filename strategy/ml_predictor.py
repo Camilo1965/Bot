@@ -27,6 +27,7 @@ from xgboost import XGBClassifier
 
 from strategy.quant_features import (
     DEFAULT_LABEL_ROUND_TRIP,
+    FINAL_FEATURE_ORDER,
     MIN_OHLC_ROWS,
     QUANT_FEATURE_COLS,
     VIBE_FEATURE_COLS,
@@ -175,8 +176,7 @@ HTF_TREND_NEUTRAL = "neutral"
 _HTF_MIN_CANDLES = 3
 
 _VIBE_ENABLED: bool = os.environ.get("VIBE_FEATURES_ENABLED", "0").strip() in ("1", "true", "yes")
-_BASE_FEATURE_COLS = QUANT_FEATURE_COLS
-_FEATURE_COLS = _BASE_FEATURE_COLS + VIBE_FEATURE_COLS if _VIBE_ENABLED else list(_BASE_FEATURE_COLS)
+_FEATURE_COLS = list(FINAL_FEATURE_ORDER) if _VIBE_ENABLED else list(QUANT_FEATURE_COLS)
 
 Signal = str  # literal: "BUY" | "SELL" | "HOLD"
 TrendStatus = str  # literal: "bullish" | "bearish" | "neutral"
@@ -530,15 +530,9 @@ class MLPredictor:
             else:
                 features.extend(VIBE_FEATURE_NEUTRAL)
 
-        # Ensure vector length matches column expectation
-        expected_len = len(_FEATURE_COLS)
-        actual_len = len(features)
-        if actual_len < expected_len:
-            features.extend([0.0] * (expected_len - actual_len))
-        elif actual_len > expected_len:
-            features = features[:expected_len]
-
-        X = pd.DataFrame([features], columns=_FEATURE_COLS)
+        # ------------------------------------------------------------------
+        # Resolve booster and determine expected feature count
+        # ------------------------------------------------------------------
         sym = symbol or "ETH/USDT"
         booster: XGBClassifier | None = None
         mp = model_json_path_for_symbol(sym)
@@ -552,6 +546,36 @@ class MLPredictor:
         if booster is None:
             logger.debug("predict_proba: no model file for %s and predictor untrained.", sym)
             return None
+
+        # Expected feature count from the loaded model
+        try:
+            model_features = int(booster.n_features_in_)
+        except AttributeError:
+            try:
+                model_features = int(booster.get_booster().num_features())
+            except Exception:
+                model_features = len(_FEATURE_COLS)
+
+        input_features = len(features)
+
+        # Auto-Padding: V2 model (16) with only 12 input features
+        if model_features == 16 and input_features == 12:
+            logger.error(
+                "[XGBOOST] Mismatch detectado. Esperadas: %d, Recibidas: %d. Aplicando corrección...",
+                model_features,
+                input_features,
+            )
+            features.extend(VIBE_FEATURE_NEUTRAL)
+
+        # Generic length safety net
+        if len(features) < model_features:
+            features.extend([0.0] * (model_features - len(features)))
+        elif len(features) > model_features:
+            features = features[:model_features]
+
+        # Force column order using FINAL_FEATURE_ORDER
+        cols = FINAL_FEATURE_ORDER[:model_features]
+        X = pd.DataFrame([features], columns=cols)
         try:
             proba: float = float(booster.predict_proba(X)[0][1])
         except Exception as exc:  # noqa: BLE001
