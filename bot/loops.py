@@ -47,7 +47,7 @@ async def dashboard_logger(
       and pushes it to the running :class:`~rich.live.Live` context so the
       terminal display is updated in-place without any scrolling.
     * Writes per-position risk telemetry (trailing stop, ATR, high-watermark)
-      exclusively to ``audit.log`` via the ``clawdbot.audit`` logger – this
+      exclusively to ``audit.log`` via the ``clawdbot.audit`` logger - this
       output never reaches the console.
     * Emits a DEBUG heartbeat to ``bot_debug.log`` for post-session analysis.
 
@@ -114,7 +114,7 @@ async def dashboard_logger(
             mark_price = mt5_dashboard_mark(state, sym, float(prices_buf[-1])) or float(prices_buf[-1])
             if pos.entry_price == 0.0:
                 continue
-            # Use the live ratcheted stop stored on the position object – this
+            # Use the live ratcheted stop stored on the position object - this
             # is updated by check_and_close() on every price tick, so it always
             # reflects the current in-memory value rather than a recomputed
             # snapshot that could diverge from what the exit logic actually uses.
@@ -288,11 +288,17 @@ async def health_monitor_loop(
                     )
                 except Exception:
                     pass
-                asyncio.create_task(
-                    send_priority_telegram_alert(
-                        "⚠️ *HEALTH ALERT* Feed de mercado sin mensajes recientes (>120s)."
-                    , priority="critical", dedup_key="health:market_feed_stale")
-                )
+                async def _safe_health_alert() -> None:
+                    try:
+                        await send_priority_telegram_alert(
+                            "⚠️ *HEALTH ALERT* Feed de mercado sin mensajes recientes (>120s).",
+                            priority="critical",
+                            dedup_key="health:market_feed_stale",
+                        )
+                    except Exception as _alert_exc:
+                        logger.warning("[HEALTH] Telegram alert failed: %s", _alert_exc)
+
+                asyncio.create_task(_safe_health_alert())
         else:
             stale_alert_sent = False
 
@@ -317,20 +323,24 @@ async def health_monitor_loop(
                     )
                 except Exception:
                     pass
-                asyncio.create_task(
-                    send_priority_telegram_alert(
-                        "🚨 *ALERTA DEL SISTEMA: ÓRDENES DE CIERRE RECHAZADAS*\n\n"
-                        f"El bot ha intentado cerrar *{pending_count} posición(es)* repetidamente, pero el bróker (MT5) está rechazando las órdenes.\n\n"
-                        "🛑 *¿Qué significa esto?*\n"
-                        "El bot ya decidió que la operación debe cerrarse (por toma de ganancias o stop loss), pero MT5 no procesa la solicitud.\n\n"
-                        "⚠️ *Acción recomendada:*\n"
-                        "Revisa la terminal de MT5 manualmente para confirmar si la orden sigue abierta o si ya se cerró. Si sigue abierta, es posible que debas cerrarla a mano.\n\n"
-                        "*Detalles técnicos (Símbolo : Error):*\n"
-                        + "\n".join(f"• `{d}`" for d in details[:5]),
-                        priority="critical",
-                        dedup_key="health:pending_close_persistent",
-                    )
-                )
+                async def _safe_pending_alert() -> None:
+                    try:
+                        await send_priority_telegram_alert(
+                            "🚨 *ALERTA DEL SISTEMA: ÓRDENES DE CIERRE RECHAZADAS*\n\n"
+                            f"El bot ha intentado cerrar *{pending_count} posición(es)* repetidamente, pero el bróker (MT5) está rechazando las órdenes.\n\n"
+                            "🛑 *¿Qué significa esto?*\n"
+                            "El bot ya decidió que la operación debe cerrarse (por toma de ganancias o stop loss), pero MT5 no procesa la solicitud.\n\n"
+                            "⚠️ *Acción recomendada:*\n"
+                            "Revisa la terminal de MT5 manualmente para confirmar si la orden sigue abierta o si ya se cerró. Si sigue abierta, es posible que debas cerrarla a mano.\n\n"
+                            "*Detalles técnicos (Símbolo : Error):*\n"
+                            + "\n".join(f"• `{d}`" for d in details[:5]),
+                            priority="critical",
+                            dedup_key="health:pending_close_persistent",
+                        )
+                    except Exception as _alert_exc:
+                        logger.warning("[RECONCILER] Telegram alert failed: %s", _alert_exc)
+
+                asyncio.create_task(_safe_pending_alert())
         else:
             pending_alert_streak = 0
 
@@ -406,14 +416,14 @@ def _next_run_local(target_weekday: int | None, target_hour: int, target_minute:
     * **Monthly:** 1st of the month at *target_hour*:*target_minute* (local).  The
       previous implementation used “today at hour” and then ``.replace(day=1)`` when
       the time was still in the future, which produced a datetime **in the past**
-      whenever ``now.day > 1`` — causing a tight loop (``sleep_s == interval_floor``)
+      whenever ``now.day > 1`` - causing a tight loop (``sleep_s == interval_floor``)
       and spam logs.
     """
     tz = _report_tz()
     now_local = datetime.now(tz=tz)
 
     if target_weekday is None:
-        # Monthly — always anchor to the 1st at target hour in REPORT_TIMEZONE.
+        # Monthly - always anchor to the 1st at target hour in REPORT_TIMEZONE.
         first_this_month = datetime(
             now_local.year,
             now_local.month,

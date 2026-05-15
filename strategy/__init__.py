@@ -1,1 +1,1 @@
-# strategy – ML models, signal generation, and feature engineering
+# strategy - ML models, signal generation, and feature engineering

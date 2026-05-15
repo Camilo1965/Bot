@@ -163,7 +163,7 @@ def generate_html_report(stats: dict[str, Any], month: str, out_path: Path) -> N
 <html>
 <head><meta charset="utf-8"><title>ClawdBot Report {month}</title></head>
 <body>
-<h1>ClawdBot Monthly Report — {month}</h1>
+<h1>ClawdBot Monthly Report - {month}</h1>
 <p><strong>Total P&L:</strong> {stats['total_pnl']:.2f} USDT</p>
 <p><strong>Winrate:</strong> {stats['winrate']:.1f}% ({stats['wins']}W / {stats['losses']}L / {stats['total']}T)</p>
 <p><strong>Best trade:</strong> {best_str}</p>
@@ -228,7 +228,7 @@ def notify_telegram(stats: dict[str, Any]) -> None:
     """Send summary via Telegram if configured."""
     from utils.telegram_notifier import send_telegram_alert
     msg = (
-        f"📊 *Monthly Reset* — {stats['month']}\n"
+        f"📊 *Monthly Reset* - {stats['month']}\n"
         f"PnL: `{stats['total_pnl']:+.2f}` USDT\n"
         f"Winrate: `{stats['winrate']:.1f}%` ({stats['wins']}W/{stats['losses']}L)\n"
     )
@@ -279,7 +279,7 @@ def main() -> int:
 
     backup = backup_postgres(month, dry_run=args.dry_run)
     if not backup and not args.dry_run:
-        logger.error("Backup failed — aborting reset.")
+        logger.error("Backup failed - aborting reset.")
         return 1
 
     archive_files(month, dry_run=args.dry_run)

@@ -1,1 +1,1 @@
-# utils – logging helpers and configuration management
+# utils - logging helpers and configuration management

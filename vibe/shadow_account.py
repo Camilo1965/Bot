@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from vibe.mcp_client import VibeMCPClient
+from typing import Any
 
 logger = logging.getLogger("clawdbot.vibe.shadow")
 
@@ -54,7 +54,7 @@ def _extract_shadow_id(result: dict[str, Any] | None) -> str | None:
 
 
 async def extract_and_backtest_shadow(
-    client: VibeMCPClient,
+    client: Any,
     journal_path: Path | None = None,
 ) -> dict[str, Any] | None:
     """Extract shadow strategy from trade journal and run backtest.

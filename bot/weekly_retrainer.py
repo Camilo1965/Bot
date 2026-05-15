@@ -19,7 +19,7 @@ async def weekly_retrainer(
     model_path: Path,
     data_limit: int = _RETRAINER_DATA_LIMIT,
 ) -> None:
-    """[PRO] Background task – re-trains the ML model every Sunday at 00:00 UTC."""
+    """[PRO] Background task - re-trains the ML model every Sunday at 00:00 UTC."""
     log = logging.getLogger("clawdbot.retrainer")
 
     def _seconds_until_next_sunday_midnight() -> float:
@@ -41,7 +41,7 @@ async def weekly_retrainer(
         )
         await asyncio.sleep(wait_secs)
 
-        log.info("[PRO] Weekly Re-training started – fetching latest market data.")
+        log.info("[PRO] Weekly Re-training started - fetching latest market data.")
         all_prices: list[float] = []
         for sym in watchlist:
             try:
@@ -53,7 +53,7 @@ async def weekly_retrainer(
 
         if len(all_prices) < 50:
             log.warning(
-                "[PRO] Re-training skipped – only %d price samples available (need ≥ 50).",
+                "[PRO] Re-training skipped - only %d price samples available (need >= 50).",
                 len(all_prices),
             )
             continue
@@ -71,7 +71,7 @@ async def weekly_retrainer(
 
         reloaded = predictor.load_model(model_path)
         if reloaded:
-            log.info("[PRO] Weekly Re-training complete – model hot-reloaded from %s.", model_path)
+            log.info("[PRO] Weekly Re-training complete - model hot-reloaded from %s.", model_path)
         else:
             log.warning(
                 "[PRO] Re-training complete but hot-reload from %s failed.", model_path

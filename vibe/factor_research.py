@@ -14,7 +14,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-from vibe.mcp_client import VibeMCPClient
+from typing import Any
 
 logger = logging.getLogger("clawdbot.vibe.factor")
 
@@ -29,7 +29,7 @@ _CRYPTO_FACTORS = [
 
 
 async def analyze_factors(
-    client: VibeMCPClient,
+    client: Any,
     symbols: list[str],
     factor_name: str = "close",
     days_back: int = 90,

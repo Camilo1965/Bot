@@ -16,6 +16,7 @@ import csv
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from bot.constants import DEBUG_LOG_HINT
+from bot.observability import TradeMetrics, ExitMetrics, get_buffer
 from database.db_manager import DatabaseManager
 from risk import risk_manager as _rm_mod
 from risk.risk_manager import RiskManager, get_execution_thresholds
@@ -182,8 +184,20 @@ class PaperExecutor:
                 state = json.load(f)
             self.total_pnl = state.get("total_pnl", 0.0)
             raw_pos = state.get("positions", {})
+            cleaned = 0
             for s, d in raw_pos.items():
-                self.open_positions[s] = OpenPosition.from_dict(d)
+                pos = OpenPosition.from_dict(d)
+                # Discard orphan positions that were never persisted to DB
+                # (numeric trade_id == legacy ghost position).
+                tid = getattr(pos, "trade_id", None)
+                if isinstance(tid, str) and tid.isdigit():
+                    logger.debug("Discarding orphan position %s (trade_id=%s) from state.json.", s, tid)
+                    cleaned += 1
+                    continue
+                self.open_positions[s] = pos
+            if cleaned:
+                logger.info("Cleaned %d orphan position(s) from state.json.", cleaned)
+                self.save_state()
             self._risk.sync_open_count(len(self.open_positions))
             self._risk.recalc_total_risk(self.open_positions)
             return len(self.open_positions)
@@ -192,11 +206,11 @@ class PaperExecutor:
             try:
                 self._state_file.rename(backup)
                 logger.warning(
-                    "State file corrupted (%s) — backed up to %s, starting fresh.",
+                    "State file corrupted (%s) - backed up to %s, starting fresh.",
                     exc, backup,
                 )
             except Exception:
-                logger.warning("State file corrupted (%s) — could not backup, removing.", exc)
+                logger.warning("State file corrupted (%s) - could not backup, removing.", exc)
                 try:
                     self._state_file.unlink()
                 except Exception:
@@ -243,9 +257,9 @@ class PaperExecutor:
         sl_price = entry_price * (1.0 - sl_frac)
         act_price = entry_price * (1.0 + thresh.activation_pct)
         
-        # [PRO] ATR-based Take Profit (default 2.5x ATR)
-        atr_mult = float(os.environ.get("TP_ATR_MULTIPLIER", "2.5"))
-        tp_price = entry_price + (current_atr * atr_mult) if current_atr else None
+        # [PRO] Fixed percentage Take Profit (3.0% default for R:R 1:2)
+        tp_frac = float(cfg.get("fixed_tp_pct", 0.03))
+        tp_price = entry_price * (1.0 + tp_frac)
         
         trade_id = str(uuid.uuid4())
         now = datetime.now(tz=timezone.utc)
@@ -295,6 +309,21 @@ class PaperExecutor:
             )
         except Exception as exc:
             logger.warning("Failed to log trade open to DB: %s", exc)
+
+        # Observability: trade opened
+        get_buffer().emit_trade(
+            TradeMetrics(
+                symbol=symbol,
+                timestamp=time.time(),
+                side="LONG",
+                entry_price=round(entry_price, 4),
+                position_size=round(pos_size_quote, 4),
+                win_probability=round(win_probability, 4),
+                atr=round(current_atr, 6) if current_atr else None,
+                vibe_quality=round(vibe_quality, 4),
+                sl_distance_pct=round(sl_frac * 100, 2),
+            )
+        )
 
         self.save_state()
         tp_str = f"TP={tp_price:.4f}" if tp_price else "TP=NONE"
@@ -400,6 +429,20 @@ class PaperExecutor:
         self.save_state()
         
         pnl_pct_display = pnl_pct * 100
+        hours_held = (exit_time - pos.entry_time).total_seconds() / 3600.0
+
+        # Observability: trade closed
+        get_buffer().emit_exit(
+            ExitMetrics(
+                symbol=symbol,
+                timestamp=time.time(),
+                exit_price=round(exit_price, 4),
+                pnl=round(gross_pnl, 4),
+                reason=reason,
+                hours_held=round(hours_held, 2),
+            )
+        )
+
         logger.info("🏁 [CLOSE] %s exit=%.4f pnl=%.2f (%.2f%%) reason=%s", symbol, exit_price, gross_pnl, pnl_pct_display, reason)
         await send_telegram_alert(f"🏁 *CLOSE* {symbol}\nExit: {exit_price:.4f}\nPnL: {gross_pnl:+.2f} ({pnl_pct_display:+.2f}%)\nReason: {reason}")
         return gross_pnl

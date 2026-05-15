@@ -50,7 +50,7 @@ def _simple_md_to_html(text: str) -> str:
     """Turn legacy *bold* and `` `code` `` into Telegram-safe HTML (escape inner text).
 
     Avoids Telegram's Markdown entity errors from paths, underscores, decimals, etc.
-    Does not parse Markdown links — bare URLs stay literal after escaping.
+    Does not parse Markdown links - bare URLs stay literal after escaping.
     """
     out: list[str] = []
     i = 0
@@ -90,7 +90,7 @@ def _payload_for_send(message: str, parse_mode: str | None) -> tuple[str, str | 
         return message, "HTML"
     if parse_mode is None:
         return message, None
-    # Legacy callers use parse_mode="Markdown" with *bold* / `code` — never send Markdown.
+    # Legacy callers use parse_mode="Markdown" with *bold* / `code` - never send Markdown.
     return _simple_md_to_html(message), "HTML"
 
 
@@ -146,7 +146,7 @@ async def send_telegram_alert(
     ----------
     message:
         Body text. Default ``parse_mode="Markdown"`` only means *call-site style*
-        ``*bold*`` / `` `code` `` — it is converted to HTML and sent as
+        ``*bold*`` / `` `code` `` - it is converted to HTML and sent as
         ``parse_mode=HTML`` (Telegram legacy Markdown is not used; avoids
         entity parse errors). Use ``parse_mode="HTML"`` when the message is
         already valid HTML (e.g. from ``html.escape``). Use ``None`` for plain.
@@ -156,9 +156,13 @@ async def send_telegram_alert(
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
+    if not message or not message.strip():
+        logger.debug("Telegram alert skipped - empty message.")
+        return False
+
     if not token or not chat_id:
         logger.debug(
-            "Telegram alert skipped – TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID "
+            "Telegram alert skipped - TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID "
             "not configured."
         )
         return False
@@ -185,7 +189,7 @@ async def send_telegram_alert(
                     logger.info("Telegram alert sent successfully.")
                     return True
                 body = await resp.text()
-                # Bad entities / broken Markdown or HTML — retry as plain text
+                # Bad entities / broken Markdown or HTML - retry as plain text
                 if resp.status == 400 and (
                     "parse" in body.lower() or "markdown" in body.lower() or "entities" in body.lower()
                 ):
@@ -355,7 +359,7 @@ def install_asyncio_critical_telegram_alerts() -> None:
             else (msg[:380] if msg else "error sin excepción en contexto")
         )
         lines = [
-            "🚨 *ERROR ASYNC (loop)* — revisar logs / posible fix requerido",
+            "🚨 *ERROR ASYNC (loop)* - revisar logs / posible fix requerido",
             "",
             exc_line,
         ]
@@ -670,7 +674,7 @@ async def telegram_command_poller(
                                             f"📊 Backtest {bt_sym} completado. Ver details en dashboard /api/vibe/backtest"
                                         )
                                     else:
-                                        await send_telegram_alert(f"⚠️ Backtest {bt_sym} falló — sin respuesta del tool.")
+                                        await send_telegram_alert(f"⚠️ Backtest {bt_sym} falló - sin respuesta del tool.")
                                 else:
                                     await send_telegram_alert("⚠️ Vibe-Trading no disponible.")
                             elif text.startswith("/journal"):
@@ -681,7 +685,7 @@ async def telegram_command_poller(
                                     if result:
                                         await send_telegram_alert("📋 Journal analysis completado. Ver dashboard /api/vibe/journal")
                                     else:
-                                        await send_telegram_alert("⚠️ Journal analysis falló — sin datos.")
+                                        await send_telegram_alert("⚠️ Journal analysis falló - sin datos.")
                                 else:
                                     await send_telegram_alert("⚠️ Vibe-Trading no disponible.")
                             elif text.startswith("/patterns"):

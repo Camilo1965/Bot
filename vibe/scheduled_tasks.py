@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from vibe.mcp_client import VibeMCPClient
+from typing import Any
+
 from vibe.journal_analyzer import analyze_journal
 from vibe.backtest import run_backtest
 from vibe.pattern_recognition import detect_patterns
@@ -74,13 +75,13 @@ def _record_run(loop_name: str) -> None:
 
 
 async def journal_analysis_loop(
-    client: VibeMCPClient,
+    client: Any,
     shared_state: dict[str, Any],
     interval_s: float = _JOURNAL_ANALYSIS_INTERVAL_S,
 ) -> None:
     """Periodically analyze the trade journal and store results in shared_state."""
     if not client.available:
-        logger.info("[VIBE] Client not available — journal analysis disabled.")
+        logger.info("[VIBE] Client not available - journal analysis disabled.")
         return
     await asyncio.sleep(_initial_sleep_with_state("journal", 60, interval_s))
     while True:
@@ -96,7 +97,7 @@ async def journal_analysis_loop(
 
 
 async def weekly_backtest_loop(
-    client: VibeMCPClient,
+    client: Any,
     shared_state: dict[str, Any],
     watchlist: list[str],
     interval_s: float = _BACKTEST_INTERVAL_S,
@@ -125,7 +126,7 @@ async def weekly_backtest_loop(
 
 
 async def pattern_detection_loop(
-    client: VibeMCPClient,
+    client: Any,
     shared_state: dict[str, Any],
     watchlist: list[str],
     interval_s: float = _PATTERN_INTERVAL_S,
@@ -147,7 +148,7 @@ async def pattern_detection_loop(
 
 
 async def factor_analysis_loop(
-    client: VibeMCPClient,
+    client: Any,
     shared_state: dict[str, Any],
     watchlist: list[str],
     interval_s: float = _FACTOR_INTERVAL_S,
@@ -169,7 +170,7 @@ async def factor_analysis_loop(
 
 
 async def shadow_account_loop(
-    client: VibeMCPClient,
+    client: Any,
     shared_state: dict[str, Any],
     interval_s: float = _SHADOW_INTERVAL_S,
 ) -> None:

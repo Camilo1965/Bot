@@ -1,0 +1,18 @@
+18:15:30 | SESSION_START session_id=d022b3672e89 pid=24944 | full JSON: bot_debug.log | esta sesión: logs/last_session.log
++-----------------------------------------------------------------------------+
+|           DESPLIEGUE OPERATIVO AGRESIVO                                     |
+| +------------------------------------------------+                          |
+| | Parametro               |                Valor |                          |
+| |-------------------------+----------------------|                          |
+| | ML BUY threshold (prob) |                 0.55 |                          |
+| | RISK_PER_TRADE (equity) |                 2.0% |                          |
+| | MAX_POSITIONS           |                    2 |                          |
+| | POSITION_TTL_HOURS      |                 12.0 |                          |
+| | BASE_SL (initial)       |                 2.5% |                          |
+| | Watchlist -> MT5        | BTC/USDT -> BTCUSD-T |                          |
+| +------------------------------------------------+                          |
++-----------------------------------------------------------------------------+
+[05/13/26 18:15:35] WARNING  [MT5][DB] close_trade skipped for numeric         
+                             trade_id=222 (not in DB).                         
+[05/13/26 18:15:37] WARNING  [RIESGO] Perfil ETH/USDT 15m - valores activos    
+                             prob>=0.55 risk=2.0%.                             

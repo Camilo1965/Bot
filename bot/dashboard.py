@@ -1,4 +1,4 @@
-"""Rich mega-dashboard — professional crypto trading terminal aesthetic.
+"""Rich mega-dashboard - professional crypto trading terminal aesthetic.
 
 Dense, information-rich layout inspired by Bloomberg/TradingView terminals.
 Color language: cyan=system, green=positive, red=negative, yellow=caution,

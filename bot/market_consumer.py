@@ -24,7 +24,7 @@ async def market_consumer(
         msg = await queue.get()
         _count += 1
         sym = msg["symbol"]
-        # MT5 feed emits trade (price), order_book (bids/asks), kline (OHLC) — not all have "price".
+        # MT5 feed emits trade (price), order_book (bids/asks), kline (OHLC) - not all have "price".
         mtype = msg.get("type", "trade")
         if mtype == "kline":
             price = float(msg.get("close") or msg.get("open") or 0.0)

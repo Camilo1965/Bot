@@ -153,7 +153,7 @@ async def cmd_smoke(args: argparse.Namespace) -> int:
 
     # Override risk_pct from CLI when provided
     risk_pct = args.risk_pct
-    ex._risk_pct = risk_pct  # noqa: SLF001 — smoke harness matches user's intent
+    ex._risk_pct = risk_pct  # noqa: SLF001 - smoke harness matches user's intent
 
     sym = args.symbol.strip()
     bad = ex.validate_symbol_mapping([sym])
@@ -169,7 +169,7 @@ async def cmd_smoke(args: argparse.Namespace) -> int:
         return 1
 
     if not mt5.symbol_select(mt5_sym, True):
-        logger.error("symbol_select(%s) failed — enable symbol in Market Watch.", mt5_sym)
+        logger.error("symbol_select(%s) failed - enable symbol in Market Watch.", mt5_sym)
         shutdown_mt5()
         return 1
 
@@ -188,7 +188,7 @@ async def cmd_smoke(args: argparse.Namespace) -> int:
     sl_raw = bid * (1.0 - args.sl_pct)
     sl_price, adjusted = ex._clamp_stop_loss_buy(mt5_sym, sl_raw, ask, tick, digits)  # noqa: SLF001
     if sl_price is None:
-        logger.error("Could not clamp SL — abort.")
+        logger.error("Could not clamp SL - abort.")
         shutdown_mt5()
         return 1
     if adjusted:
@@ -215,7 +215,7 @@ async def cmd_smoke(args: argparse.Namespace) -> int:
     )
 
     if args.dry_run:
-        logger.info("Dry run — not sending.")
+        logger.info("Dry run - not sending.")
         shutdown_mt5()
         return 0
 
@@ -252,7 +252,7 @@ async def cmd_smoke(args: argparse.Namespace) -> int:
     ticket = await _await_bot_position(mt5_sym, ex._magic)  # noqa: SLF001
     if ticket is None:
         logger.warning(
-            "Could not find position with bot magic=%s — check MT5 (manual magic / overlap).",
+            "Could not find position with bot magic=%s - check MT5 (manual magic / overlap).",
             ex._magic,  # noqa: SLF001
         )
         shutdown_mt5()
@@ -284,7 +284,7 @@ async def cmd_smoke(args: argparse.Namespace) -> int:
 
     ok = await ex.close_position_by_ticket(ticket)
     if not ok:
-        logger.error("close_position_by_ticket failed — close manually ticket=%s", ticket)
+        logger.error("close_position_by_ticket failed - close manually ticket=%s", ticket)
         shutdown_mt5()
         try:
             await close_db()

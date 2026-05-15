@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from vibe.mcp_client import VibeMCPClient
+from typing import Any
 
 logger = logging.getLogger("clawdbot.vibe.pattern")
 
@@ -32,7 +32,7 @@ async def _export_ohlcv_to_run_dir(symbol: str, run_dir: Path) -> Path | None:
 
     rows = await db.fetch_market_data_ohlcv(symbol=symbol, limit=_MAX_OHLCV_ROWS)
     if not rows:
-        logger.warning("[VIBE] No DB data for %s — cannot export.", symbol)
+        logger.warning("[VIBE] No DB data for %s - cannot export.", symbol)
         return None
 
     artifacts_dir = run_dir / "artifacts"
@@ -59,7 +59,7 @@ async def _export_ohlcv_to_run_dir(symbol: str, run_dir: Path) -> Path | None:
 
 
 async def detect_patterns(
-    client: VibeMCPClient,
+    client: Any,
     symbol: str,
     timeframe: str = "15m",
 ) -> dict[str, Any] | None:

@@ -332,7 +332,7 @@ def is_extreme_macro_veto(state: dict[str, Any]) -> bool:
     elif "negative" in factor_text and "predictive" in factor_text:
         signals += 1
 
-    # 3. Patrones extremos en múltiples símbolos (≥2)
+    # 3. Patrones extremos en múltiples símbolos (>=2)
     extreme_pattern_count = 0
     for sym, data in (vibe_patterns or {}).items():
         txt = _extract_text(data)

@@ -13,9 +13,9 @@ try:
 except ImportError:
     _load_env_file = None  # type: ignore[assignment]
 
-# Embedded markdown max size (chars) before truncate — evita .md imposible de pegar.
+# Embedded markdown max size (chars) before truncate - evita .md imposible de pegar.
 _MAX_EMBED_CHARS = 3_500_000
-# bot_debug día completo (todos los niveles) puede ser grande — límite aparte.
+# bot_debug día completo (todos los niveles) puede ser grande - límite aparte.
 _MAX_EMBED_BOT_DEBUG = 4_500_000
 
 
@@ -131,7 +131,7 @@ def _parse_runtime_jsonl(path: Path, max_lines: int = 250) -> tuple[str, dict]:
         "symbols_ever_open": set(),
     }
     if not path.is_file():
-        return "(no existe runtime_metrics.jsonl — arranca el bot con métricas activas)\n", stats
+        return "(no existe runtime_metrics.jsonl - arranca el bot con métricas activas)\n", stats
 
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     stats["lines_total"] = len(lines)
@@ -309,8 +309,8 @@ def write_diagnostic_bundle(
     Parameters
     ----------
     mode:
-        ``snapshot`` — colas cortas (comportamiento anterior).
-        ``full_day`` — todo el ``runtime_metrics.jsonl`` del día local (``REPORT_TIMEZONE``)
+        ``snapshot`` - colas cortas (comportamiento anterior).
+        ``full_day`` - todo el ``runtime_metrics.jsonl`` del día local (``REPORT_TIMEZONE``)
         + ``bot_debug`` de ese día (por defecto **todos** los niveles JSON: INFO/DEBUG/WARNING/ERROR).
     report_date:
         Día a exportar en modo ``full_day`` (default: hoy en zona de informe).
@@ -336,12 +336,12 @@ def write_diagnostic_bundle(
 
     parts: list[str] = []
     title = (
-        "# ClawdBot — revisión **día completo**\n"
+        "# ClawdBot - revisión **día completo**\n"
         if mode == "full_day"
-        else "# ClawdBot — paquete único para revisión (IA / humano)\n"
+        else "# ClawdBot - paquete único para revisión (IA / humano)\n"
     )
     parts.append(title)
-    parts.append(f"_Generado: `{now}` — repo: `{repo_root.resolve()}`_\n")
+    parts.append(f"_Generado: `{now}` - repo: `{repo_root.resolve()}`_\n")
     if mode == "full_day":
         parts.append(
             f"_**Día local** (`REPORT_TIMEZONE={tz.key}`): **{target_d.isoformat()}**_\n\n"
@@ -391,11 +391,11 @@ def write_diagnostic_bundle(
                 "Revisá `--date` y zona; si el bot no estuvo activo, es esperable.\n"
             )
         if truncated:
-            parts.append("- **Texto JSONL truncado** en este .md — ver archivo fuente.\n")
+            parts.append("- **Texto JSONL truncado** en este .md - ver archivo fuente.\n")
         lvl_parts = ", ".join(f"{k}: **{v}**" for k, v in sorted(bd_counts.items()))
         parts.append(
-            f"- JSON `bot_debug` — fuente {bd_source_label} — líneas con `timestamp` ese día: **{bd_n}**"
-            + (f" — niveles: {lvl_parts}" if lvl_parts else "")
+            f"- JSON `bot_debug` - fuente {bd_source_label} - líneas con `timestamp` ese día: **{bd_n}**"
+            + (f" - niveles: {lvl_parts}" if lvl_parts else "")
             + ".\n"
         )
         ls_path = logs_dir / "last_session.log"
@@ -413,7 +413,7 @@ def write_diagnostic_bundle(
                 )
         if bd_trunc:
             parts.append(
-                "- **Texto embebido de `bot_debug` truncado** — abrí `bot_debug.log` local si necesitás el día completo.\n"
+                "- **Texto embebido de `bot_debug` truncado** - abrí `bot_debug.log` local si necesitás el día completo.\n"
             )
         parts.append(f"- Modo inclusión bot_debug: **{bd_mode_lbl}**.\n")
         parts.append("\n")
@@ -432,7 +432,7 @@ def write_diagnostic_bundle(
         parts.append(f"\n## 5) `runtime_metrics.jsonl` **completo del día** ({target_d})\n")
         parts.append("```text\n" + metrics_day + "```\n")
         parts.append(
-            f"\n## 6) `bot_debug` — día {target_d} ({bd_mode_lbl}) — {bd_source_label}\n"
+            f"\n## 6) `bot_debug` - día {target_d} ({bd_mode_lbl}) - {bd_source_label}\n"
         )
         parts.append("```text\n" + bd_body + "```\n")
 
@@ -514,7 +514,7 @@ def write_diagnostic_bundle(
         parts.append("```text\n" + _tail_text(logs_dir / "last_session.log", 200) + "```\n")
 
         _bd_snap, _bd_lbl = _resolve_bot_debug_path(repo_root)
-        parts.append(f"\n## 7) ERROR / WARNING en `bot_debug` — {_bd_lbl} (filtrado)\n")
+        parts.append(f"\n## 7) ERROR / WARNING en `bot_debug` - {_bd_lbl} (filtrado)\n")
         parts.append("```text\n" + _filter_bot_debug_warnings(_bd_snap) + "```\n")
 
         parts.append("\n## 8) `audit.log` (últimas 120 líneas)\n")

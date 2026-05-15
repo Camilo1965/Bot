@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,7 +20,9 @@ from database.db_manager import db
 from execution.paper_executor import PaperExecutor
 from strategy.feature_engineer import FeatureEngineer
 from strategy.quant_features import MIN_OHLC_ROWS
-from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, get_symbol_config
+from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, get_symbol_config, model_json_path_for_symbol
+from strategy.regime_predictor import predict_regime
+from bot.observability import SignalMetrics, TradeMetrics, ExitMetrics, get_buffer
 from vibe.decision_bridge import (
     check_vibe_force_exit,
     compute_entry_score,
@@ -247,7 +250,7 @@ async def signal_emitter(
 
             if len(prices) < MIN_OHLC_ROWS:
                 logger.debug(
-                    "⏳ [AI WARMUP] %s – Recopilando datos... (%d/%d barras necesarias)",
+                    "⏳ [AI WARMUP] %s - Recopilando datos... (%d/%d barras necesarias)",
                     symbol,
                     len(prices),
                     MIN_OHLC_ROWS,
@@ -266,7 +269,7 @@ async def signal_emitter(
             if current_atr is not None:
                 state.setdefault("atrs", {})[symbol] = current_atr
                 logger.debug(
-                    "📐 [ATR] %s – ATR_14=%.4f", symbol, current_atr
+                    "📐 [ATR] %s - ATR_14=%.4f", symbol, current_atr
                 )
             else:
                 current_atr = state.get("atrs", {}).get(symbol)
@@ -297,11 +300,17 @@ async def signal_emitter(
                 )
                 full_features = (q_feat or []) + (vibe_vec or [0.0, 0.0, 1.0, 0.5])
                 
-                asyncio.create_task(
-                    _fetch_vibe_mcp_decision(http_session, full_features, ohlcv_list, symbol)
-                )
+                # Fire-and-forget with safe exception logging
+                async def _safe_vibe_fetch() -> None:
+                    try:
+                        await _fetch_vibe_mcp_decision(http_session, full_features, ohlcv_list, symbol)
+                    except Exception as _vibe_exc:
+                        logger.debug("[VIBE MCP] background fetch failed: %s", _vibe_exc)
+
+                asyncio.create_task(_safe_vibe_fetch())
 
             # Single-pass prediction
+            _t0_pred = time.time()
             signal, win_prob = predictor.generate_signal(
                 prices,
                 0.0,
@@ -313,11 +322,25 @@ async def signal_emitter(
                 symbol=symbol,
                 vibe_features=vibe_vec,
             )
+            _pred_latency_ms = (time.time() - _t0_pred) * 1000.0
             state["ml_signals"][symbol] = signal
             # Store the latest ML confidence so dashboard_logger can display it.
             state["ml_probs"][symbol] = win_prob
 
-            # [VIBE] Log pattern recognition overlay (INFORMATIONAL — does NOT gate entries)
+            # Observability: emit signal metrics
+            get_buffer().emit_signal(
+                SignalMetrics(
+                    symbol=symbol,
+                    timestamp=time.time(),
+                    latency_ms=round(_pred_latency_ms, 2),
+                    probability=round(win_prob, 4),
+                    signal=signal,
+                    features_valid=True,
+                    model_used=model_json_path_for_symbol(symbol).name,
+                )
+            )
+
+            # [VIBE] Log pattern recognition overlay (INFORMATIONAL - does NOT gate entries)
             vibe_pattern = state.get("vibe_patterns", {}).get(symbol)
             if vibe_pattern:
                 _pdesc = _extract_vibe_pattern_text(vibe_pattern)
@@ -325,7 +348,7 @@ async def signal_emitter(
                     logger.warning("🔍 [VIBE] %s pattern: %s", symbol, _pdesc)
 
             logger.debug(
-                "🧠 [AI THOUGHT] %s – Signal: %s | Confidence: %.2f%% | Prices in buffer: %d",
+                "🧠 [AI THOUGHT] %s - Signal: %s | Confidence: %.2f%% | Prices in buffer: %d",
                 symbol,
                 signal,
                 win_prob * 100,
@@ -333,7 +356,7 @@ async def signal_emitter(
             )
 
             # ------------------------------------------------------------------
-            # [SMART EXIT] Layers 1 + 4 – ML Exhaustion & TTL
+            # [SMART EXIT] Layers 1 + 4 - ML Exhaustion & TTL
             # ------------------------------------------------------------------
             # For every open position evaluate whether the current ML signal
             # warrants an early exit (trend reversal) or the TTL has elapsed.
@@ -347,7 +370,7 @@ async def signal_emitter(
                     current_price = prices[-1]
 
                 # ------------------------------------------------------------------
-                # [VIBE FASE 3] Exit Augmentation — EMERGENCY (antes que ML exit)
+                # [VIBE FASE 3] Exit Augmentation - EMERGENCY (antes que ML exit)
                 # ------------------------------------------------------------------
                 if os.environ.get("VIBE_FORCE_EXIT") == "1":
                     vibe_reason = check_vibe_force_exit(state, symbol)
@@ -385,7 +408,7 @@ async def signal_emitter(
                             smart_pnl,
                             paper_executor.total_pnl,
                         )
-                        # Position was closed – skip the BUY entry logic below.
+                        # Position was closed - skip the BUY entry logic below.
                         continue
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -395,8 +418,45 @@ async def signal_emitter(
                         DEBUG_LOG_HINT,
                     )
 
+                # [REGIME] Close open positions if market enters ranging regime
+                if os.environ.get("REGIME_FILTER_ENABLED", "1").strip() in ("1", "true", "yes"):
+                    regime_result = predict_regime(symbol, prices, highs=highs, lows=lows, volumes=volumes)
+                    if regime_result is not None:
+                        regime, regime_prob = regime_result
+                        if regime == "RANGING":
+                            logger.warning(
+                                "[REGIME] Closing %s position: market entered RANGING (prob=%.2f)",
+                                symbol, regime_prob,
+                            )
+                            close_pnl = await paper_executor._close_position(
+                                symbol, current_price, "REGIME_RANGING"
+                            )
+                            logger.info(
+                                "[REGIME] Position %s closed. PnL=%.4f", symbol, close_pnl or 0.0
+                            )
+                            continue
+
             # ------------------------------------------------------------------
-            # [VIBE FASE 1] Gating de entradas — Veto Probabilístico Híbrido
+            # [REGIME] Filter new entries by market regime
+            # ------------------------------------------------------------------
+            regime_gate_passed = True
+            regime_str = "UNKNOWN"
+            regime_prob = 0.0
+            if os.environ.get("REGIME_FILTER_ENABLED", "1").strip() in ("1", "true", "yes"):
+                regime_result = predict_regime(symbol, prices, highs=highs, lows=lows, volumes=volumes)
+                if regime_result is not None:
+                    regime_str, regime_prob = regime_result
+                    if regime_str == "RANGING":
+                        regime_gate_passed = False
+                        logger.info(
+                            "[REGIME] Entry blocked for %s: market is RANGING (prob=%.2f)",
+                            symbol, regime_prob,
+                        )
+                else:
+                    logger.debug("[REGIME] No regime model available for %s", symbol)
+
+            # ------------------------------------------------------------------
+            # [VIBE FASE 1] Gating de entradas - Veto Probabilístico Híbrido
             # ------------------------------------------------------------------
             # Se evalúa DESPUÉS del smart-exit para que posiciones abiertas
             # sigan gestionándose independientemente del gating de nuevas entradas.
@@ -417,7 +477,7 @@ async def signal_emitter(
                     )
                 signal = gated_signal
 
-            if signal == "BUY" and prices:
+            if signal == "BUY" and prices and regime_gate_passed:
                 # [VIBE FASE 2] Sizing dinámico por calidad del setup
                 _vibe_adj = os.environ.get("VIBE_ADJUST_SIZE", "1").strip()
                 if _vibe_adj not in ("1", "true", "yes"):
@@ -446,7 +506,7 @@ async def signal_emitter(
                     )
                     if not opened:
                         logger.debug(
-                            "BUY signal ignored for %s – position already open, "
+                            "BUY signal ignored for %s - position already open, "
                             "max positions reached, or insufficient balance.",
                             symbol,
                         )
@@ -459,7 +519,7 @@ async def signal_emitter(
                 # This branch documents intent and aids debugging when the model
                 # flips bearish but the confidence gate leaves the trade open.
                 logger.debug(
-                    "[LONG_ONLY] Model SELL for %s — exit relies on smart-exit/TTL/SL "
+                    "[LONG_ONLY] Model SELL for %s - exit relies on smart-exit/TTL/SL "
                     "(check_ml_exit already evaluated this cycle).",
                     symbol,
                 )

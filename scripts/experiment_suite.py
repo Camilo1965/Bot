@@ -174,7 +174,7 @@ def main():
     
     # Save raw results
     out_file = _REPO / "logs" / "experiment_suite_results.json"
-    with open(out_file, "w") as f:
+    with open(out_file, "w", encoding="utf-8") as f:
         json.dump(best_overall, f, indent=2)
     logger.info(f"Full results saved to {out_file}")
 

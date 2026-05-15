@@ -9,7 +9,7 @@ Entry rule
 * ``symbol`` must be in ``ALLOWED_SYMBOLS`` (otherwise **HOLD**).
 * ``probability >= BUY_PROB_THRESHOLD`` (default 0.50 max-performance profile; override ``BUY_PROB_THRESHOLD`` env) → **BUY**, else **HOLD**.
 
-No sentiment, HTF, funding, or regime overrides — the loaded model is the only
+No sentiment, HTF, funding, or regime overrides - the loaded model is the only
 entry gate.  :meth:`MLPredictor.warm_start` still retrains from history when no
 artifact is present; weekly retrainer may refresh the active model path in this file.
 """
@@ -57,41 +57,28 @@ def _float_env(name: str, default: float) -> float:
 SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     "BTC/USDT": {
         "prob_threshold": 0.60,
-        "fixed_sl_pct": 0.02,
+        "fixed_sl_pct": 0.015,      # 1.5% SL (aligned with 1.5% label threshold)
+        "fixed_tp_pct": 0.030,      # 3.0% TP (R:R = 1:2)
         "use_sma_filter": False,
-        "risk": 0.03,
+        "risk": 0.015,              # 1.5% risk per trade (conservative)
         "timeframe": "30m",
         "horizon": 12,
     },
     "ETH/USDT": {
         "prob_threshold": 0.65,
-        "fixed_sl_pct": 0.02,
+        "fixed_sl_pct": 0.015,      # 1.5% SL
+        "fixed_tp_pct": 0.030,      # 3.0% TP
         "use_sma_filter": True,
-        "risk": 0.03,
+        "risk": 0.015,
         "timeframe": "15m",
         "horizon": 8,
     },
-    "SOL/USDT": {
-        "prob_threshold": 0.50,
-        "fixed_sl_pct": 0.03,
-        "use_sma_filter": True,
-        "risk": 0.03,
-        "timeframe": "15m",
-        "horizon": 12,
-    },
-    "DOGE/USDT": {
-        "prob_threshold": 0.55,
-        "fixed_sl_pct": 0.04,
-        "use_sma_filter": False,
-        "risk": 0.02,
-        "timeframe": "30m",
-        "horizon": 12,
-    },
     "XRP/USDT": {
         "prob_threshold": 0.65,
-        "fixed_sl_pct": 0.025,
+        "fixed_sl_pct": 0.015,      # 1.5% SL
+        "fixed_tp_pct": 0.030,      # 3.0% TP
         "use_sma_filter": True,
-        "risk": 0.03,
+        "risk": 0.015,
         "timeframe": "5m",
         "horizon": 4,
     },
@@ -110,9 +97,15 @@ _SELL_SENTIMENT_THRESHOLD = -0.3
 
 
 def model_json_path_for_symbol(symbol: str) -> Path:
-    """``models/BTC_USDT_v1.json`` (legacy) or ``models/BTC_USDT_v2.json`` (VIBE features)."""
-    suffix = "_v2" if _VIBE_ENABLED else "_v1"
-    return MODELS_DIR / f"{symbol.replace('/', '_')}{suffix}.json"
+    """Resolve the newest available model path with fallback chain."""
+    base = MODELS_DIR / symbol.replace("/", "_")
+    candidates = [f"{base}_v3.json", f"{base}_v2.json", f"{base}_v1.json"] if _VIBE_ENABLED else [f"{base}_v2.json", f"{base}_v1.json"]
+    for p in candidates:
+        if Path(p).is_file():
+            return Path(p)
+    # Default to newest version (will fail gracefully later if missing)
+    default_suffix = "_v3" if _VIBE_ENABLED else "_v2"
+    return Path(f"{base}{default_suffix}.json")
 
 
 def get_symbol_config(symbol: str) -> dict[str, Any]:
@@ -164,7 +157,7 @@ _FUNDING_RATE_EXTREME_FEAR = -0.0003   # < this → Long-Bias bonus on BUY
 # Minimum bars for quant feature stack (MACD/BB warm-up)
 _MIN_PRICES_FOR_INFERENCE = MIN_OHLC_ROWS
 
-# Default ADX value used when OHLCV data is unavailable (neutral – no regime)
+# Default ADX value used when OHLCV data is unavailable (neutral - no regime)
 _ADX_NEUTRAL_DEFAULT = 25.0
 
 # HTF trend labels
@@ -190,7 +183,7 @@ def compute_htf_trend(
 
     The trend is considered **bullish** when either of the following holds:
     * The latest close is above the 20-period EMA of all available close prices.
-    * The last two candles are individually bullish (close ≥ open).
+    * The last two candles are individually bullish (close >= open).
 
     The trend is considered **bearish** when:
     * The latest close is below the 20-period EMA, AND
@@ -219,7 +212,7 @@ def compute_htf_trend(
 
     above_ema = current_close > current_ema
 
-    # Check whether the last two candles are bullish (close ≥ open)
+    # Check whether the last two candles are bullish (close >= open)
     last_two_bullish = False
     if opens and len(opens) >= 2 and len(closes) >= 2:
         last_two_bullish = (
@@ -281,7 +274,7 @@ class MLPredictor:
 
         Returns
         -------
-        ``(adx, atr)`` – both are floats; defaults are ``(25.0, 0.0)`` when
+        ``(adx, atr)`` - both are floats; defaults are ``(25.0, 0.0)`` when
         the series is too short to produce a valid result.
         """
         n = len(closes)
@@ -452,7 +445,7 @@ class MLPredictor:
         occurs.
         """
         if not self._is_trained:
-            logger.warning("save_model: model is not trained – nothing to save.")
+            logger.warning("save_model: model is not trained - nothing to save.")
             return False
         path = Path(filepath)
         try:
@@ -580,7 +573,7 @@ class MLPredictor:
             proba: float = float(booster.predict_proba(X)[0][1])
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "predict_proba: XGBoost inference failed (%s) – "
+                "predict_proba: XGBoost inference failed (%s) - "
                 "model may need retraining with the new feature set.",
                 exc,
             )
@@ -611,7 +604,7 @@ class MLPredictor:
         symbol: str = "ETH/USDT",
         vibe_features: list[float] | None = None,
     ) -> tuple[Signal, float]:
-        """BUY only when HTF (precio > SMA200 1h) passes, then ``probability ≥ BUY_PROB_THRESHOLD``.
+        """BUY only when HTF (precio > SMA200 1h) passes, then ``probability >= BUY_PROB_THRESHOLD``.
         
         Returns tuple of (Signal, Probability).
         """
@@ -647,7 +640,7 @@ class MLPredictor:
 
         if cfg["use_sma_filter"] and not htf_sma200_1h_allows_long(prices, base_timeframe_min=tf_min):
             logger.debug(
-                "Signal=HOLD (precio ≤ SMA200 1h) prob=%.4f symbol=%s",
+                "Signal=HOLD (precio <= SMA200 1h) prob=%.4f symbol=%s",
                 probability,
                 symbol,
             )

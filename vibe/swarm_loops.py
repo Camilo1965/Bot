@@ -6,18 +6,18 @@ Background swarm-intelligence loop for VIBE-Trading (Fase 5).
 
 Runs the ``crypto_trading_desk`` swarm preset periodically and stores the
 parsed recommendation in ``shared_state["vibe_swarm_recommendation"]``.
+
+v2 improvements:
+- Passes real OHLCV data and portfolio context to the swarm.
+- Uses semantic consensus from the multi-agent response instead of keyword matching.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-from datetime import datetime, timezone
+import time
 from typing import Any
-
-from vibe.mcp_client import VibeMCPClient
 
 logger = logging.getLogger("clawdbot.vibe.swarm")
 
@@ -25,15 +25,55 @@ _SWARM_BACKOFF_BASE = 2.0
 _SWARM_BACKOFF_MAX = 300.0
 _SWARM_TIMEOUT = 90
 
-# Keywords used to heuristically map swarm text output to a recommendation.
-_STRONG_BUY_KW = {"strong buy", "aggressive long", "conviction buy", "accumulate"}
-_BUY_KW = {"buy", "long", "bullish", "upside", "enter long"}
-_EXIT_KW = {"exit", "close", "sell", "flat", "neutralize", "take profit"}
-_REDUCE_KW = {"reduce", "trim", "scale out", "lighten", "de-risk"}
+
+def _build_ohlcv_for_symbol(state: dict[str, Any], symbol: str) -> list[dict[str, Any]]:
+    """Build OHLCV list from shared_state buffers for the swarm prompt."""
+    prices = list(state.get("prices", {}).get(symbol, []))
+    highs = list(state.get("highs", {}).get(symbol, []))
+    lows = list(state.get("lows", {}).get(symbol, []))
+    volumes = list(state.get("volumes", {}).get(symbol, []))
+    n = min(len(prices), len(highs), len(lows))
+    if n == 0:
+        return []
+    # Use last 30 candles max
+    recent = min(n, 30)
+    out = []
+    for i in range(n - recent, n):
+        out.append({
+            "open": float(prices[i]),
+            "high": float(highs[i]),
+            "low": float(lows[i]),
+            "close": float(prices[i]),
+            "volume": float(volumes[i]) if i < len(volumes) else 0.0,
+        })
+    return out
+
+
+def _build_portfolio_context(state: dict[str, Any]) -> dict[str, Any]:
+    """Extract portfolio snapshot from shared_state."""
+    executor = state.get("paper_executor")
+    risk = state.get("risk_manager")
+    positions = []
+    if executor and hasattr(executor, "open_positions"):
+        for sym, pos in executor.open_positions.items():
+            positions.append({
+                "symbol": sym,
+                "entry_price": float(pos.entry_price),
+                "size": float(pos.position_size),
+                "pnl": float(getattr(pos, "unrealized_pnl", 0.0)),
+            })
+    total_pnl = float(getattr(executor, "total_pnl", 0.0)) if executor else 0.0
+    balance = float(risk.balance) if risk and hasattr(risk, "balance") else 0.0
+    return {
+        "open_positions": positions,
+        "position_count": len(positions),
+        "total_pnl": round(total_pnl, 2),
+        "balance": round(balance, 2),
+    }
 
 
 def _extract_text(data: Any) -> str:
-    """Extract plain text from an MCP response dict."""
+    """Extract plain text from an MCP-style response dict."""
     if data is None:
         return ""
     if isinstance(data, str):
@@ -50,16 +90,26 @@ def _extract_text(data: Any) -> str:
 def parse_swarm_recommendation(result: dict | None) -> str:
     """Map a raw swarm result to one of five recommendation levels.
 
-    Returns one of: ``STRONG_BUY``, ``BUY``, ``NEUTRAL``, ``REDUCE``, ``EXIT``.
+    Uses the semantic consensus field when available, falling back to
+    keyword matching only when necessary.
     """
     if result is None:
         return "NEUTRAL"
 
-    text = _extract_text(result)
-    if not text:
-        return "NEUTRAL"
+    # Prefer direct consensus from multi-agent swarm
+    consensus = str(result.get("consensus", "")).upper()
+    if consensus and consensus in ("STRONG_BUY", "BUY", "REDUCE", "EXIT"):
+        return consensus
 
-    # Score each category by keyword count
+    # Fallback: keyword matching on the final report text or legacy content
+    text = str(result.get("final_report", "")).lower()
+    if not text:
+        text = _extract_text(result)
+    _STRONG_BUY_KW = {"strong buy", "aggressive long", "conviction buy", "accumulate"}
+    _BUY_KW = {"buy", "long", "bullish", "upside", "enter long"}
+    _EXIT_KW = {"exit", "close", "sell", "flat", "neutralize", "take profit"}
+    _REDUCE_KW = {"reduce", "trim", "scale out", "lighten", "de-risk"}
+
     strong_buy = sum(1 for kw in _STRONG_BUY_KW if kw in text)
     buy = sum(1 for kw in _BUY_KW if kw in text)
     exit_s = sum(1 for kw in _EXIT_KW if kw in text)
@@ -78,15 +128,15 @@ def parse_swarm_recommendation(result: dict | None) -> str:
 
 
 async def crypto_desk_swarm_loop(
-    client: VibeMCPClient,
+    client: Any,
     shared_state: dict[str, Any],
     watchlist: list[str],
     interval_s: float = 3600,
     initial_delay_s: float = 120.0,
 ) -> None:
-    """Hourly: run ``crypto_trading_desk`` swarm for each symbol and store recommendation."""
+    """Hourly: run ``crypto_trading_desk`` swarm for each symbol with real data."""
     if not client.available:
-        logger.info("[VIBE SWARM] Client not available — swarm loop disabled.")
+        logger.info("[VIBE SWARM] Client not available - swarm loop disabled.")
         return
 
     if initial_delay_s > 0:
@@ -96,15 +146,29 @@ async def crypto_desk_swarm_loop(
     while True:
         for symbol in watchlist:
             try:
+                ohlcv = _build_ohlcv_for_symbol(shared_state, symbol)
+                portfolio = _build_portfolio_context(shared_state)
+                # Use ML probability as a feature hint if available
+                ml_prob = shared_state.get("ml_probs", {}).get(symbol, 0.5)
+                features = [ml_prob] + [0.0] * 23  # minimal feature vector
+
                 result = await client.run_swarm(
                     preset="crypto_trading_desk",
                     variables={"asset": symbol, "timeframe": "1h"},
                     timeout=_SWARM_TIMEOUT,
+                    features=features,
+                    ohlcv=ohlcv,
+                    portfolio=portfolio,
                 )
                 if result is not None:
                     rec = parse_swarm_recommendation(result)
                     shared_state.setdefault("vibe_swarm_recommendation", {})[symbol] = rec
-                    logger.info("[VIBE SWARM] %s recommendation: %s", symbol, rec)
+                    logger.info(
+                        "[VIBE SWARM] %s recommendation: %s (confidence=%.2f)",
+                        symbol,
+                        rec,
+                        result.get("confidence", 0.5),
+                    )
                     failures = 0
                 else:
                     failures += 1

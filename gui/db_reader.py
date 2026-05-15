@@ -132,11 +132,11 @@ class DBReaderThread(QThread):
     Signals
     -------
     data_ready : emitted on each successful poll with a dict containing keys:
-        ``ohlcv``         – list of dicts {bucket, open, high, low, close, volume}
-        ``total_pnl``     – float, total realised PnL of closed trades
-        ``active_trades`` – list of dicts describing open positions
-        ``sentiment``     – float | None, latest sentiment score
-        ``trades``        – list of dicts {symbol, entry_price, entry_time,
+        ``ohlcv``         - list of dicts {bucket, open, high, low, close, volume}
+        ``total_pnl``     - float, total realised PnL of closed trades
+        ``active_trades`` - list of dicts describing open positions
+        ``sentiment``     - float | None, latest sentiment score
+        ``trades``        - list of dicts {symbol, entry_price, entry_time,
                               exit_price, exit_time, status} for chart markers
     error      : emitted when a database error occurs (str message).
     log_message: emitted when the worker has a status message for the log panel.
@@ -248,7 +248,7 @@ class DBReaderThread(QThread):
         sentiment_row = await conn.fetchrow(_LATEST_SENTIMENT_QUERY)
         marker_rows = await conn.fetch(_TRADES_MARKERS_QUERY, self.symbol)
 
-        # HTF trend statuses – may not exist if the trading engine has not
+        # HTF trend statuses - may not exist if the trading engine has not
         # written any rows yet, so we handle missing tables gracefully.
         htf_trend_rows: list[Any] = []
         try:

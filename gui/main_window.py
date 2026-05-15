@@ -190,7 +190,7 @@ def _make_section_label(text: str) -> QLabel:
     return lbl
 
 
-def _make_card(label: str, initial_value: str = "—") -> tuple[QFrame, QLabel]:
+def _make_card(label: str, initial_value: str = "-") -> tuple[QFrame, QLabel]:
     """Return a dark card frame and its mutable value label."""
     frame = QFrame()
     frame.setObjectName("card")
@@ -210,7 +210,7 @@ def _make_card(label: str, initial_value: str = "—") -> tuple[QFrame, QLabel]:
 
 
 # ---------------------------------------------------------------------------
-# TimeAxisItem – HH:MM labels for the X axis
+# TimeAxisItem - HH:MM labels for the X axis
 # ---------------------------------------------------------------------------
 
 
@@ -344,7 +344,7 @@ class CandlestickItem(pg.GraphicsObject):
 
 
 # ---------------------------------------------------------------------------
-# PnLLabel – QLabel with a pyqtProperty-driven text colour
+# PnLLabel - QLabel with a pyqtProperty-driven text colour
 # ---------------------------------------------------------------------------
 
 
@@ -381,7 +381,7 @@ class PnLLabel(QLabel):
     # ── Convenience ──────────────────────────────────────────────────────
 
     def setPnlValue(self, value: float) -> None:  # noqa: N802
-        """Update text and colour for a PnL value (neon-green ≥ 0, crimson < 0)."""
+        """Update text and colour for a PnL value (neon-green >= 0, crimson < 0)."""
         sign = "+" if value >= 0 else ""
         self.setText(f"{sign}{value:.2f}")
         self.textColor = QColor("#00FF88") if value >= 0 else QColor("#DC143C")
@@ -407,7 +407,7 @@ def _make_pnl_card(label: str, initial_value: str = "0.00") -> tuple[QFrame, PnL
 
 
 # ---------------------------------------------------------------------------
-# SentimentGaugeItem – arc-gauge / speedometer (pg.GraphicsObject)
+# SentimentGaugeItem - arc-gauge / speedometer (pg.GraphicsObject)
 # ---------------------------------------------------------------------------
 
 
@@ -417,9 +417,9 @@ class SentimentGaugeItem(pg.GraphicsObject):
     The gauge is drawn as a semicircle (top half of a unit circle centred at
     the origin) with three colour-coded zones:
 
-    * 0° – 60°   → green  (positive sentiment)
-    * 60° – 120° → yellow (neutral)
-    * 120° – 180° → red   (negative sentiment)
+    * 0° - 60°   → green  (positive sentiment)
+    * 60° - 120° → yellow (neutral)
+    * 120° - 180° → red   (negative sentiment)
 
     A glowing needle rotates from 180° (most negative) through 90° (neutral)
     to 0° (most positive).
@@ -460,13 +460,13 @@ class SentimentGaugeItem(pg.GraphicsObject):
         # Angles correspond to the arc's mathematical angle convention (y-up):
         #   0° = right (most positive), 90° = top (neutral), 180° = left (most negative)
         # In Qt clockwise terms, these map to: 0°→0°, 60°→-60°, 120°→-120°, 180°→-180°
-        p.setPen(pg.mkPen(QColor(0, 200, 80, 180), width=5))    # green  0°–60°
+        p.setPen(pg.mkPen(QColor(0, 200, 80, 180), width=5))    # green  0°-60°
         p.drawArc(arc_rect, 0 * 16, -60 * 16)
 
-        p.setPen(pg.mkPen(QColor(255, 220, 0, 180), width=5))   # yellow 60°–120°
+        p.setPen(pg.mkPen(QColor(255, 220, 0, 180), width=5))   # yellow 60°-120°
         p.drawArc(arc_rect, -60 * 16, -60 * 16)
 
-        p.setPen(pg.mkPen(QColor(220, 50, 50, 180), width=5))   # red    120°–180°
+        p.setPen(pg.mkPen(QColor(220, 50, 50, 180), width=5))   # red    120°-180°
         p.drawArc(arc_rect, -120 * 16, -60 * 16)
 
         # ── Needle ────────────────────────────────────────────────────
@@ -512,7 +512,7 @@ class SentimentGaugeItem(pg.GraphicsObject):
 
 
 # ---------------------------------------------------------------------------
-# SentimentGaugeWidget – thin QWidget wrapper embedding the gauge in a card
+# SentimentGaugeWidget - thin QWidget wrapper embedding the gauge in a card
 # ---------------------------------------------------------------------------
 
 
@@ -554,7 +554,7 @@ class SentimentGaugeWidget(QWidget):
         self._gauge = SentimentGaugeItem()
         self._plot.addItem(self._gauge)
 
-        self._value_text = pg.TextItem(text="—", anchor=(0.5, 0.5), color="#8b949e")
+        self._value_text = pg.TextItem(text="-", anchor=(0.5, 0.5), color="#8b949e")
         self._value_text.setFont(QFont("Consolas", 9))
         self._value_text.setPos(0.0, -0.22)
         self._plot.addItem(self._value_text)
@@ -564,7 +564,7 @@ class SentimentGaugeWidget(QWidget):
     def setValue(self, value: float | None) -> None:  # noqa: N802
         if value is None:
             self._gauge.setValue(0.0)
-            self._value_text.setText("—")
+            self._value_text.setText("-")
             self._value_text.setColor("#8b949e")
         else:
             self._gauge.setValue(value)
@@ -579,7 +579,7 @@ class SentimentGaugeWidget(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# TrendRadarWidget – LED indicators for the MTA Trend Radar
+# TrendRadarWidget - LED indicators for the MTA Trend Radar
 # ---------------------------------------------------------------------------
 
 
@@ -665,7 +665,7 @@ class TrendRadarWidget(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Left pane – watchlist
+# Left pane - watchlist
 # ---------------------------------------------------------------------------
 
 
@@ -743,7 +743,7 @@ class WatchlistPane(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Centre pane – candlestick chart
+# Centre pane - candlestick chart
 # ---------------------------------------------------------------------------
 
 
@@ -766,7 +766,7 @@ class ChartPane(QWidget):
         self._graphics_layout = pg.GraphicsLayoutWidget()
         layout.addWidget(self._graphics_layout)
 
-        # Price chart – use a custom TimeAxisItem for the bottom axis.
+        # Price chart - use a custom TimeAxisItem for the bottom axis.
         time_axis = TimeAxisItem(orientation="bottom")
         time_axis.setStyle(tickFont=QFont("Consolas", 9))
         self._price_plot: pg.PlotItem = self._graphics_layout.addPlot(
@@ -800,7 +800,7 @@ class ChartPane(QWidget):
         self._price_plot.addItem(self._buy_markers)
         self._price_plot.addItem(self._sell_markers)
 
-        # Volume chart (smaller, below price) – use TimeAxisItem for HH:MM labels
+        # Volume chart (smaller, below price) - use TimeAxisItem for HH:MM labels
         self._graphics_layout.nextRow()
         vol_time_axis = TimeAxisItem(orientation="bottom")
         vol_time_axis.setStyle(tickFont=QFont("Consolas", 9))
@@ -817,7 +817,7 @@ class ChartPane(QWidget):
 
         # Empty-state annotation
         self._no_data_text = pg.TextItem(
-            "No data – waiting for TimescaleDB…",
+            "No data - waiting for TimescaleDB…",
             anchor=(0.5, 0.5),
             color="#8b949e",
         )
@@ -920,13 +920,13 @@ class ChartPane(QWidget):
             exit_time_val = trade.get("exit_time")
             exit_price = trade.get("exit_price")
 
-            # BUY marker – below the candle low at entry time.
+            # BUY marker - below the candle low at entry time.
             entry_candle = _nearest_candle(entry_time_val)
             if entry_candle is not None:
                 buy_xs.append(entry_candle["t"])
                 buy_ys.append(entry_candle["low"] * (1.0 - _MARKER_OFFSET_PCT))
 
-            # SELL / trailing-stop marker – above the candle high at exit time.
+            # SELL / trailing-stop marker - above the candle high at exit time.
             if exit_time_val is not None and exit_price is not None:
                 exit_candle = _nearest_candle(exit_time_val)
                 if exit_candle is not None:
@@ -944,7 +944,7 @@ class ChartPane(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Right pane – log viewer
+# Right pane - log viewer
 # ---------------------------------------------------------------------------
 
 
@@ -1061,7 +1061,7 @@ class MainWindow(QMainWindow):
         self._db_reader.start()
 
         ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
-        self._log_pane.append(f"[{ts}] Dashboard started – connecting to TimescaleDB…")
+        self._log_pane.append(f"[{ts}] Dashboard started - connecting to TimescaleDB…")
 
     # ------------------------------------------------------------------
     # Slots
@@ -1107,7 +1107,7 @@ class MainWindow(QMainWindow):
             self._db_reader.request_emergency_stop()
             ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
             self._log_pane.append_error(
-                f"[{ts}] ⚠ EMERGENCY STOP issued – liquidating all positions…"
+                f"[{ts}] ⚠ EMERGENCY STOP issued - liquidating all positions…"
             )
 
     # ------------------------------------------------------------------

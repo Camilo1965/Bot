@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
-from vibe.mcp_client import VibeMCPClient
+from typing import Any
 
 logger = logging.getLogger("clawdbot.vibe.backtest")
 
@@ -57,7 +57,7 @@ def signal(df):
 
 
 async def run_backtest(
-    client: VibeMCPClient,
+    client: Any,
     symbol: str,
     source: str = "ccxt",
     days_back: int = 30,

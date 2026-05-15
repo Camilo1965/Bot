@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""
+scripts/backtest_full_bot.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Backtesting COMPLETO del bot ClawdBot v2 con:
+- Regime prediction (TRENDING vs RANGING)
+- XGBoost direction prediction
+- Risk manager (sizing, max positions, daily loss limit)
+- Execution (SL, TP ATR-based, trailing stop, TTL)
+- Vibe gating (simplificado)
+
+Out-of-sample: entrena en 70%, backtestea en 30%.
+Compara: bot completo vs sin regime vs buy-and-hold.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score, roc_auc_score
+from xgboost import XGBClassifier
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from scripts.deep_strategy_audit import fetch_ohlcv_ccxt
+from strategy.quant_features import QUANT_FEATURE_COLS, add_quant_features, forward_return_label, DEFAULT_LABEL_ROUND_TRIP
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger("backtest_full_bot")
+
+# ── Configuración del bot ────────────────────────────────────────────────────
+INITIAL_BALANCE = 10_000.0
+MAX_POSITIONS = 2
+RISK_PER_TRADE = 0.03
+LEVERAGE = 5
+TTL_HOURS = 12.0
+TP_ATR_MULT = 2.5
+ACTIVATION_PCT = 0.02
+TRAILING_DISTANCE = 0.02
+DAILY_LOSS_LIMIT = 0.03
+
+SYMBOL_CONFIG = {
+    "BTC/USDT": {"prob_threshold": 0.60, "fixed_sl_pct": 0.02, "risk": 0.03, "timeframe": "30m", "horizon": 12},
+    "ETH/USDT": {"prob_threshold": 0.65, "fixed_sl_pct": 0.02, "risk": 0.03, "timeframe": "15m", "horizon": 8},
+    "XRP/USDT": {"prob_threshold": 0.65, "fixed_sl_pct": 0.025, "risk": 0.03, "timeframe": "5m", "horizon": 4},
+}
+
+
+# ── Dataclasses ──────────────────────────────────────────────────────────────
+
+@dataclass
+class OpenPosition:
+    symbol: str
+    entry_time: pd.Timestamp
+    entry_price: float
+    position_size: float  # notional en USD
+    sl_price: float
+    tp_price: float | None
+    peak_price: float
+    current_stop: float
+    ml_confidence: float
+    regime_prob: float
+    ttl_hours: float = TTL_HOURS
+    close_reason: str | None = None
+    exit_price: float | None = None
+    exit_time: pd.Timestamp | None = None
+    pnl_usd: float = 0.0
+    pnl_pct: float = 0.0
+
+
+@dataclass
+class BacktestState:
+    balance: float = INITIAL_BALANCE
+    equity: float = INITIAL_BALANCE
+    total_pnl: float = 0.0
+    open_positions: dict[str, OpenPosition] = field(default_factory=dict)
+    closed_trades: list[OpenPosition] = field(default_factory=list)
+    daily_loss: float = 0.0
+    current_day: pd.Timestamp | None = None
+    max_drawdown: float = 0.0
+    peak_equity: float = INITIAL_BALANCE
+    n_trades: int = 0
+    n_wins: int = 0
+    n_losses: int = 0
+    gross_wins: float = 0.0
+    gross_losses: float = 0.0
+
+
+# ── Modelos ──────────────────────────────────────────────────────────────────
+
+def train_regime_model(df_train: pd.DataFrame, look_ahead: int) -> XGBClassifier:
+    feat = add_quant_features(df_train.copy(), base_timeframe_min=15)
+    feat["future_adx"] = feat["adx"].shift(-look_ahead)
+    feat["label"] = (feat["future_adx"] > 25.0).astype(int)
+    feat = feat[(feat["adx"] > 30) | (feat["adx"] < 20)].copy()
+    feat = feat.dropna(subset=list(QUANT_FEATURE_COLS) + ["label"])
+    if len(feat) < 100:
+        # Fallback: neutral model
+        return XGBClassifier(n_estimators=10, max_depth=2)
+    X = feat[QUANT_FEATURE_COLS].to_numpy(dtype=np.float32)
+    y = feat["label"].to_numpy(dtype=np.int32)
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    spw = max(1.0, n_neg / n_pos) if n_pos > 0 else 1.0
+    model = XGBClassifier(
+        n_estimators=200, max_depth=5, learning_rate=0.08,
+        subsample=0.85, colsample_bytree=0.85,
+        scale_pos_weight=spw, eval_metric="logloss",
+        random_state=42, n_jobs=-1,
+    )
+    model.fit(X, y)
+    return model
+
+
+LABEL_THRESHOLD: float = float(os.environ.get("BACKTEST_LABEL_THRESHOLD", "0.015"))  # 1.5% default
+
+def train_direction_model(df_train: pd.DataFrame, horizon: int) -> XGBClassifier:
+    feat = add_quant_features(df_train.copy(), base_timeframe_min=15)
+    # CRITICAL FIX: label must exceed SL to justify the risk
+    fwd = feat["close"].shift(-horizon) / feat["close"] - 1.0
+    feat["label"] = (fwd > LABEL_THRESHOLD).astype(int)
+    feat = feat.dropna(subset=list(QUANT_FEATURE_COLS) + ["label"])
+    if len(feat) < 100:
+        return XGBClassifier(n_estimators=10, max_depth=2)
+    X = feat[QUANT_FEATURE_COLS].to_numpy(dtype=np.float32)
+    y = feat["label"].to_numpy(dtype=np.int32)
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    spw = max(1.0, n_neg / n_pos) if n_pos > 0 else 1.0
+    model = XGBClassifier(
+        n_estimators=300, max_depth=6, learning_rate=0.05,
+        subsample=0.9, colsample_bytree=0.9,
+        scale_pos_weight=spw, eval_metric="logloss",
+        random_state=42, n_jobs=-1,
+    )
+    model.fit(X, y)
+    return model
+
+
+# ── Simulación del bot ───────────────────────────────────────────────────────
+
+def simulate_bot(
+    df_test: pd.DataFrame,
+    regime_model: XGBClassifier,
+    direction_model: XGBClassifier,
+    symbol: str,
+    use_regime: bool = True,
+) -> BacktestState:
+    """Simula el bot completo en datos de test."""
+    state = BacktestState()
+    cfg = SYMBOL_CONFIG[symbol]
+    sl_frac = cfg["fixed_sl_pct"]
+    prob_threshold = cfg["prob_threshold"]
+    risk_pct = cfg["risk"]
+    ttl_hours = TTL_HOURS
+    tf_min = int(cfg["timeframe"][:-1])
+
+    feat = add_quant_features(df_test.copy(), base_timeframe_min=tf_min)
+    feat = feat.dropna(subset=QUANT_FEATURE_COLS).reset_index(drop=True)
+    if len(feat) < 10:
+        return state
+
+    X = feat[QUANT_FEATURE_COLS].to_numpy(dtype=np.float32)
+    regime_probs = regime_model.predict_proba(X)[:, 1] if hasattr(regime_model, "predict_proba") else np.full(len(X), 0.5)
+    direction_probs = direction_model.predict_proba(X)[:, 1] if hasattr(direction_model, "predict_proba") else np.full(len(X), 0.5)
+
+    closes = feat["close"].to_numpy()
+    highs = feat["high"].to_numpy()
+    lows = feat["low"].to_numpy()
+    atrs = feat["atr"].fillna(0.0).to_numpy()
+    timestamps = feat["timestamp"] if "timestamp" in feat.columns else pd.RangeIndex(len(feat))
+
+    for i in range(len(feat)):
+        ts = timestamps.iloc[i] if hasattr(timestamps, "iloc") else timestamps[i]
+        current_price = float(closes[i])
+        current_high = float(highs[i])
+        current_low = float(lows[i])
+        current_atr = float(atrs[i]) if i < len(atrs) else 0.0
+
+        # ── Daily reset ──
+        if state.current_day is None or pd.Timestamp(ts).date() != state.current_day.date():
+            state.daily_loss = 0.0
+            state.current_day = pd.Timestamp(ts)
+
+        # ── Update open positions ──
+        symbols_to_close = []
+        for sym, pos in state.open_positions.items():
+            # Update peak
+            if current_high > pos.peak_price:
+                pos.peak_price = current_high
+
+            # Trailing stop update
+            if pos.peak_price >= pos.entry_price * (1.0 + ACTIVATION_PCT):
+                new_stop = pos.peak_price * (1.0 - TRAILING_DISTANCE)
+                if new_stop > pos.current_stop:
+                    pos.current_stop = new_stop
+
+            # Check SL / TP / TTL
+            hit_sl = current_low <= pos.current_stop
+            hit_tp = pos.tp_price is not None and current_high >= pos.tp_price
+            hours_held = (pd.Timestamp(ts) - pos.entry_time).total_seconds() / 3600.0
+            hit_ttl = hours_held >= ttl_hours
+
+            if hit_sl:
+                exit_p = pos.current_stop
+                reason = "SL"
+            elif hit_tp:
+                exit_p = pos.tp_price
+                reason = "TP"
+            elif hit_ttl:
+                exit_p = current_price
+                reason = "TTL"
+            else:
+                continue
+
+            # Calculate PnL
+            pnl_pct = (exit_p - pos.entry_price) / pos.entry_price
+            pnl_usd = pnl_pct * pos.position_size
+            state.total_pnl += pnl_usd
+            state.balance += pnl_usd
+            state.daily_loss += min(0.0, pnl_usd)
+            state.n_trades += 1
+            if pnl_usd > 0:
+                state.n_wins += 1
+                state.gross_wins += pnl_usd
+            else:
+                state.n_losses += 1
+                state.gross_losses += abs(pnl_usd)
+
+            pos.close_reason = reason
+            pos.exit_price = exit_p
+            pos.exit_time = pd.Timestamp(ts)
+            pos.pnl_usd = pnl_usd
+            pos.pnl_pct = pnl_pct
+            state.closed_trades.append(pos)
+            symbols_to_close.append(sym)
+
+            # Commission
+            commission = pos.position_size * 0.0004 * 2  # open + close
+            state.balance -= commission
+            state.total_pnl -= commission
+
+        for sym in symbols_to_close:
+            del state.open_positions[sym]
+
+        # ── Update equity & drawdown ──
+        unrealized = 0.0
+        for pos in state.open_positions.values():
+            unrealized += ((current_price - pos.entry_price) / pos.entry_price) * pos.position_size
+        state.equity = state.balance + unrealized
+        if state.equity > state.peak_equity:
+            state.peak_equity = state.equity
+        dd = (state.peak_equity - state.equity) / state.peak_equity
+        if dd > state.max_drawdown:
+            state.max_drawdown = dd
+
+        # ── Daily loss limit ──
+        if abs(state.daily_loss) >= state.balance * DAILY_LOSS_LIMIT:
+            continue
+
+        # ── Max positions ──
+        if len(state.open_positions) >= MAX_POSITIONS:
+            continue
+
+        # ── Skip if position already open ──
+        if symbol in state.open_positions:
+            continue
+
+        # ── Regime filter ──
+        regime_prob = float(regime_probs[i])
+        is_trending = regime_prob >= 0.65
+        if use_regime and not is_trending:
+            continue
+
+        # ── Direction filter ──
+        direction_prob = float(direction_probs[i])
+        if direction_prob < prob_threshold:
+            continue
+
+        # ── Risk manager sizing ──
+        risk_amount = state.balance * risk_pct
+        position_size = risk_amount / max(0.001, sl_frac)
+        max_allocation = (state.balance / MAX_POSITIONS) * LEVERAGE
+        position_size = min(position_size, max_allocation)
+        if position_size <= 0:
+            continue
+        if position_size > state.balance * LEVERAGE:
+            continue
+
+        # ── Open position ──
+        sl_price = current_price * (1.0 - sl_frac)
+        tp_price = current_price + (current_atr * TP_ATR_MULT) if current_atr > 0 else None
+
+        pos = OpenPosition(
+            symbol=symbol,
+            entry_time=pd.Timestamp(ts),
+            entry_price=current_price,
+            position_size=position_size,
+            sl_price=sl_price,
+            tp_price=tp_price,
+            peak_price=current_price,
+            current_stop=sl_price,
+            ml_confidence=direction_prob,
+            regime_prob=regime_prob,
+        )
+        state.open_positions[symbol] = pos
+
+        # Commission on open
+        commission_open = position_size * 0.0004
+        state.balance -= commission_open
+        state.total_pnl -= commission_open
+
+    # Close any remaining positions at last price
+    for sym, pos in list(state.open_positions.items()):
+        exit_p = float(closes[-1])
+        pnl_pct = (exit_p - pos.entry_price) / pos.entry_price
+        pnl_usd = pnl_pct * pos.position_size
+        state.total_pnl += pnl_usd
+        state.balance += pnl_usd
+        state.n_trades += 1
+        if pnl_usd > 0:
+            state.n_wins += 1
+            state.gross_wins += pnl_usd
+        else:
+            state.n_losses += 1
+            state.gross_losses += abs(pnl_usd)
+        pos.close_reason = "END_OF_DATA"
+        pos.exit_price = exit_p
+        pos.exit_time = pd.Timestamp(timestamps.iloc[-1] if hasattr(timestamps, "iloc") else timestamps[-1])
+        pos.pnl_usd = pnl_usd
+        pos.pnl_pct = pnl_pct
+        state.closed_trades.append(pos)
+        commission = pos.position_size * 0.0004
+        state.balance -= commission
+        state.total_pnl -= commission
+    state.open_positions.clear()
+    state.equity = state.balance
+
+    return state
+
+
+def calc_metrics(state: BacktestState, days: float) -> dict[str, float]:
+    if state.n_trades == 0:
+        return {"trades": 0, "win_rate": 0.0, "pnl_pct": 0.0}
+    win_rate = state.n_wins / state.n_trades
+    pnl_pct = (state.balance - INITIAL_BALANCE) / INITIAL_BALANCE * 100
+    avg_win = state.gross_wins / state.n_wins if state.n_wins > 0 else 0
+    avg_loss = state.gross_losses / state.n_losses if state.n_losses > 0 else 1
+    profit_factor = state.gross_wins / state.gross_losses if state.gross_losses > 0 else float("inf")
+    # Sharpe simplificado
+    returns = [t.pnl_pct for t in state.closed_trades]
+    sharpe = 0.0
+    if len(returns) > 1:
+        mean_r = np.mean(returns)
+        std_r = np.std(returns)
+        if std_r > 0:
+            sharpe = (mean_r / std_r) * np.sqrt(365 / max(days, 1))
+    return {
+        "trades": state.n_trades,
+        "win_rate": round(win_rate, 4),
+        "pnl_pct": round(pnl_pct, 2),
+        "total_pnl_usd": round(state.total_pnl, 2),
+        "final_balance": round(state.balance, 2),
+        "max_drawdown_pct": round(state.max_drawdown * 100, 2),
+        "profit_factor": round(profit_factor, 2),
+        "sharpe": round(sharpe, 2),
+        "avg_win_usd": round(avg_win, 2),
+        "avg_loss_usd": round(avg_loss, 2),
+        "trades_per_week": round(state.n_trades / max(days / 7, 1), 1),
+    }
+
+
+def run_backtest(symbol: str, limit: int = 30_000) -> dict[str, Any]:
+    cfg = SYMBOL_CONFIG[symbol]
+    tf = cfg["timeframe"]
+    hor = cfg["horizon"]
+    tf_min = int(tf[:-1])
+
+    logger.info("Fetching %d %s candles for %s...", limit, tf, symbol)
+    raw = fetch_ohlcv_ccxt(symbol, timeframe=tf, limit=limit)
+    if len(raw) < 1000:
+        return {"error": "insufficient data"}
+
+    # Split 70/30
+    split = int(len(raw) * 0.7)
+    train_df = raw.iloc[:split].copy()
+    test_df = raw.iloc[split:].copy()
+    test_days = (pd.to_datetime(test_df["timestamp"].iloc[-1]) - pd.to_datetime(test_df["timestamp"].iloc[0])).total_seconds() / 86400
+
+    logger.info("Training models on %d rows, testing on %d rows (%.1f days)...", len(train_df), len(test_df), test_days)
+
+    # Train models
+    regime_model = train_regime_model(train_df, hor)
+    direction_model = train_direction_model(train_df, hor)
+
+    # Backtest: bot completo
+    state_full = simulate_bot(test_df, regime_model, direction_model, symbol, use_regime=True)
+    metrics_full = calc_metrics(state_full, test_days)
+
+    # Backtest: sin regime
+    state_no_regime = simulate_bot(test_df, regime_model, direction_model, symbol, use_regime=False)
+    metrics_no_regime = calc_metrics(state_no_regime, test_days)
+
+    # Buy and hold
+    start_p = float(test_df["close"].iloc[0])
+    end_p = float(test_df["close"].iloc[-1])
+    bnh_pct = (end_p - start_p) / start_p * 100
+
+    return {
+        "symbol": symbol,
+        "test_days": round(test_days, 1),
+        "bot_with_regime": metrics_full,
+        "bot_without_regime": metrics_no_regime,
+        "buy_and_hold_pct": round(bnh_pct, 2),
+    }
+
+
+def main() -> int:
+    results = []
+    for symbol in ["BTC/USDT", "ETH/USDT", "XRP/USDT"]:
+        try:
+            res = run_backtest(symbol, limit=30_000)
+            results.append(res)
+        except Exception as exc:
+            logger.error("Backtest failed for %s: %s", symbol, exc, exc_info=True)
+
+    # Summary
+    logger.info("=" * 80)
+    logger.info("BACKTEST RESULTS SUMMARY (Out-of-sample, 30%% test set)")
+    logger.info("=" * 80)
+    logger.info(
+        "%-10s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s | %-6s",
+        "Symbol", "Trades", "Win%", "PnL%", "DD%", "PF", "Sharpe", "Trd/Wk"
+    )
+    logger.info("-" * 80)
+    for r in results:
+        if "error" in r:
+            continue
+        m = r["bot_with_regime"]
+        logger.info(
+            "%-10s | %-8d | %-8.1f | %-8.2f | %-8.2f | %-8.2f | %-8.2f | %-6.1f",
+            r["symbol"], m["trades"], m["win_rate"] * 100, m["pnl_pct"],
+            m["max_drawdown_pct"], m["profit_factor"], m["sharpe"], m["trades_per_week"],
+        )
+
+    logger.info("-" * 80)
+    logger.info("WITHOUT REGIME FILTER:")
+    for r in results:
+        if "error" in r:
+            continue
+        m = r["bot_without_regime"]
+        logger.info(
+            "%-10s | %-8d | %-8.1f | %-8.2f | %-8.2f | %-8.2f | %-8.2f | %-6.1f",
+            r["symbol"], m["trades"], m["win_rate"] * 100, m["pnl_pct"],
+            m["max_drawdown_pct"], m["profit_factor"], m["sharpe"], m["trades_per_week"],
+        )
+
+    logger.info("-" * 80)
+    logger.info("BUY & HOLD:")
+    for r in results:
+        if "error" not in r:
+            logger.info("  %s: %.2f%%", r["symbol"], r["buy_and_hold_pct"])
+
+    # Save
+    out = Path("logs/backtest_results.json")
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+    logger.info("Results saved to %s", out)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

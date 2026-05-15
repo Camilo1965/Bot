@@ -1,1 +1,1 @@
-"""database – asyncpg-based TimescaleDB persistence layer."""
+"""database - asyncpg-based TimescaleDB persistence layer."""

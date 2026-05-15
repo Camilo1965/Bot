@@ -6,7 +6,7 @@ Snapshot (rápido, colas)::
 
     .venv312\\Scripts\\python scripts\\export_diagnostic_bundle.py
 
-Día completo — JSONL del día + ``bot_debug`` (INFO/DEBUG/WARNING/ERROR) + last_session/audit/journal ampliados::
+Día completo - JSONL del día + ``bot_debug`` (INFO/DEBUG/WARNING/ERROR) + last_session/audit/journal ampliados::
 
     .venv312\\Scripts\\python scripts\\export_diagnostic_bundle.py --full-day
 

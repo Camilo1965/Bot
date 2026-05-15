@@ -183,7 +183,7 @@ class FeatureEngineer:
         :meth:`~strategy.ml_predictor.MLPredictor._compute_features`, which
         produces the eight-element vector expected by the deployed XGBoost model.
         This method builds an alternate indicator set for exploratory notebooks
-        or older training scripts—not the production inference pipeline.
+        or older training scripts-not the production inference pipeline.
 
         Each row is one time step; the label is ``1`` if the price
         *horizon* steps ahead is higher than the current price, else ``0``.

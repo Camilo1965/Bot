@@ -84,7 +84,7 @@ class TestMLPredictorVibeFeatures:
     """Valida que ml_predictor maneja correctamente el vector con/sin VIBE."""
 
     def test_predict_proba_with_vibe_enabled_appends_features(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test 1: Vector base (12) + VIBE activado = 16 features totales."""
+        """Test 1: Vector base (24) + VIBE activado = 28 features totales."""
         monkeypatch.setenv("VIBE_FEATURES_ENABLED", "1")
 
         # Recargar ml_predictor para que _FEATURE_COLS se calcule con VIBE=1
@@ -134,7 +134,7 @@ class TestMLPredictorVibeFeatures:
         assert isinstance(proba, float)
 
     def test_predict_proba_without_vibe_keeps_original_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test 3: VIBE desactivado (default) → vector mantiene tamaño original (12)."""
+        """Test 3: VIBE desactivado (default) → vector mantiene tamaño original (24)."""
         monkeypatch.setenv("VIBE_FEATURES_ENABLED", "0")
 
         import importlib
@@ -155,26 +155,27 @@ class TestMLPredictorVibeFeatures:
         assert isinstance(proba, float)
 
     def test_model_path_changes_with_vibe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Cuando VIBE_FEATURES_ENABLED=1, el path apunta a _v2.json."""
+        """Cuando VIBE_FEATURES_ENABLED=1, el path default es _v3.json."""
         monkeypatch.setenv("VIBE_FEATURES_ENABLED", "1")
 
         import importlib
         import strategy.ml_predictor as _mp
         importlib.reload(_mp)
 
-        path = _mp.model_json_path_for_symbol("BTC/USDT")
-        assert "_v2.json" in str(path)
+        # Use a symbol that has NO model on disk so fallback chain returns the default
+        path = _mp.model_json_path_for_symbol("FAKE/TEST")
+        assert "_v3.json" in str(path)
 
     def test_model_path_legacy_without_vibe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Cuando VIBE desactivado, el path sigue siendo _v1.json."""
+        """Cuando VIBE desactivado, el path default es _v2.json."""
         monkeypatch.setenv("VIBE_FEATURES_ENABLED", "0")
 
         import importlib
         import strategy.ml_predictor as _mp
         importlib.reload(_mp)
 
-        path = _mp.model_json_path_for_symbol("BTC/USDT")
-        assert "_v1.json" in str(path)
+        path = _mp.model_json_path_for_symbol("FAKE/TEST")
+        assert "_v2.json" in str(path)
 
     def test_generate_signal_passes_vibe_features(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """generate_signal acepta y pasa vibe_features a predict_proba."""
@@ -210,9 +211,9 @@ class TestMLPredictorVibeFeatures:
         # Desactivado
         monkeypatch.setenv("VIBE_FEATURES_ENABLED", "0")
         importlib.reload(_mp)
-        assert len(_mp._FEATURE_COLS) == len(_qf.QUANT_FEATURE_COLS)
+        assert len(_mp._FEATURE_COLS) == len(_qf.QUANT_FEATURE_COLS)  # 24
 
         # Activado
         monkeypatch.setenv("VIBE_FEATURES_ENABLED", "1")
         importlib.reload(_mp)
-        assert len(_mp._FEATURE_COLS) == len(_qf.QUANT_FEATURE_COLS) + len(_qf.VIBE_FEATURE_COLS)
+        assert len(_mp._FEATURE_COLS) == len(_qf.QUANT_FEATURE_COLS) + len(_qf.VIBE_FEATURE_COLS)  # 28

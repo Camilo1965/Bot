@@ -1,1 +1,1 @@
-# risk – position sizing and risk management
+# risk - position sizing and risk management

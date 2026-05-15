@@ -116,7 +116,7 @@ BEGIN
       ALTER TABLE trades_history RENAME COLUMN entry_time TO timestamp_open;
   END IF;
 
-  -- Add missing columns (idempotent — skips if already present)
+  -- Add missing columns (idempotent - skips if already present)
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='trades_history' AND column_name='timestamp_open') THEN
       ALTER TABLE trades_history ADD COLUMN timestamp_open TIMESTAMPTZ;
   END IF;
@@ -327,7 +327,7 @@ class DatabaseManager:
             "low": low,
             "close": close,
             "volume": volume,
-            # Quote bracket for the bar — satisfies tick-schema NOT NULL without inventing spread:
+            # Quote bracket for the bar - satisfies tick-schema NOT NULL without inventing spread:
             "best_bid": float(low),
             "best_ask": float(high),
             "bid_volume": v_bar * 0.5,
@@ -352,7 +352,7 @@ class DatabaseManager:
             cols = self._market_cols or frozenset()
             keys = [k for k in order if k in cols]
             if "timestamp" not in keys or "symbol" not in keys:
-                logger.warning("market_data missing timestamp/symbol — skip insert")
+                logger.warning("market_data missing timestamp/symbol - skip insert")
                 return
             vals = [row[k] for k in keys]
             placeholders = ", ".join(f"${i + 1}" for i in range(len(keys)))

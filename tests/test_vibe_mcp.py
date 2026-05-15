@@ -25,7 +25,7 @@ class TestVibeMCPClient:
 
     @pytest.mark.asyncio
     async def test_start_binary_not_found(self, client):
-        with patch("shutil.which", return_value=None):
+        with patch("vibe.mcp_client._resolve_mcp_binary", return_value=None):
             result = await client.start()
             assert result is False
             assert not client.available
@@ -232,8 +232,11 @@ class TestVibeStatePersistence:
 class TestVibeMCPResilience:
     @pytest.mark.asyncio
     async def test_mcp_timeout_doesnt_crash_bot(self, client):
-        """Timeout in _call must return None, not raise."""
-        with patch.object(client, "_call", new_callable=AsyncMock, return_value=None):
+        """Timeout in _sync_call must return None, not raise."""
+        client._available = True
+        client._proc = MagicMock()
+        client._proc.poll = MagicMock(return_value=None)
+        with patch.object(client, "_sync_call", return_value=None):
             result = await client.call_tool("pattern_recognition", {"run_dir": "/tmp"})
             assert result is None
 
@@ -243,7 +246,7 @@ class TestVibeMCPResilience:
         client._available = True
         client._proc = MagicMock()
         client._proc.poll = MagicMock(return_value=None)
-        with patch.object(client, "_call", new_callable=AsyncMock, side_effect=[None, None, {"ok": True}]) as mock_call:
+        with patch.object(client, "_sync_call", side_effect=[None, None, {"ok": True}]) as mock_call:
             with patch("asyncio.sleep", new_callable=AsyncMock):
                 result = await client.call_tool("backtest", {"run_dir": "/tmp"}, max_retries=2)
                 assert result == {"ok": True}
@@ -251,6 +254,6 @@ class TestVibeMCPResilience:
 
     @pytest.mark.asyncio
     async def test_pattern_recognition_limits_ohlcv_rows(self):
-        """Pattern recognition must request ≤ 1000 OHLCV rows."""
+        """Pattern recognition must request <= 1000 OHLCV rows."""
         from vibe.pattern_recognition import _MAX_OHLCV_ROWS
         assert _MAX_OHLCV_ROWS == 1000

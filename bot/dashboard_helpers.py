@@ -37,7 +37,7 @@ def dashboard_rsi_timeframe() -> str:
 
 
 def pct_change_24h_vs_h1(h1_closes: list[float], mark_price: float) -> float | None:
-    """Approximate 24h % vs H1 close ~24 bars ago (needs ≥24 hourly closes)."""
+    """Approximate 24h % vs H1 close ~24 bars ago (needs >=24 hourly closes)."""
     if len(h1_closes) < 24 or mark_price <= 0:
         return None
     ref = h1_closes[-24]

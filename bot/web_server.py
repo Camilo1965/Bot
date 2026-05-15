@@ -17,6 +17,7 @@ from bot.dashboard_helpers import (
     pct_change_24h_vs_h1,
 )
 from bot.monitoring import get_health_metrics
+from bot.observability import get_buffer
 from database.db_manager import db
 from execution.mt5_executor import MT5Executor
 from execution.paper_executor import PaperExecutor, compute_dynamic_tp_hint
@@ -178,24 +179,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <span class="mono font-medium" id="uptime">00:00:00</span>
             </div>
             <div class="flex gap-3">
-                <div class="kpi-card text-center min-w-[100px]"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Estrategia</div><div class="mono text-sm font-semibold" style="color:var(--accent)" id="sentiment">—</div><div class="text-[10px] text-gray-500 mt-0.5 leading-snug" id="sentiment-detail">—</div></div>
-                <div class="kpi-card text-center min-w-[90px]"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Estado</div><div class="text-sm font-bold" id="bot-status">—</div></div>
-                <div class="kpi-card text-center min-w-[80px]"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Pos</div><div class="mono text-sm font-bold" id="pos-count">—</div></div>
+                <div class="kpi-card text-center min-w-[100px]"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Estrategia</div><div class="mono text-sm font-semibold" style="color:var(--accent)" id="sentiment">-</div><div class="text-[10px] text-gray-500 mt-0.5 leading-snug" id="sentiment-detail">-</div></div>
+                <div class="kpi-card text-center min-w-[90px]"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Estado</div><div class="text-sm font-bold" id="bot-status">-</div></div>
+                <div class="kpi-card text-center min-w-[80px]"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Pos</div><div class="mono text-sm font-bold" id="pos-count">-</div></div>
             </div>
         </header>
         <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
-            <div class="kpi-card"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Balance</div><div class="mono text-xl font-medium text-white" id="balance">—</div></div>
-            <div class="kpi-card"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">PnL Sesión</div><div class="mono text-xl font-medium" id="session-pnl">—</div></div>
-            <div class="kpi-card"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Max Drawdown</div><div class="mono text-xl font-medium" id="drawdown">—</div></div>
+            <div class="kpi-card"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Balance</div><div class="mono text-xl font-medium text-white" id="balance">-</div></div>
+            <div class="kpi-card"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">PnL Sesión</div><div class="mono text-xl font-medium" id="session-pnl">-</div></div>
+            <div class="kpi-card"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Max Drawdown</div><div class="mono text-xl font-medium" id="drawdown">-</div></div>
             <div class="kpi-card"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Win Rate</div><div class="flex items-baseline gap-2"><span class="mono text-xl font-bold text-white" id="s-winrate">0%</span><span class="text-xs text-gray-500"><span id="s-wins" style="color:var(--positive)">0</span>W / <span id="s-losses" style="color:var(--negative)">0</span>L</span></div></div>
             <div class="kpi-card"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold mb-1">Umbral</div><div class="mono text-xl font-bold text-white" id="sent-num">70%</div><div class="bar-track mt-1.5"><div class="bar-fill" id="sent-bar" style="width:70%;background:var(--positive)"></div></div></div>
         </div>
         <div class="surface p-5">
             <div class="flex flex-col md:flex-row gap-4 md:gap-8">
-                <div class="flex-1"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Balance Total</div><div class="mono text-3xl font-light tracking-tight mt-1"><span class="text-gray-500">$</span><span id="balance-lg" class="font-medium text-white">—</span></div></div>
-                <div class="flex-1"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Disponible</div><div class="mono text-2xl font-light mt-1"><span class="text-gray-500">$</span><span id="margin" class="font-medium text-white">—</span></div></div>
-                <div class="flex-1"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Riesgo Port.</div><div class="mono text-lg font-medium mt-1" id="risk-pct">—</div></div>
-                <div class="flex-1"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Latencia</div><div class="mono text-lg font-medium mt-1" style="color:var(--accent)" id="api-latency">—</div></div>
+                <div class="flex-1"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Balance Total</div><div class="mono text-3xl font-light tracking-tight mt-1"><span class="text-gray-500">$</span><span id="balance-lg" class="font-medium text-white">-</span></div></div>
+                <div class="flex-1"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Disponible</div><div class="mono text-2xl font-light mt-1"><span class="text-gray-500">$</span><span id="margin" class="font-medium text-white">-</span></div></div>
+                <div class="flex-1"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Riesgo Port.</div><div class="mono text-lg font-medium mt-1" id="risk-pct">-</div></div>
+                <div class="flex-1"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Latencia</div><div class="mono text-lg font-medium mt-1" style="color:var(--accent)" id="api-latency">-</div></div>
             </div>
         </div>
         <div>
@@ -240,12 +241,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div>
             <div class="section-title px-1">CEO SNAPSHOT</div>
             <div class="surface p-5">
-                <div class="flex justify-between items-center mb-4"><span class="text-xs text-gray-500" id="ceo-updated">Actualizado: —</span></div>
+                <div class="flex justify-between items-center mb-4"><span class="text-xs text-gray-500" id="ceo-updated">Actualizado: -</span></div>
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-                    <div class="elevated p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">PnL 7D</div><div class="mono text-lg font-semibold" id="ceo-pnl-7d">—</div></div>
-                    <div class="elevated p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Winrate 7D</div><div class="mono text-lg font-semibold text-white" id="ceo-winrate-7d">—</div></div>
-                    <div class="elevated p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">PnL 30D</div><div class="mono text-lg font-semibold" id="ceo-pnl-30d">—</div></div>
-                    <div class="elevated p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">PF 30D</div><div class="mono text-lg font-semibold text-white" id="ceo-pf-30d">—</div></div>
+                    <div class="elevated p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">PnL 7D</div><div class="mono text-lg font-semibold" id="ceo-pnl-7d">-</div></div>
+                    <div class="elevated p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">Winrate 7D</div><div class="mono text-lg font-semibold text-white" id="ceo-winrate-7d">-</div></div>
+                    <div class="elevated p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">PnL 30D</div><div class="mono text-lg font-semibold" id="ceo-pnl-30d">-</div></div>
+                    <div class="elevated p-3 text-center"><div class="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">PF 30D</div><div class="mono text-lg font-semibold text-white" id="ceo-pf-30d">-</div></div>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                     <div class="elevated p-3"><div class="text-xs text-gray-400 mb-2">Rendimiento por símbolo (mes)</div><div class="space-y-1.5 text-sm" id="ceo-symbols"></div></div>
@@ -405,7 +406,7 @@ async function fetchState() {
 
 function render(data) {
   document.getElementById('uptime').innerText=data.uptime;
-  const pair=data.primary_pair||(Array.isArray(data.watchlist)&&data.watchlist[0])||'—';
+  const pair=data.primary_pair||(Array.isArray(data.watchlist)&&data.watchlist[0])||'-';
   document.getElementById('sentiment').innerText=pair.replace('/',' / ');
   document.getElementById('sentiment-detail').innerText=data.strategy_blurb||'';
   const bs=document.getElementById('bot-status');
@@ -429,7 +430,7 @@ function render(data) {
   const la=document.getElementById('api-latency');
   if (la) {
     const ms=Number(data.api_latency_ms||0);
-    la.innerText=ms>0?(Math.round(ms)+' ms'):'—';
+    la.innerText=ms>0?(Math.round(ms)+' ms'):'-';
   }
   updateValue('balance',data.balance);
   updateValue('balance-lg',data.balance);
@@ -450,14 +451,14 @@ function render(data) {
     const ml=Math.min(100,Math.max(0,parseFloat(String(i.ml_conf).replace(/[%\\s]/g,''))||0));
     const mc=ml>=buyTh?'var(--positive)':'var(--accent)';
     const rn=(i.rsi==='--'||i.rsi===undefined)?NaN:parseFloat(i.rsi);
-    const rs=Number.isFinite(rn)?rn.toFixed(0):'—';
+    const rs=Number.isFinite(rn)?rn.toFixed(0):'-';
     const rv=Number.isFinite(rn)?Math.min(100,Math.max(0,rn)):0;
     const cc=i.change_ok===true;
     const chC=!cc?'color:var(--text-dim)':(i.change_num>=0?'color:var(--positive)':'color:var(--negative)');
     const chG=!cc?'•':(i.change_num>=0?'↗':'↘');
     const st=i.symbol_pair?String(i.symbol_pair).replace('/',' / '):i.symbol;
     const rb=i.has_position?'background:rgba(0,212,255,.04)':'';
-    let ph='<span style="color:var(--text-dim)">—</span>';
+    let ph='<span style="color:var(--text-dim)">-</span>';
     if (i.has_position && i.unrealized_pnl_num!==undefined) {
       const c=i.unrealized_pnl_num>=0?'var(--positive)':'var(--negative)';
       ph=`<span class="mono font-medium" style="${c}">${i.unrealized_pnl_num>=0?'+':''}${i.unrealized_pnl_num.toFixed(2)}</span>`;
@@ -472,7 +473,7 @@ function render(data) {
     if (!i.has_position) return;
     hp=true;
     const pc=i.unrealized_pnl_num>=0?'var(--positive)':'var(--negative)';
-    ph2+=`<tr class="border-b" style="border-color:var(--border)"><td class="px-4 py-2 font-semibold text-white">${i.symbol_pair||i.symbol}</td><td class="px-4 py-2 text-right mono">${i.position_str||'—'}</td><td class="px-4 py-2 text-right mono text-white">${i.price}</td><td class="px-4 py-2 text-right mono" style="color:var(--warning)">${i.stop_loss||'—'}</td><td class="px-4 py-2 text-right mono" style="color:var(--positive)">${i.take_profit||'—'}</td><td class="px-4 py-2 text-right mono font-medium" style="${pc}">${i.unrealized_pnl||'—'}</td><td class="px-4 py-2 text-center">${i.trailing_active?'<span class="badge badge-buy" style="font-size:10px">🔒 TRAIL</span>':'<span class="text-gray-500 text-xs">OFF</span>'}</td></tr>`;
+    ph2+=`<tr class="border-b" style="border-color:var(--border)"><td class="px-4 py-2 font-semibold text-white">${i.symbol_pair||i.symbol}</td><td class="px-4 py-2 text-right mono">${i.position_str||'-'}</td><td class="px-4 py-2 text-right mono text-white">${i.price}</td><td class="px-4 py-2 text-right mono" style="color:var(--warning)">${i.stop_loss||'-'}</td><td class="px-4 py-2 text-right mono" style="color:var(--positive)">${i.take_profit||'-'}</td><td class="px-4 py-2 text-right mono font-medium" style="${pc}">${i.unrealized_pnl||'-'}</td><td class="px-4 py-2 text-center">${i.trailing_active?'<span class="badge badge-buy" style="font-size:10px">🔒 TRAIL</span>':'<span class="text-gray-500 text-xs">OFF</span>'}</td></tr>`;
   });
   document.getElementById('pos-tbody').innerHTML=ph2||'<tr><td colspan="7" class="text-center text-gray-500 py-4">Sin posiciones</td></tr>';
   document.getElementById('positions-section').classList.toggle('hidden',!hp);
@@ -483,15 +484,15 @@ function render(data) {
   const ms=v=>v>=0?'color:var(--positive);font-weight:500':'color:var(--negative);font-weight:500';
   const p7n=Number(ceo.pnl_7d_num||0);
   const p30n=Number(ceo.pnl_30d_num||0);
-  updateValue('ceo-pnl-7d',ceo.pnl_7d||'—');
+  updateValue('ceo-pnl-7d',ceo.pnl_7d||'-');
   const p7e=document.getElementById('ceo-pnl-7d');
   if (p7e) p7e.style.cssText=ms(p7n);
-  updateValue('ceo-winrate-7d',ceo.winrate_7d||'—');
-  updateValue('ceo-pf-30d',ceo.profit_factor_30d||'—');
-  updateValue('ceo-pnl-30d',ceo.pnl_30d||'—');
+  updateValue('ceo-winrate-7d',ceo.winrate_7d||'-');
+  updateValue('ceo-pf-30d',ceo.profit_factor_30d||'-');
+  updateValue('ceo-pnl-30d',ceo.pnl_30d||'-');
   const p30e=document.getElementById('ceo-pnl-30d');
   if (p30e) p30e.style.cssText=ms(p30n);
-  document.getElementById('ceo-updated').innerText=`Actualizado: ${ceo.last_updated_local||'—'}`;
+  document.getElementById('ceo-updated').innerText=`Actualizado: ${ceo.last_updated_local||'-'}`;
   
   const syEl=document.getElementById('ceo-symbols');
   const sy=ceo.symbols_month||[];
@@ -675,7 +676,7 @@ async def start_web_dashboard(
         sentiment = state.get("sentiment")
         global_hold = bool(state.get("global_hold", False))
         sentiment_label = "ETH/USDT ML-only"
-        sentiment_detail = "Sin Gemini / noticias — solo XGB ≥ 70%"
+        sentiment_detail = "Sin Gemini / noticias - solo XGB >= 70%"
 
         # Wallet
         mt5_wallet = state.get("mt5_wallet")
@@ -751,10 +752,10 @@ async def start_web_dashboard(
             trailing_active = False
             sl_num: float | None = None
             tp_num: float | None = None
-            peak_display = "—"
-            trail_progress = "—"
-            broker_sl_display = "—"
-            broker_tp_display = "—"
+            peak_display = "-"
+            trail_progress = "-"
+            broker_sl_display = "-"
+            broker_tp_display = "-"
             strategy_signal = "HOLD"
             can_buy = False
             entry_hint = ""
@@ -779,20 +780,20 @@ async def start_web_dashboard(
                         trail_progress = f"Trailing ON (pico {peak_display})"
                     else:
                         trail_progress = (
-                            f"Beneficio {pcp * 100:.2f}% → activar ≥ {pos.activation_pct * 100:.2f}%"
+                            f"Beneficio {pcp * 100:.2f}% → activar >= {pos.activation_pct * 100:.2f}%"
                         )
                 tp_raw = compute_dynamic_tp_hint(pos)
                 if tp_raw is not None and tp_raw > 0:
                     tp_num = float(tp_raw)
                     tp_display = f"{tp_num:,.2f}"
                 else:
-                    tp_display = "—"
+                    tp_display = "-"
                 if isinstance(mt5_ticket, int) and mt5_ticket in mt5_by_ticket:
                     br = mt5_by_ticket[mt5_ticket]
                     slb = float(br.get("sl") or 0.0)
                     tpb = float(br.get("tp") or 0.0)
-                    broker_sl_display = f"{slb:,.2f}" if slb > 0.0 else "—"
-                    broker_tp_display = f"{tpb:,.2f}" if tpb > 0.0 else "—"
+                    broker_sl_display = f"{slb:,.2f}" if slb > 0.0 else "-"
+                    broker_tp_display = f"{tpb:,.2f}" if tpb > 0.0 else "-"
             elif has_pos_broker:
                 pos_str = "Abierta en broker (manual/externa)"
                 action = "Gestionando en broker"
@@ -807,8 +808,8 @@ async def start_web_dashboard(
                     unrl = float(p0.get("profit", 0.0) or 0.0)
                     slb = float(p0.get("sl") or 0.0)
                     tpb = float(p0.get("tp") or 0.0)
-                    broker_sl_display = f"{slb:,.2f}" if slb > 0.0 else "—"
-                    broker_tp_display = f"{tpb:,.2f}" if tpb > 0.0 else "—"
+                    broker_sl_display = f"{slb:,.2f}" if slb > 0.0 else "-"
+                    broker_tp_display = f"{tpb:,.2f}" if tpb > 0.0 else "-"
             else:
                 strategy_signal = ml_signals.get(sym, "HOLD")
                 can_buy = (
@@ -818,9 +819,9 @@ async def start_web_dashboard(
                 )
                 action = "Comprar" if can_buy else "Esperar"
                 if global_hold:
-                    entry_hint = "Pausa global — no se abren entradas."
+                    entry_hint = "Pausa global - no se abren entradas."
                 elif prob >= BUY_PROB_THRESHOLD and strategy_signal != "BUY":
-                    entry_hint = "Prob. ≥ umbral pero símbolo no operable o modelo en HOLD."
+                    entry_hint = "Prob. >= umbral pero símbolo no operable o modelo en HOLD."
                 elif prob < BUY_PROB_THRESHOLD:
                     entry_hint = (
                         f"Prob. modelo por debajo del umbral de compra "
@@ -836,7 +837,7 @@ async def start_web_dashboard(
                 "change": (
                     f"{'+' if pct >= 0 else ''}{pct:.1f}%"
                     if pct is not None
-                    else "—"
+                    else "-"
                 ),
                 "change_num": float(pct) if pct is not None else 0.0,
                 "change_ok": pct is not None,
@@ -847,7 +848,7 @@ async def start_web_dashboard(
                 "trend": _htf_trend_letters(t15, t1h, t4h),
                 "trend_detail": {"15m": t15, "1h": t1h, "4h": t4h},
                 "action": action,
-                "strategy_signal": strategy_signal if not has_pos else "—",
+                "strategy_signal": strategy_signal if not has_pos else "-",
                 "can_enter": can_buy if not has_pos else False,
                 "entry_hint": entry_hint if not has_pos else "",
                 "has_position": has_pos,
@@ -1015,12 +1016,16 @@ async def start_web_dashboard(
             ] if (vibe_c and vibe_c.available) else [],
         })
 
+    async def _handle_metrics(request: web.Request) -> web.Response:
+        return web.json_response(get_buffer().snapshot())
+
     app = web.Application(middlewares=_middlewares)
     app.add_routes([
         web.get("/", handle_html),
         web.get("/health", handle_health),
         web.get("/api/state", handle_api),
         web.get("/api/performance", handle_performance),
+        web.get("/api/metrics", _handle_metrics),
         web.get("/api/vibe/journal", _handle_vibe_journal),
         web.get("/api/vibe/backtest", _handle_vibe_backtest),
         web.get("/api/vibe/patterns", _handle_vibe_patterns),

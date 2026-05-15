@@ -67,6 +67,7 @@ from bot.loops import (
     position_sync_loop,
     weekly_report_loop,
 )
+from bot.task_supervisor import TaskSupervisor
 from bot.market_consumer import market_consumer
 from bot.mt5_preload import preload_historical_data_mt5
 from bot.signal_emitter import signal_emitter
@@ -102,7 +103,7 @@ from utils.telegram_notifier import (
 from vibe_mcp.server import start_mcp_server, SERVER_PORT as VIBE_MCP_PORT
 
 try:
-    from vibe.mcp_client import VibeMCPClient
+    from vibe.hybrid_client import VibeHybridClient as VibeClient
     from vibe.scheduled_tasks import (
         factor_analysis_loop,
         journal_analysis_loop,
@@ -529,7 +530,7 @@ async def main() -> None:
                 initial_balance,
             )
         except ValueError:
-            logger.warning("[ENV] INITIAL_BALANCE inválido — usando 10000.0")
+            logger.warning("[ENV] INITIAL_BALANCE inválido - usando 10000.0")
             initial_balance = 10_000.0
     _mt5_initialized: bool = False
 
@@ -804,21 +805,21 @@ async def main() -> None:
     # confirm that session state was cleanly initialised on this startup.
     # ------------------------------------------------------------------
     logger.info(
-        "🔍 [AUDIT] Decision pipeline: ML_BUY_PROB≥%.2f | symbols=%s (ML-only entries).",
+        "[AUDIT] Decision pipeline: ML_BUY_PROB>=%.2f | symbols=%s (ML-only entries).",
         BUY_PROB_THRESHOLD,
         WATCHLIST,
     )
     logger.info(
-        "🔍 [AUDIT] Session state reset: max_drawdown=0.0  trading_halted=%s",
+        "[AUDIT] Session state reset: max_drawdown=0.0  trading_halted=%s",
         risk_manager.is_trading_halted(),
     )
     logger.info(
-        "🔍 [AUDIT] UI coherence: COMPRAR/BUY only when "
-        "ml_signals[symbol]==BUY and prob≥%.2f.",
+        "[AUDIT] UI coherence: COMPRAR/BUY only when "
+        "ml_signals[symbol]==BUY and prob>=%.2f.",
         BUY_PROB_THRESHOLD,
     )
     logger.warning(
-        "[RIESGO] Perfil ETH/USDT 15m — valores activos prob≥%.2f risk=%.1f%%.",
+        "[RIESGO] Perfil ETH/USDT 15m - valores activos prob>=%.2f risk=%.1f%%.",
         BUY_PROB_THRESHOLD,
         RISK_PER_TRADE * 100.0,
     )
@@ -874,11 +875,31 @@ async def main() -> None:
         await close_db()
         return
 
-    run_tasks: list[asyncio.Future[Any] | asyncio.Task[Any] | Any] = [
-        mt5_market_client.run(),
-        market_consumer(market_queue, shared_state, paper_executor),
-        signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
-        dashboard_logger(
+    # ── Task Supervisor (FASE 1: async robusto) ─────────────────────────────
+    supervisor = TaskSupervisor()
+
+    # CRITICAL tasks: si mueren, el bot muere
+    supervisor.spawn(
+        "mt5_market_client",
+        lambda: mt5_market_client.run(),
+        critical=True,
+        restart=False,
+    )
+    supervisor.spawn(
+        "market_consumer",
+        lambda: market_consumer(market_queue, shared_state, paper_executor),
+        critical=True,
+        restart=False,
+    )
+    supervisor.spawn(
+        "signal_emitter",
+        lambda: signal_emitter(shared_state, predictor, paper_executor, watchlist=WATCHLIST, interval=15),
+        critical=True,
+        restart=False,
+    )
+    supervisor.spawn(
+        "dashboard_logger",
+        lambda: dashboard_logger(
             paper_executor,
             risk_manager,
             shared_state,
@@ -886,59 +907,142 @@ async def main() -> None:
             watchlist=WATCHLIST,
             interval=1,
         ),
-        weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
-        position_sync_loop(
+        critical=True,
+        restart=False,
+    )
+    supervisor.spawn(
+        "position_sync",
+        lambda: position_sync_loop(
             paper_executor,
             interval=max(3, min(int(float(os.environ.get("MT5_POSITION_SYNC_S", "4"))), 300)),
         ),
-        health_monitor_loop(shared_state, market_queue, paper_executor, risk_manager, interval=30),
-        close_pending_reconciler_loop(shared_state, paper_executor, interval=20),
-        telegram_command_poller(shared_state, paper_executor, risk_manager, interval=5),
-        weekly_report_loop(),
-        monthly_report_loop(),
-        start_web_dashboard(shared_state, paper_executor, risk_manager, WATCHLIST, port=8080),
-        start_mcp_server(port=VIBE_MCP_PORT),
-    ]
+        critical=True,
+        restart=False,
+    )
+    supervisor.spawn(
+        "health_monitor",
+        lambda: health_monitor_loop(shared_state, market_queue, paper_executor, risk_manager, interval=30),
+        critical=True,
+        restart=False,
+    )
+    supervisor.spawn(
+        "close_pending_reconciler",
+        lambda: close_pending_reconciler_loop(shared_state, paper_executor, interval=20),
+        critical=True,
+        restart=False,
+    )
 
-    # ── Vibe-Trading MCP integration (optional) ─────────────────────────────
-    vibe_client: VibeMCPClient | None = None
+    # NON-CRITICAL tasks: se reinician automáticamente si crashean
+    supervisor.spawn(
+        "weekly_retrainer",
+        lambda: weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
+        critical=False,
+        restart=True,
+        restart_delay_s=60.0,
+    )
+    supervisor.spawn(
+        "telegram_command_poller",
+        lambda: telegram_command_poller(shared_state, paper_executor, risk_manager, interval=5),
+        critical=False,
+        restart=True,
+    )
+    supervisor.spawn(
+        "weekly_report",
+        lambda: weekly_report_loop(),
+        critical=False,
+        restart=True,
+    )
+    supervisor.spawn(
+        "monthly_report",
+        lambda: monthly_report_loop(),
+        critical=False,
+        restart=True,
+    )
+    supervisor.spawn(
+        "web_dashboard",
+        lambda: start_web_dashboard(shared_state, paper_executor, risk_manager, WATCHLIST, port=8080),
+        critical=False,
+        restart=True,
+        restart_delay_s=10.0,
+    )
+
+    # ── Vibe-Trading hybrid client integration (optional) ───────────────────
+    # Start the internal HTTP server first so the hybrid client can connect
     if _VIBE_AVAILABLE and os.environ.get("VIBE_TRADING_ENABLED", "1").strip() in ("1", "true", "yes"):
-        vibe_client = VibeMCPClient()
+        mcp_server_task = asyncio.create_task(start_mcp_server(port=VIBE_MCP_PORT))
+        await asyncio.sleep(2)  # Give the server time to bind
+
+    vibe_client: VibeClient | None = None
+    if _VIBE_AVAILABLE and os.environ.get("VIBE_TRADING_ENABLED", "1").strip() in ("1", "true", "yes"):
+        vibe_client = VibeClient()
         try:
             vibe_started = await vibe_client.start()
         except Exception as exc:
-            logger.warning("ℹ️ Vibe-Trading MCP start raised exception (%s) — tools disabled.", exc)
+            logger.warning("Vibe-Trading start raised exception (%s) - tools disabled.", exc)
             vibe_started = False
         if vibe_started:
             shared_state["vibe_client"] = vibe_client
-            run_tasks.append(journal_analysis_loop(vibe_client, shared_state))
-            run_tasks.append(weekly_backtest_loop(vibe_client, shared_state, WATCHLIST))
-            run_tasks.append(pattern_detection_loop(vibe_client, shared_state, WATCHLIST))
-            run_tasks.append(factor_analysis_loop(vibe_client, shared_state, WATCHLIST))
-            run_tasks.append(shadow_account_loop(vibe_client, shared_state))
+            supervisor.spawn(
+                "vibe_journal",
+                lambda: journal_analysis_loop(vibe_client, shared_state),
+                critical=False,
+                restart=True,
+            )
+            supervisor.spawn(
+                "vibe_backtest",
+                lambda: weekly_backtest_loop(vibe_client, shared_state, WATCHLIST),
+                critical=False,
+                restart=True,
+            )
+            supervisor.spawn(
+                "vibe_patterns",
+                lambda: pattern_detection_loop(vibe_client, shared_state, WATCHLIST),
+                critical=False,
+                restart=True,
+            )
+            supervisor.spawn(
+                "vibe_factors",
+                lambda: factor_analysis_loop(vibe_client, shared_state, WATCHLIST),
+                critical=False,
+                restart=True,
+            )
+            supervisor.spawn(
+                "vibe_shadow",
+                lambda: shadow_account_loop(vibe_client, shared_state),
+                critical=False,
+                restart=True,
+            )
             if os.environ.get("VIBE_SWARM_ENABLED", "0").strip() in ("1", "true", "yes"):
-                run_tasks.append(crypto_desk_swarm_loop(vibe_client, shared_state, WATCHLIST))
-                logger.warning("✅ Vibe-Trading MCP client started — 5 scheduled tasks + SWARM active.")
+                supervisor.spawn(
+                    "vibe_swarm",
+                    lambda: crypto_desk_swarm_loop(vibe_client, shared_state, WATCHLIST),
+                    critical=False,
+                    restart=True,
+                )
+                logger.info("Vibe-Trading active - 5 scheduled tasks + SWARM (supervised).")
             else:
-                logger.warning("✅ Vibe-Trading MCP client started — 5 scheduled tasks active (swarm disabled).")
+                logger.info("Vibe-Trading active - 5 scheduled tasks (swarm disabled, supervised).")
         else:
             err = vibe_client.last_error or "unknown"
-            logger.warning("ℹ️ Vibe-Trading MCP start failed (%s) — tools disabled. Bot runs normally.", err)
+            logger.warning("Vibe-Trading start failed (%s) - tools disabled. Bot runs normally.", err)
     else:
-        logger.info("ℹ️ Vibe-Trading integration disabled (VIBE_TRADING_ENABLED=0 or package not installed).")
+        logger.info("ℹ️ Vibe-Trading integration disabled.")
 
     # Default 120s recurring snapshot → logs/runtime_metrics.jsonl (set to 0 to disable).
     _rmi = float(os.environ.get("RUNTIME_METRICS_INTERVAL_S", "120").strip() or "0")
     if _rmi >= 10.0:
-        run_tasks.append(
-            runtime_metrics_loop(
+        supervisor.spawn(
+            "runtime_metrics",
+            lambda: runtime_metrics_loop(
                 _LOG_SESSION_ID,
                 execution_mode,
                 risk_manager,
                 paper_executor,
                 WATCHLIST,
                 _rmi,
-            )
+            ),
+            critical=False,
+            restart=True,
         )
         logger.info(
             "📊 Runtime metrics JSONL every %.0fs → logs/runtime_metrics.jsonl",
@@ -946,7 +1050,7 @@ async def main() -> None:
         )
     elif _rmi > 0:
         logger.warning(
-            "RUNTIME_METRICS_INTERVAL_S=%.1f < 10s — metrics JSONL disabled (use ≥10 or 0).",
+            "RUNTIME_METRICS_INTERVAL_S=%.1f < 10s - metrics JSONL disabled (use >=10 or 0).",
             _rmi,
         )
     else:
@@ -956,7 +1060,12 @@ async def main() -> None:
         )
     _bundle_iv = float(os.environ.get("DIAGNOSTIC_BUNDLE_INTERVAL_S", "1800").strip() or "0")
     if _bundle_iv >= 60.0:
-        run_tasks.append(diagnostic_bundle_refresh_loop(_REPO_ROOT, _bundle_iv))
+        supervisor.spawn(
+            "diagnostic_bundle",
+            lambda: diagnostic_bundle_refresh_loop(_REPO_ROOT, _bundle_iv),
+            critical=False,
+            restart=True,
+        )
         logger.info(
             "📎 Cada %.0fs → %s (un solo archivo para pegar al asistente)",
             _bundle_iv,
@@ -964,13 +1073,13 @@ async def main() -> None:
         )
     elif _bundle_iv > 0:
         logger.warning(
-            "DIAGNOSTIC_BUNDLE_INTERVAL_S=%.1f < 60s — bundle automático desactivado.",
+            "DIAGNOSTIC_BUNDLE_INTERVAL_S=%.1f < 60s - bundle automático desactivado.",
             _bundle_iv,
         )
-    running_tasks: list[asyncio.Task[Any]] = [asyncio.create_task(task) for task in run_tasks]
 
+    # ── Start supervised loop ───────────────────────────────────────────────
     try:
-        await asyncio.gather(*running_tasks)
+        await supervisor.run_forever()
     except Exception as _critical_exc:  # noqa: BLE001
         logger.critical(
             "🚨 [CRITICAL] Bot loop terminated unexpectedly: %s – check bot_debug.log.",
@@ -993,11 +1102,7 @@ async def main() -> None:
             paper_executor.begin_shutdown()
         if vibe_client:
             await vibe_client.stop()
-        for task in running_tasks:
-            if not task.done():
-                task.cancel()
-        if running_tasks:
-            await asyncio.gather(*running_tasks, return_exceptions=True)
+        await supervisor.shutdown()
         if startup_alert_task and not startup_alert_task.done():
             startup_alert_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

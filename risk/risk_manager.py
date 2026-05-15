@@ -36,7 +36,7 @@ A second, session-level safety net protects the starting capital from
 ``MAX_PORTFOLIO_DD_PCT`` (15 %) below the balance recorded at
 instantiation time, :meth:`is_portfolio_dd_exceeded` returns *True* and
 all new positions are permanently blocked for that session.  Unlike the
-daily-loss halt this guard is **not** reset at midnight – it requires a
+daily-loss halt this guard is **not** reset at midnight - it requires a
 deliberate bot restart with fresh capital to resume trading.
 
 Multi-asset risk controls:
@@ -128,12 +128,12 @@ def get_sector(symbol: str) -> str:
     return SECTOR_MAP.get(normalised, _SECTOR_UNCLASSIFIED)
 
 
-# ── Dynamic risk management – base thresholds (neutral market) ────────────────
+# ── Dynamic risk management - base thresholds (neutral market) ────────────────
 BASE_SL: float = 0.025                      # 2.5 % base stop loss
 BASE_ACTIVATION_PCT: float = 0.020          # 2.0 % profit to activate trailing stop
 BASE_TRAILING_DISTANCE: float = 0.020       # 2.0 % trailing distance
 
-# ── Dynamic risk management – sentiment multiplier bounds ─────────────────────
+# ── Dynamic risk management - sentiment multiplier bounds ─────────────────────
 _SENTIMENT_LOW_THRESHOLD: float = 0.30      # below this → scalping regime
 _SENTIMENT_HIGH_THRESHOLD: float = 0.60    # above this → swing-trading regime
 _MULTIPLIER_LOW: float = 0.8               # shrink thresholds in low-sentiment markets
@@ -195,7 +195,7 @@ class RiskManager:
         self.max_positions: int = max_positions
         self._open_count: int = 0
         self._position_counter_fn: Any | None = position_counter_fn
-        # Portfolio drawdown circuit-breaker – fixed reference, never modified
+        # Portfolio drawdown circuit-breaker - fixed reference, never modified
         self._initial_balance: float = initial_balance
         self._portfolio_dd_floor: float = initial_balance * (1.0 - MAX_PORTFOLIO_DD_PCT)
         # Daily-loss tracking

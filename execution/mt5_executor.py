@@ -6,11 +6,11 @@ MetaTrader 5 execution layer for ClawdBot.
 
 Provides:
 
-* :func:`initialize_mt5` / :func:`shutdown_mt5` – connect to a local MT5
+* :func:`initialize_mt5` / :func:`shutdown_mt5` - connect to a local MT5
   terminal and log in to a trading account.
-* :func:`calculate_lot_size` – convert a fixed risk-percentage of the account
+* :func:`calculate_lot_size` - convert a fixed risk-percentage of the account
   balance into a standard MT5 lot size for a given crypto CFD symbol.
-* :class:`MT5Executor` – drop-in replacement for the Binance-backed section of
+* :class:`MT5Executor` - drop-in replacement for the Binance-backed section of
   :class:`~execution.paper_executor.PaperExecutor`.  It inherits all paper-book
   keeping logic (stop-loss tracking, trailing stop, journal CSV, database
   persistence) but replaces every ``ccxt`` call with the corresponding
@@ -103,7 +103,7 @@ try:
     import MetaTrader5 as mt5  # type: ignore[import-untyped]
 
     _MT5_AVAILABLE = True
-except ImportError:  # pragma: no cover – only available on Windows with MT5 installed
+except ImportError:  # pragma: no cover - only available on Windows with MT5 installed
     mt5 = None  # type: ignore[assignment]
     _MT5_AVAILABLE = False
 
@@ -184,10 +184,10 @@ def _apply_mt5_symbol_env_overrides() -> None:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("MT5_SYMBOL_OVERRIDES is not valid JSON — ignoring.")
+        logger.warning("MT5_SYMBOL_OVERRIDES is not valid JSON - ignoring.")
         return
     if not isinstance(data, dict):
-        logger.warning("MT5_SYMBOL_OVERRIDES must be a JSON object — ignoring.")
+        logger.warning("MT5_SYMBOL_OVERRIDES must be a JSON object - ignoring.")
         return
     for k, v in data.items():
         if isinstance(k, str) and isinstance(v, str) and v.strip():
@@ -202,46 +202,46 @@ _apply_mt5_symbol_env_overrides()
 # Human-readable descriptions for every known MT5 trade retcode.  Used by
 # _log_mt5_retcode() to produce actionable log messages.
 MT5_RETCODE_DESCRIPTIONS: dict[int, str] = {
-    10004: "REQUOTE – price changed between request and execution; retry",
-    10006: "REQUEST_REJECTED – request rejected by the broker",
-    10007: "REQUEST_CANCEL – request was cancelled by the client",
-    10008: "REQUEST_PLACED – order placed but not yet executed",
-    10009: "TRADE_RETCODE_DONE – request completed successfully",
-    10010: "DONE_PARTIAL – request partially executed; retry remainder",
-    10011: "REQUEST_ERROR – processing error; retry",
-    10012: "REQUEST_TIMEOUT – request timed out; retry",
-    10013: "INVALID_REQUEST – malformed order request",
-    10014: "INVALID_VOLUME – lot size is outside broker limits",
-    10015: "INVALID_PRICE – price is out of range or stale",
-    10016: "INVALID_STOPS – SL/TP price is invalid (check digits/distance)",
-    10017: "TRADE_DISABLED – trading is disabled for this symbol",
-    10018: "MARKET_CLOSED – market is closed for this symbol",
-    10019: "NO_MONEY – insufficient margin to open the position",
-    10020: "PRICE_CHANGED – price changed; retry with updated price",
-    10021: "PRICE_OFF – no quotes available; retry shortly",
-    10022: "INVALID_EXPIRATION – order expiration time is invalid",
-    10023: "ORDER_CHANGED – order state changed during processing",
-    10024: "TOO_MANY_REQUESTS – request flood limit hit; retry after pause",
-    10025: "NO_CHANGES – modification request contains no actual changes",
-    10026: "SERVER_DISABLES_AT – algo-trading disabled on the server side",
-    10027: "CLIENT_DISABLES_AT – 'Algo Trading' button is OFF in MT5 terminal",
-    10028: "LOCKED – order or position is locked by the server",
-    10029: "FROZEN – order or position is frozen (e.g. during market auction)",
-    10030: "INVALID_FILL – order filling type is not supported",
-    10031: "CONNECTION – no connection to the trade server; retry",
-    10032: "ONLY_REAL – operation only allowed on real accounts",
-    10033: "LIMIT_ORDERS – maximum number of pending orders reached",
-    10034: "LIMIT_VOLUME – volume limit per symbol/direction reached",
-    10035: "INVALID_ORDER – unknown or invalid order type",
-    10036: "POSITION_CLOSED – position is already closed",
-    10038: "INVALID_CLOSE_VOLUME – close volume exceeds open volume",
-    10039: "CLOSE_ORDER_EXIST – a close order for this position already exists",
-    10040: "LIMIT_POSITIONS – maximum number of open positions reached",
-    10041: "REJECT_CANCEL – pending order activation failed; order was cancelled",
-    10042: "LONG_ONLY – only long (BUY) positions are allowed",
-    10043: "SHORT_ONLY – only short (SELL) positions are allowed",
-    10044: "CLOSE_ONLY – only close operations are allowed at this time",
-    10045: "FIFO_CLOSE – positions must be closed in FIFO order",
+    10004: "REQUOTE - price changed between request and execution; retry",
+    10006: "REQUEST_REJECTED - request rejected by the broker",
+    10007: "REQUEST_CANCEL - request was cancelled by the client",
+    10008: "REQUEST_PLACED - order placed but not yet executed",
+    10009: "TRADE_RETCODE_DONE - request completed successfully",
+    10010: "DONE_PARTIAL - request partially executed; retry remainder",
+    10011: "REQUEST_ERROR - processing error; retry",
+    10012: "REQUEST_TIMEOUT - request timed out; retry",
+    10013: "INVALID_REQUEST - malformed order request",
+    10014: "INVALID_VOLUME - lot size is outside broker limits",
+    10015: "INVALID_PRICE - price is out of range or stale",
+    10016: "INVALID_STOPS - SL/TP price is invalid (check digits/distance)",
+    10017: "TRADE_DISABLED - trading is disabled for this symbol",
+    10018: "MARKET_CLOSED - market is closed for this symbol",
+    10019: "NO_MONEY - insufficient margin to open the position",
+    10020: "PRICE_CHANGED - price changed; retry with updated price",
+    10021: "PRICE_OFF - no quotes available; retry shortly",
+    10022: "INVALID_EXPIRATION - order expiration time is invalid",
+    10023: "ORDER_CHANGED - order state changed during processing",
+    10024: "TOO_MANY_REQUESTS - request flood limit hit; retry after pause",
+    10025: "NO_CHANGES - modification request contains no actual changes",
+    10026: "SERVER_DISABLES_AT - algo-trading disabled on the server side",
+    10027: "CLIENT_DISABLES_AT - 'Algo Trading' button is OFF in MT5 terminal",
+    10028: "LOCKED - order or position is locked by the server",
+    10029: "FROZEN - order or position is frozen (e.g. during market auction)",
+    10030: "INVALID_FILL - order filling type is not supported",
+    10031: "CONNECTION - no connection to the trade server; retry",
+    10032: "ONLY_REAL - operation only allowed on real accounts",
+    10033: "LIMIT_ORDERS - maximum number of pending orders reached",
+    10034: "LIMIT_VOLUME - volume limit per symbol/direction reached",
+    10035: "INVALID_ORDER - unknown or invalid order type",
+    10036: "POSITION_CLOSED - position is already closed",
+    10038: "INVALID_CLOSE_VOLUME - close volume exceeds open volume",
+    10039: "CLOSE_ORDER_EXIST - a close order for this position already exists",
+    10040: "LIMIT_POSITIONS - maximum number of open positions reached",
+    10041: "REJECT_CANCEL - pending order activation failed; order was cancelled",
+    10042: "LONG_ONLY - only long (BUY) positions are allowed",
+    10043: "SHORT_ONLY - only short (SELL) positions are allowed",
+    10044: "CLOSE_ONLY - only close operations are allowed at this time",
+    10045: "FIFO_CLOSE - positions must be closed in FIFO order",
 }
 
 # Return codes that represent transient conditions worth retrying.
@@ -255,7 +255,7 @@ _RETRYABLE_RETCODES: frozenset[int] = frozenset({
     10031,  # CONNECTION
 })
 
-# Expected pauses (weekend / session) — must not trip the circuit breaker.
+# Expected pauses (weekend / session) - must not trip the circuit breaker.
 _MT5_SOFT_SESSION_RETCODES: frozenset[int] = frozenset({
     10018,  # MARKET_CLOSED
     10021,  # PRICE_OFF
@@ -335,7 +335,7 @@ def initialize_mt5(
     account_info = mt5.account_info()
     if account_info is None:
         logger.error(
-            "MT5 initialized but account_info() returned None – "
+            "MT5 initialized but account_info() returned None - "
             "check account number / password / server."
         )
         mt5.shutdown()
@@ -376,7 +376,7 @@ def fetch_mt5_account_balance() -> float | None:
         return None
     acct = mt5.account_info()
     if acct is None:
-        logger.warning("[MT5] account_info() returned None – cannot fetch balance.")
+        logger.warning("[MT5] account_info() returned None - cannot fetch balance.")
         return None
     logger.debug(
         "[MT5] Account balance=%.2f  equity=%.2f  currency=%s",
@@ -464,7 +464,7 @@ def calculate_lot_size(
     """
     if not _MT5_AVAILABLE or sl_distance_price <= 0.0 or account_balance <= 0.0:
         logger.warning(
-            "calculate_lot_size: invalid inputs or MT5 unavailable – "
+            "calculate_lot_size: invalid inputs or MT5 unavailable - "
             "returning fallback volume %.2f",
             _FALLBACK_VOLUME_MIN,
         )
@@ -473,7 +473,7 @@ def calculate_lot_size(
     info = mt5.symbol_info(symbol)
     if info is None:
         logger.warning(
-            "calculate_lot_size: mt5.symbol_info('%s') returned None – "
+            "calculate_lot_size: mt5.symbol_info('%s') returned None - "
             "returning fallback volume %.2f",
             symbol,
             _FALLBACK_VOLUME_MIN,
@@ -528,7 +528,7 @@ def calculate_lot_size(
         cap = account_balance * risk_pct * max(risk_mult, 1.0)
         if implied_loss > cap + 1e-9:
             logger.warning(
-                "calculate_lot_size: min lot %.4f would risk %.4f at SL vs cap %.4f — skip",
+                "calculate_lot_size: min lot %.4f would risk %.4f at SL vs cap %.4f - skip",
                 min_lot_floor,
                 implied_loss,
                 cap,
@@ -613,7 +613,7 @@ class MT5Executor(PaperExecutor):
         # Register live position counter to eliminate counter drift.
         risk_manager.set_position_counter_fn(self._live_open_count)
 
-        # Issue 3 – warn if risk_pct clearly above typical prop cap (skip noise at 2.5% aggressive).
+        # Issue 3 - warn if risk_pct clearly above typical prop cap (skip noise at 2.5% aggressive).
         if risk_pct > 0.025 + 1e-9:
             logger.warning(
                 "[MT5] ⚠️ RISK ALERT: risk_pct=%.4f exceeds 2.5%%. "
@@ -622,7 +622,7 @@ class MT5Executor(PaperExecutor):
             )
         self._risk_pct = risk_pct
 
-        # Issue 6 – circuit breaker counters to detect MT5 terminal outages.
+        # Issue 6 - circuit breaker counters to detect MT5 terminal outages.
         self._mt5_failure_count: int = 0
         self._mt5_last_failure_time: float = 0.0
         self._mt5_max_consecutive_failures: int = 10
@@ -632,7 +632,7 @@ class MT5Executor(PaperExecutor):
         self._mt5_tp_trace_at: dict[str, float] = {}
         # Same SL source → same clamp every tick would spam WARNING; throttle per MT5 symbol.
         self._sl_widen_last_warn_mono: dict[str, float] = {}
-        # 10016 on SLTP is often quote vs clamp edge — throttle; avoid ERROR every tick.
+        # 10016 on SLTP is often quote vs clamp edge - throttle; avoid ERROR every tick.
         self._sltp_10016_last_mono: dict[str, float] = {}
         # Graceful-stop guard checked by sync/reconcile paths.
         self._shutting_down: bool = False
@@ -686,7 +686,7 @@ class MT5Executor(PaperExecutor):
             return 0
         raw = mt5.positions_get()
         if raw is None:
-            logger.warning("[RECOVERY] MT5 positions_get returned None — skip recovery.")
+            logger.warning("[RECOVERY] MT5 positions_get returned None - skip recovery.")
             return 0
         ours = [p for p in raw if p.magic == self._magic and p.type == mt5.POSITION_TYPE_BUY]
         recovered = 0
@@ -698,12 +698,28 @@ class MT5Executor(PaperExecutor):
             sl_price = float(p.sl) if p.sl else entry_price * 0.975
             ts = datetime.now(tz=timezone.utc)
             th = get_execution_thresholds()
+            position_size = float(p.volume) * entry_price
+            # Insert into DB so we have a valid trade_id (UUID/INTEGER depending on schema)
+            trade_id: str | None = None
+            try:
+                trade_id = await self._db.insert_open_trade(
+                    symbol=sym,
+                    entry_price=entry_price,
+                    position_size=position_size,
+                    entry_time=ts,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RECOVERY] insert_open_trade failed for %s (ticket=%s) - %s",
+                    sym, p.ticket, exc,
+                )
+                trade_id = None
             pos = OpenPosition(
-                trade_id=str(p.ticket),
+                trade_id=trade_id if trade_id is not None else str(p.ticket),
                 symbol=sym,
                 entry_time=ts,
                 entry_price=entry_price,
-                position_size=float(p.volume) * entry_price,
+                position_size=position_size,
                 sl_price=sl_price,
                 activation_price=entry_price * (1.0 + th.activation_pct),
                 trailing_distance_pct=th.trailing_distance_pct,
@@ -719,7 +735,7 @@ class MT5Executor(PaperExecutor):
             self._risk.register_open(risk_usd=pos.position_size * pos.sl_pct)
             recovered += 1
             logger.warning(
-                "♻️ [RECOVERY] Adopted orphan position %s ticket=%s entry=%.4f",
+                "[RECOVERY] Adopted orphan position %s ticket=%s entry=%.4f",
                 sym, p.ticket, entry_price,
             )
         if recovered:
@@ -762,7 +778,7 @@ class MT5Executor(PaperExecutor):
         logger.info("[MT5 TP sync] %s | %s | %s", sym, reason, message)
 
     def _log_sltp_10016_throttled(self, mt5_sym: str | None) -> None:
-        """INVALID_STOPS on position modify — expected at broker edge; do not log as ERROR each tick."""
+        """INVALID_STOPS on position modify - expected at broker edge; do not log as ERROR each tick."""
         try:
             interval = float(
                 os.environ.get("MT5_SLTP_10016_LOG_INTERVAL_S", "90").strip() or "90"
@@ -782,7 +798,7 @@ class MT5Executor(PaperExecutor):
                 return
             self._sltp_10016_last_mono[key] = now_m
         logger.warning(
-            "[MT5] SL/TP modify rejected — 10016 INVALID_STOPS (%s). "
+            "[MT5] SL/TP modify rejected - 10016 INVALID_STOPS (%s). "
             "Quote vs min distance/freeze; next sync re-clamps. "
             "If often: raise MT5_STOPS_BUFFER_POINTS.",
             key,
@@ -814,7 +830,7 @@ class MT5Executor(PaperExecutor):
             return spread_price / entry_price if entry_price > 0 else _SPREAD_BUFFER_FALLBACK
         except (OSError, TimeoutError, AttributeError, TypeError) as exc:
             logger.debug(
-                "_get_spread_fraction: failed to fetch tick for %s – "
+                "_get_spread_fraction: failed to fetch tick for %s - "
                 "using fallback spread buffer. Error: %s",
                 symbol,
                 exc,
@@ -852,7 +868,7 @@ class MT5Executor(PaperExecutor):
         Returns
         -------
         float
-            Effective trailing distance fraction ≥ *trailing_distance_pct*.
+            Effective trailing distance fraction >= *trailing_distance_pct*.
         """
         spread_fraction = self._get_spread_fraction(symbol, entry_price)
         effective = trailing_distance_pct + spread_fraction
@@ -902,12 +918,12 @@ class MT5Executor(PaperExecutor):
             return None
 
         if not _MT5_AVAILABLE:
-            return broker_sym  # Paper mode – no terminal to query.
+            return broker_sym  # Paper mode - no terminal to query.
 
         info = mt5.symbol_info(broker_sym)
         if info is None:
             logger.error(
-                "[MT5] mt5.symbol_info('%s') returned None – "
+                "[MT5] mt5.symbol_info('%s') returned None - "
                 "symbol does not exist on the broker server.",
                 broker_sym,
             )
@@ -1083,7 +1099,7 @@ class MT5Executor(PaperExecutor):
         except ValueError:
             buffer_pts = 2.0
 
-        # Stops + freeze (broker forbids SL/TP mods inside freeze distance — causes 10016).
+        # Stops + freeze (broker forbids SL/TP mods inside freeze distance - causes 10016).
         min_total_pts = float(stops_level + freeze_level) + buffer_pts
         min_total_price = min_total_pts * point
 
@@ -1142,7 +1158,7 @@ class MT5Executor(PaperExecutor):
                 break
 
         logger.error(
-            "[MT5] Could not clamp SL for %s – bid=%.5f ask=%.5f last_sl=%.5f",
+            "[MT5] Could not clamp SL for %s - bid=%.5f ask=%.5f last_sl=%.5f",
             mt5_sym,
             bid,
             ask_f,
@@ -1162,7 +1178,7 @@ class MT5Executor(PaperExecutor):
     ) -> bool:
         """Check that SL/TP distances satisfy broker minimum distance.
 
-        Uses ``trade_stops_level + trade_freeze_level`` (points × point) — freeze
+        Uses ``trade_stops_level + trade_freeze_level`` (points × point) - freeze
         applies to SL/TP modifications and triggers 10016 if omitted.
 
         CRITICAL: For a BUY order, the SL is triggered by the BID price.
@@ -1310,7 +1326,7 @@ class MT5Executor(PaperExecutor):
             )
 
         logger.debug(
-            "[MT5] Margin OK – required=%.2f, free=%.2f, post_trade_ratio=%.1f%%",
+            "[MT5] Margin OK - required=%.2f, free=%.2f, post_trade_ratio=%.1f%%",
             margin_required,
             acct.margin_free,
             margin_ratio * 100,
@@ -1345,7 +1361,7 @@ class MT5Executor(PaperExecutor):
             ``True`` when the tick is valid and fresh, ``False`` otherwise.
         """
         if tick is None:
-            logger.error("[MT5] Tick is None for %s – cannot validate freshness.", symbol)
+            logger.error("[MT5] Tick is None for %s - cannot validate freshness.", symbol)
             return False
 
         if tick.ask <= 0 or tick.bid <= 0:
@@ -1383,7 +1399,7 @@ class MT5Executor(PaperExecutor):
         Foreign (non-bot magic) positions are rejected by default so manual trades
         do not collide with bot entries on the same instrument.  Set environment
         ``MT5_ALLOW_FOREIGN_SYMBOL_OVERLAP=1`` to allow opens while a manual long
-        exists (dangerous — double exposure).
+        exists (dangerous - double exposure).
 
         Also blocks when the broker already shows a bot-tagged BUY (sync lag vs
         local ``open_positions``).
@@ -1433,7 +1449,7 @@ class MT5Executor(PaperExecutor):
         Any | None
             The ``order_send`` result on success, or ``None`` on final failure.
         """
-        # Issue 6 – circuit breaker: refuse new orders while terminal is down.
+        # Issue 6 - circuit breaker: refuse new orders while terminal is down.
         if self._mt5_failure_count >= self._mt5_max_consecutive_failures:
             elapsed = time.time() - self._mt5_last_failure_time
             if elapsed < self._mt5_cooldown_seconds:
@@ -1450,7 +1466,7 @@ class MT5Executor(PaperExecutor):
                     )
                 return None
             else:
-                # Cooldown expired – reset and allow a new attempt.
+                # Cooldown expired - reset and allow a new attempt.
                 logger.info(
                     "[MT5 CIRCUIT BREAKER] Cooldown expired. "
                     "Resetting failure counter (was %d).",
@@ -1498,10 +1514,10 @@ class MT5Executor(PaperExecutor):
                 return None
 
             if result.retcode == mt5.TRADE_RETCODE_DONE:
-                # Success – reset circuit breaker counter.
+                # Success - reset circuit breaker counter.
                 if self._mt5_failure_count > 0:
                     logger.info(
-                        "[MT5] Order succeeded – resetting failure counter (was %d).",
+                        "[MT5] Order succeeded - resetting failure counter (was %d).",
                         self._mt5_failure_count,
                     )
                 self._mt5_failure_count = 0
@@ -1527,7 +1543,7 @@ class MT5Executor(PaperExecutor):
                     )
                 return result
 
-            # SLTP + 10016: retrying the *same* request dict never fixes INVALID_STOPS —
+            # SLTP + 10016: retrying the *same* request dict never fixes INVALID_STOPS -
             # quote moved vs clamp; next _sync_exchange_stops tick rebuilds levels.
             if sltp_10016:
                 self._log_sltp_10016_throttled(request.get("symbol"))
@@ -1538,7 +1554,7 @@ class MT5Executor(PaperExecutor):
                 self._mt5_last_failure_time = time.time()
                 back_off = 0.5 * attempt
                 logger.warning(
-                    "[MT5] Transient error for %s (attempt %d/%d, failure_count=%d) – "
+                    "[MT5] Transient error for %s (attempt %d/%d, failure_count=%d) - "
                     "retrying in %.1f s...",
                     request.get("symbol"),
                     attempt,
@@ -1614,19 +1630,19 @@ class MT5Executor(PaperExecutor):
 
             if self._risk.is_portfolio_dd_exceeded():
                 logger.warning(
-                    "🚨 [CIRCUIT BREAKER] All new positions blocked – "
+                    "🚨 [CIRCUIT BREAKER] All new positions blocked - "
                     "portfolio drawdown limit reached (symbol=%s).",
                     sym,
                 )
                 return False
 
             if sym in self.open_positions or sym in self._pending_symbols:
-                logger.debug("Trade skipped – a position for %s is already open.", sym)
+                logger.debug("Trade skipped - a position for %s is already open.", sym)
                 return False
 
             if not self._risk.can_open_position():
                 logger.debug(
-                    "Trade skipped – max open positions (%d) reached.",
+                    "Trade skipped - max open positions (%d) reached.",
                     self._risk.max_positions,
                 )
                 return False
@@ -1635,7 +1651,7 @@ class MT5Executor(PaperExecutor):
             if self._risk.is_sector_exposed(sym, list(occupied_syms)):
                 sector = get_sector(sym)
                 logger.warning(
-                    "🛡️ [RISK CONTROL] BUY signal for %s ignored – "
+                    "🛡️ [RISK CONTROL] BUY signal for %s ignored - "
                     "maximum sector exposure reached: %s.",
                     sym,
                     sector,
@@ -1649,7 +1665,7 @@ class MT5Executor(PaperExecutor):
             )
             if position_size <= 0.0:
                 logger.warning(
-                    "⚠️ [ALERT] Position size is 0 for %s — portfolio risk budget exhausted or drawdown limit.",
+                    "⚠️ [ALERT] Position size is 0 for %s - portfolio risk budget exhausted or drawdown limit.",
                     sym,
                 )
                 return False
@@ -1706,7 +1722,7 @@ class MT5Executor(PaperExecutor):
             block_open, _occ_reason = self._broker_blocks_new_long_on_symbol(mt5_sym)
             if block_open:
                 logger.warning(
-                    "[MT5] New LONG blocked (%s) on %s — sym=%s",
+                    "[MT5] New LONG blocked (%s) on %s - sym=%s",
                     _occ_reason,
                     mt5_sym,
                     sym,
@@ -1719,10 +1735,10 @@ class MT5Executor(PaperExecutor):
             sym_info = mt5.symbol_info(mt5_sym)
             digits: int = sym_info.digits if sym_info else 5
 
-            # Issue 4 – reject stale tick prices before entering.
+            # Issue 4 - reject stale tick prices before entering.
             tick = mt5.symbol_info_tick(mt5_sym)
             if not self._validate_tick_freshness(tick, mt5_sym, max_age_seconds=5.0):
-                logger.error("[MT5] Tick freshness check failed – aborting trade for %s.", sym)
+                logger.error("[MT5] Tick freshness check failed - aborting trade for %s.", sym)
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
                     self._risk.register_close(risk_usd=0.0)
@@ -1734,13 +1750,13 @@ class MT5Executor(PaperExecutor):
                 digits,
             )
 
-            # Issue 1 – widen SL if tighter than broker ``trade_stops_level`` (+ buffer).
+            # Issue 1 - widen SL if tighter than broker ``trade_stops_level`` (+ buffer).
             sl_clamped, _ = self._clamp_stop_loss_buy(
                 mt5_sym, stop_loss_price, ask_price, tick, digits
             )
             if sl_clamped is None:
                 logger.error(
-                    "[MT5] Stop clamp failed (broker rules) – aborting trade for %s.",
+                    "[MT5] Stop clamp failed (broker rules) - aborting trade for %s.",
                     sym,
                 )
                 async with self._positions_lock:
@@ -1762,7 +1778,7 @@ class MT5Executor(PaperExecutor):
             )
             if lots <= 0.0:
                 logger.error(
-                    "[MT5] Lot size 0 (min-lot / risk cap) – aborting trade for %s.",
+                    "[MT5] Lot size 0 (min-lot / risk cap) - aborting trade for %s.",
                     sym,
                 )
                 async with self._positions_lock:
@@ -1770,9 +1786,9 @@ class MT5Executor(PaperExecutor):
                     self._risk.register_close(risk_usd=0.0)
                 return False
 
-            # Issue 2 – verify sufficient margin before sending the order.
+            # Issue 2 - verify sufficient margin before sending the order.
             if not self._check_margin_available(mt5_sym, lots, ask_price):
-                logger.error("[MT5] Margin check failed – aborting trade for %s.", sym)
+                logger.error("[MT5] Margin check failed - aborting trade for %s.", sym)
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
                     self._risk.register_close(risk_usd=0.0)
@@ -1786,7 +1802,7 @@ class MT5Executor(PaperExecutor):
             )
             result = await self._send_order_with_retry(request)
             if result is None:
-                # Order rejected – roll back counter (balance wasn't deducted)
+                # Order rejected - roll back counter (balance wasn't deducted)
                 async with self._positions_lock:
                     self._pending_symbols.discard(sym)
                     self._risk.register_close(risk_usd=0.0)
@@ -1801,7 +1817,7 @@ class MT5Executor(PaperExecutor):
                 entry_time=ts,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[MT5][DB] insert_open_trade failed for %s — rolling back: %s", sym, exc)
+            logger.exception("[MT5][DB] insert_open_trade failed for %s - rolling back: %s", sym, exc)
             async with self._positions_lock:
                 self._pending_symbols.discard(sym)
                 self._risk.register_close(risk_usd=0.0)
@@ -1889,7 +1905,7 @@ class MT5Executor(PaperExecutor):
         *,
         telegram_after: bool = False,
     ) -> None:
-        """Persist close, risk, journal — shared by normal exit and ghost sync."""
+        """Persist close, risk, journal - shared by normal exit and ghost sync."""
         fee_total = pos.position_size * _TAKER_FEE_RATE * 2
         pnl_net = gross_pnl - fee_total
         commission = 0.0
@@ -1925,24 +1941,32 @@ class MT5Executor(PaperExecutor):
                 fee = economics["fee"]
 
         if pos.trade_id is not None:
-            try:
-                await self._db.close_trade(
-                    trade_id=pos.trade_id,
-                    exit_price=exit_price,
-                    exit_time=exit_time,
-                    pnl=gross_pnl,
-                    pnl_net=pnl_net,
-                    commission=commission,
-                    swap=swap,
-                    fee=fee,
-                    exit_reason=exit_reason_code,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "[MT5][DB] close_trade failed trade_id=%s — %s",
+            # Skip DB close for numeric-only trade_ids (legacy state.json or
+            # recovery before DB insert) because they were never persisted.
+            if isinstance(pos.trade_id, str) and pos.trade_id.isdigit():
+                logger.debug(
+                    "[MT5][DB] close_trade skipped for numeric trade_id=%s (not in DB).",
                     pos.trade_id,
-                    exc,
                 )
+            else:
+                try:
+                    await self._db.close_trade(
+                        trade_id=pos.trade_id,
+                        exit_price=exit_price,
+                        exit_time=exit_time,
+                        pnl=gross_pnl,
+                        pnl_net=pnl_net,
+                        commission=commission,
+                        swap=swap,
+                        fee=fee,
+                        exit_reason=exit_reason_code,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "[MT5][DB] close_trade failed trade_id=%s - %s",
+                        pos.trade_id,
+                        exc,
+                    )
 
         async with self._positions_lock:
             self._risk.credit(gross_pnl)
@@ -2028,7 +2052,7 @@ class MT5Executor(PaperExecutor):
             telegram_after=False,
         )
         logger.info(
-            "[MT5] Posición ya cerrada en broker — libro sincronizado sym=%s ticket=%s",
+            "[MT5] Posición ya cerrada en broker - libro sincronizado sym=%s ticket=%s",
             symbol,
             mt5_ticket,
         )
@@ -2039,7 +2063,7 @@ class MT5Executor(PaperExecutor):
         if self._shutting_down:
             return
         if not self._mt5_terminal_connected():
-            logger.warning("[MT5 SYNC] Terminal disconnected — skip ghost reconcile for %s.", sym)
+            logger.warning("[MT5 SYNC] Terminal disconnected - skip ghost reconcile for %s.", sym)
             return
         async with self._positions_lock:
             pos = self.open_positions.get(sym)
@@ -2089,7 +2113,7 @@ class MT5Executor(PaperExecutor):
                 continue
             if cand.type != mt5.POSITION_TYPE_BUY:
                 logger.warning(
-                    "[MT5 SYNC] Cannot adopt %s — broker position is not BUY.", sym
+                    "[MT5 SYNC] Cannot adopt %s - broker position is not BUY.", sym
                 )
                 return False
             p = cand
@@ -2130,7 +2154,7 @@ class MT5Executor(PaperExecutor):
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
-                "[MT5 SYNC] adopt insert_open_trade failed sym=%s — %s", sym, exc
+                "[MT5 SYNC] adopt insert_open_trade failed sym=%s - %s", sym, exc
             )
             return False
 
@@ -2163,7 +2187,7 @@ class MT5Executor(PaperExecutor):
 
         async with self._positions_lock:
             if sym in self.open_positions:
-                logger.debug("_try_adopt_mt5_position: %s already tracked — skipping.", sym)
+                logger.debug("_try_adopt_mt5_position: %s already tracked - skipping.", sym)
                 return False
             self.open_positions[sym] = op
             risk_usd = position_size * fixed_ad
@@ -2205,17 +2229,17 @@ class MT5Executor(PaperExecutor):
     ) -> Any:
         """Dispatch broker close + bookkeeping.
 
-        * **PaperExecutor API** — ``(symbol, exit_price, reason: str)`` from
+        * **PaperExecutor API** - ``(symbol, exit_price, reason: str)`` from
           :meth:`~execution.paper_executor.PaperExecutor.check_and_close` and
           :meth:`~execution.paper_executor.PaperExecutor.check_ml_exit`.
-        * **Internal API** — ``(symbol, exit_price, exit_time, pnl, exit_reason_code)``.
+        * **Internal API** - ``(symbol, exit_price, exit_time, pnl, exit_reason_code)``.
         """
         if isinstance(arg3, str) and arg4 is None:
             exit_time = datetime.now(tz=timezone.utc)
             pos = self.open_positions.get(symbol)
             if pos is None:
                 logger.warning(
-                    "_close_position (paper API): no open position for %s — skipping.",
+                    "_close_position (paper API): no open position for %s - skipping.",
                     symbol,
                 )
                 return None
@@ -2262,13 +2286,13 @@ class MT5Executor(PaperExecutor):
         exit.
 
         If the MT5 order is rejected the position is still removed from local
-        state and the paper PnL is updated — this mirrors the Binance fallback
+        state and the paper PnL is updated - this mirrors the Binance fallback
         behaviour and prevents ghost positions from accumulating.
         """
         pos = self.open_positions.get(symbol)
         if pos is None:
             logger.warning(
-                "_close_position called for %s but no open position found – skipping.",
+                "_close_position called for %s but no open position found - skipping.",
                 symbol,
             )
             return False
@@ -2286,7 +2310,7 @@ class MT5Executor(PaperExecutor):
                 mt5_sym = self._resolve_symbol(symbol)
                 if mt5_sym is None:
                     logger.error(
-                        "[MT5] Cannot send close order for '%s' – symbol not in SYMBOL_MAP. "
+                        "[MT5] Cannot send close order for '%s' - symbol not in SYMBOL_MAP. "
                         "keeping local position for retry.",
                         symbol,
                     )
@@ -2333,7 +2357,7 @@ class MT5Executor(PaperExecutor):
                                 )
                             else:
                                 logger.error(
-                                    "MT5 close order rejected for %s (ticket=%d) – "
+                                    "MT5 close order rejected for %s (ticket=%d) - "
                                     "keeping local position for retry.",
                                     symbol,
                                     mt5_pos.ticket,
@@ -2349,7 +2373,7 @@ class MT5Executor(PaperExecutor):
                             close_error = close_error or "mt5_no_positions_closed"
                         elif closed_count > 1:
                             logger.warning(
-                                "[MT5] Closed %d positions for %s (expected 1) – "
+                                "[MT5] Closed %d positions for %s (expected 1) - "
                                 "possible overlap after restart.",
                                 closed_count,
                                 symbol,
@@ -2362,7 +2386,7 @@ class MT5Executor(PaperExecutor):
                         if synced:
                             return True
                         logger.warning(
-                            "[MT5] No open position found for %s with magic=%d – "
+                            "[MT5] No open position found for %s with magic=%d - "
                             "keeping local position for retry.",
                             symbol,
                             self._magic,
@@ -2407,7 +2431,7 @@ class MT5Executor(PaperExecutor):
             if entry == mt5.DEAL_ENTRY_OUT:
                 close_deals.append(d)
         # Never sum the whole deal list as fallback: without OUT filtering MT5 can
-        # return IN+OUT rows or broader history — summing everything inflated PnL
+        # return IN+OUT rows or broader history - summing everything inflated PnL
         # (e.g. journal +358 USDT ghosts). Fall back to book formula via None.
         if not close_deals:
             return None
@@ -2491,7 +2515,7 @@ class MT5Executor(PaperExecutor):
             pins = await asyncio.to_thread(lambda t=tid: mt5.positions_get(ticket=t))
             if pins is None:
                 logger.warning(
-                    "[MT5 SYNC] positions_get(ticket=%s) returned None — deferring ghost for %s.",
+                    "[MT5 SYNC] positions_get(ticket=%s) returned None - deferring ghost for %s.",
                     tid,
                     sym,
                 )
@@ -2504,7 +2528,7 @@ class MT5Executor(PaperExecutor):
                 )
                 if not self._ghost_mark_missing(gk, confirmations_required=needed):
                     logger.warning(
-                        "[MT5 SYNC] Ticket %s missing for %s (%d/%d) — waiting confirmation.",
+                        "[MT5 SYNC] Ticket %s missing for %s (%d/%d) - waiting confirmation.",
                         tid,
                         sym,
                         self._ghost_missing_counts.get(gk, 0),
@@ -2512,7 +2536,7 @@ class MT5Executor(PaperExecutor):
                     )
                     continue
                 logger.info(
-                    "[MT5 SYNC] Ticket %s closed on broker — ghost reconcile %s",
+                    "[MT5 SYNC] Ticket %s closed on broker - ghost reconcile %s",
                     tid,
                     sym,
                 )
@@ -2539,10 +2563,10 @@ class MT5Executor(PaperExecutor):
             return len(self.open_positions)
 
         if not _MT5_AVAILABLE:
-            logger.warning("[MT5 SYNC] MetaTrader5 not available – skipping sync.")
+            logger.warning("[MT5 SYNC] MetaTrader5 not available - skipping sync.")
             return len(self.open_positions)
         if not self._mt5_terminal_connected():
-            logger.warning("[MT5 SYNC] MT5 disconnected — sync skipped (no ghost actions).")
+            logger.warning("[MT5 SYNC] MT5 disconnected - sync skipped (no ghost actions).")
             return len(self.open_positions)
 
         needed_confirmations = (
@@ -2553,7 +2577,7 @@ class MT5Executor(PaperExecutor):
         mt5_positions_raw = await self._mt5_positions_get_retry()
         if mt5_positions_raw is None:
             logger.warning(
-                "[MT5 SYNC] mt5.positions_get() still None after retries — "
+                "[MT5 SYNC] mt5.positions_get() still None after retries - "
                 "using per-symbol fallback + ticket checks.",
             )
             mt5_positions_raw = await self._mt5_positions_fallback_symbols()
@@ -2573,7 +2597,7 @@ class MT5Executor(PaperExecutor):
             if p.magic == self._magic
         }
 
-        # Ghost detection — broker closed without bot bookkeeping (SL/TP / manual)
+        # Ghost detection - broker closed without bot bookkeeping (SL/TP / manual)
         async with self._positions_lock:
             snapshot = list(self.open_positions.items())
             ghost_symbols: list[str] = []
@@ -2586,7 +2610,7 @@ class MT5Executor(PaperExecutor):
                     ghost_symbols.append(sym)
                 else:
                     logger.warning(
-                        "[MT5 SYNC] Ghost candidate %s (%d/%d) — waiting confirmation.",
+                        "[MT5 SYNC] Ghost candidate %s (%d/%d) - waiting confirmation.",
                         sym,
                         self._ghost_missing_counts.get(gk, 0),
                         needed_confirmations,
@@ -2594,7 +2618,7 @@ class MT5Executor(PaperExecutor):
         for sym in ghost_symbols:
             await self._reconcile_ghost_position(sym)
 
-        # Same symbol, new broker ticket — remove stale local ticket row
+        # Same symbol, new broker ticket - remove stale local ticket row
         await self._reconcile_stale_tickets(confirmations_required=needed_confirmations)
 
         # Broker-only positions → import into local book (LONG + our magic)
@@ -2606,7 +2630,7 @@ class MT5Executor(PaperExecutor):
             if not adopted:
                 logger.warning(
                     "[MT5 SYNC] ⚠️ Position for %s is open on MT5 but not tracked locally "
-                    "(adoption failed — check logs).",
+                    "(adoption failed - check logs).",
                     sym,
                 )
 
@@ -2615,7 +2639,7 @@ class MT5Executor(PaperExecutor):
             actual = len(self.open_positions)
             if self._risk.open_count != actual:
                 logger.warning(
-                    "[MT5 SYNC] Counter drift detected: risk.open_count=%d actual=%d — correcting.",
+                    "[MT5 SYNC] Counter drift detected: risk.open_count=%d actual=%d - correcting.",
                     self._risk.open_count,
                     actual,
                 )
@@ -2705,7 +2729,7 @@ class MT5Executor(PaperExecutor):
             otherwise (including paper-mode where no MT5 call is made).
         """
         if not self._live:
-            logger.debug("modify_position: not in live mode – skipping MT5 call.")
+            logger.debug("modify_position: not in live mode - skipping MT5 call.")
             return True
 
         if not _MT5_AVAILABLE:
@@ -2932,7 +2956,7 @@ class MT5Executor(PaperExecutor):
             ``True`` on successful close, ``False`` on failure or paper mode.
         """
         if not self._live:
-            logger.debug("close_position_by_ticket: not in live mode – skipping.")
+            logger.debug("close_position_by_ticket: not in live mode - skipping.")
             return True
 
         if not _MT5_AVAILABLE:

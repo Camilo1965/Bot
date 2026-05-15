@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from vibe.mcp_client import VibeMCPClient
+from typing import Any
 
 logger = logging.getLogger("clawdbot.vibe.journal")
 
@@ -22,7 +22,7 @@ JOURNAL_PATH = Path("logs") / "trade_journal.csv"
 
 
 async def analyze_journal(
-    client: VibeMCPClient,
+    client: Any,
     journal_path: Path | None = None,
 ) -> dict[str, Any] | None:
     """Analyze the trade journal CSV for behavioral biases.
