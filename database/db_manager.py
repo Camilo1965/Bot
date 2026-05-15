@@ -438,11 +438,19 @@ class DatabaseManager:
     # ── Legacy Aliases for MT5Executor ───────────────────────────────────────
     async def insert_open_trade(self, symbol: str, entry_price: float, position_size: float, entry_time: datetime) -> Any:
         trade_id = str(uuid.uuid4())
+        # Derive the timeframe from per-symbol config so that DB records match
+        # what the ML predictor actually used (BTC=30m, ETH=15m, XRP=5m, etc.).
+        # Previously this was hardcoded to "15m" for every symbol.
+        try:
+            from strategy.ml_predictor import get_symbol_config  # local import avoids circular
+            tf = get_symbol_config(symbol).get("timeframe", "15m")
+        except Exception:
+            tf = "15m"
         await self.insert_trade_open(
             trade_id=trade_id,
             timestamp_open=entry_time,
             symbol=symbol,
-            timeframe="15m", # default
+            timeframe=tf,
             side="LONG",
             entry_price=entry_price,
             lots=position_size / entry_price if entry_price > 0 else 0,

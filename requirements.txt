@@ -4,7 +4,8 @@
 aiohttp==3.13.3
 
 # Exchange connectivity
-ccxt[pro]
+# Pin to major version — ccxt breaks API compatibility between majors frequently.
+ccxt[pro]>=2.0,<5.0
 
 # Data manipulation
 pandas
