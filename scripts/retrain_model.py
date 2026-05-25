@@ -36,6 +36,7 @@ from strategy.quant_features import (
     triple_barrier_label,
     DEFAULT_LABEL_ROUND_TRIP,
 )
+from strategy.ml_predictor import get_symbol_config
 from vibe.feature_bridge import VIBE_FEATURE_NEUTRAL
 
 _MODELS_DIR = _ROOT / "models"
@@ -158,8 +159,22 @@ def retrain_and_validate(
 
     # 2. Compute quant features
     feat = add_quant_features(df)
+    # Use symbol-specific SL/TP/horizon so training barriers match live execution
+    _sym_cfg = get_symbol_config(symbol)
+    _sl_pct = float(_sym_cfg.get("fixed_sl_pct", 0.02))
+    _tp_pct = float(_sym_cfg.get("fixed_tp_pct", 0.04))
+    _horizon = int(_sym_cfg.get("horizon", 8))
     feat["label"] = triple_barrier_label(
-        feat["close"], feat["high"], feat["low"], horizon=8, volatility=feat["atr"]
+        feat["close"],
+        feat["high"],
+        feat["low"],
+        horizon=_horizon,
+        fixed_sl_pct=_sl_pct,
+        fixed_tp_pct=_tp_pct,
+    )
+    logger.info(
+        "[LABEL] %s  triple-barrier  SL=%.1f%%  TP=%.1f%%  horizon=%d bars",
+        symbol, _sl_pct * 100, _tp_pct * 100, _horizon,
     )
 
     # 3. Inject VIBE features if requested

@@ -372,12 +372,20 @@ def triple_barrier_label(
     sl_mult: float = 1.5,
     tp_mult: float = 2.5,
     volatility: pd.Series | None = None,
+    *,
+    fixed_sl_pct: float | None = None,
+    fixed_tp_pct: float | None = None,
 ) -> pd.Series:
     """Triple-barrier label: 1 if price hits take-profit before stop-loss within *horizon*.
 
-    Uses ATR-based barriers when *volatility* is provided, else percentage-based.
+    Priority: fixed_sl_pct/fixed_tp_pct > ATR-based (volatility) > hard-coded defaults.
+    Pass fixed_sl_pct/fixed_tp_pct to align training barriers with live SYMBOL_CONFIG.
     """
-    if volatility is None:
+    if fixed_sl_pct is not None and fixed_tp_pct is not None:
+        sl_pct = fixed_sl_pct
+        tp_pct = fixed_tp_pct
+        volatility = None  # force scalar path below
+    elif volatility is None:
         # Default: 2% SL, 4% TP (approx for crypto 15m)
         sl_pct = 0.02
         tp_pct = 0.04
