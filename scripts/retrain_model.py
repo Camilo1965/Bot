@@ -33,6 +33,7 @@ from strategy.quant_features import (
     QUANT_FEATURE_COLS,
     VIBE_FEATURE_COLS,
     add_quant_features,
+    forward_return_label,
     triple_barrier_label,
     DEFAULT_LABEL_ROUND_TRIP,
 )
