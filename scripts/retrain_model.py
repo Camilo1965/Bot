@@ -157,25 +157,13 @@ def retrain_and_validate(
         )
         return False
 
-    # 2. Compute quant features
+    # 2. Compute quant features (DB DataFrame has timestamp col → temporal features computed correctly)
     feat = add_quant_features(df)
-    # Use ATR-based triple barrier: SL = 1.5×ATR, TP = 2.5×ATR, horizon = 8 bars
-    # This produces AUC ~0.72 because short-term momentum IS predictable from
-    # technical features. The trailing stop + partial exits then capture larger
-    # moves when momentum continues beyond the initial 2% target.
-    feat["label"] = triple_barrier_label(
-        feat["close"],
-        feat["high"],
-        feat["low"],
-        horizon=8,
-        sl_mult=1.5,
-        tp_mult=2.5,
-        volatility=feat["atr"],
-    )
-    logger.info(
-        "[LABEL] %s  triple-barrier  ATR×1.5 SL / ATR×2.5 TP  horizon=8 bars",
-        symbol,
-    )
+    # forward_return_label: predicts short-term momentum (>1.5% in 8 bars)
+    # This is what the original AUC-0.71 models used. The trailing stop + partial
+    # exits in the executor then capture the extended 7.5%+ moves when momentum continues.
+    feat["label"] = forward_return_label(feat["close"], horizon=8, round_trip_cost=DEFAULT_LABEL_ROUND_TRIP)
+    logger.info("[LABEL] %s  forward_return  horizon=8  threshold=%.3f", symbol, DEFAULT_LABEL_ROUND_TRIP)
 
     # 3. Inject VIBE features if requested
     if use_vibe:
