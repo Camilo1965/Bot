@@ -58,8 +58,45 @@ def _build_dsn() -> str:
     return f"postgres://{user}:{password}@{host}:{port}/{dbname}"
 
 
+_MIN_ROWS_FOR_TRAINING = 5_000  # ~52 days of 15m data minimum
+
+
+def _fetch_ohlcv_ccxt(symbol: str, days: int) -> pd.DataFrame | None:
+    """Download OHLCV from Binance via CCXT (no auth required for public data)."""
+    try:
+        import ccxt
+    except ImportError:
+        logger.warning("ccxt not installed — skipping Binance fallback (pip install ccxt)")
+        return None
+    timeframe = "15m"
+    bars_needed = days * 24 * 4  # 15m bars per day = 96
+    limit = min(bars_needed, 1000)
+    try:
+        ex = ccxt.binance({"enableRateLimit": True})
+        # Fetch in chunks of 1000 bars (Binance max per request)
+        all_rows: list = []
+        since = int((datetime.now(tz=timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+        while len(all_rows) < bars_needed:
+            rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=1000)
+            if not rows:
+                break
+            all_rows.extend(rows)
+            since = rows[-1][0] + 1
+            if len(rows) < 1000:
+                break
+        if not all_rows:
+            return None
+        df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        logger.info("[CCXT] Downloaded %d rows for %s from Binance", len(df), symbol)
+        return df
+    except Exception as exc:
+        logger.warning("[CCXT] Download failed for %s: %s", symbol, exc)
+        return None
+
+
 async def _fetch_ohlcv(symbol: str, days: int) -> pd.DataFrame | None:
-    """Fetch OHLCV from TimescaleDB for the last *days*."""
+    """Fetch OHLCV from TimescaleDB; falls back to Binance CCXT if DB has insufficient data."""
     dsn = _build_dsn()
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
     query = (
@@ -67,22 +104,29 @@ async def _fetch_ohlcv(symbol: str, days: int) -> pd.DataFrame | None:
         "FROM market_data WHERE symbol = $1 AND timestamp >= $2 "
         "ORDER BY timestamp ASC"
     )
+    df_db: pd.DataFrame | None = None
     try:
         conn = await asyncpg.connect(dsn=dsn)
         rows = await conn.fetch(query, symbol, cutoff)
         await conn.close()
+        if rows:
+            df_db = pd.DataFrame([dict(r) for r in rows])
+            for col in ("open", "high", "low", "close", "volume"):
+                df_db[col] = pd.to_numeric(df_db[col], errors="coerce")
+            df_db = df_db.dropna()
     except Exception as exc:
-        logger.error("DB fetch failed for %s: %s", symbol, exc)
-        return None
+        logger.warning("DB fetch failed for %s: %s", symbol, exc)
 
-    if not rows:
-        logger.warning("No OHLCV data for %s in the last %d days.", symbol, days)
-        return None
+    if df_db is not None and len(df_db) >= _MIN_ROWS_FOR_TRAINING:
+        logger.info("[DB] %d rows for %s", len(df_db), symbol)
+        return df_db
 
-    df = pd.DataFrame([dict(r) for r in rows])
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna()
+    db_rows = len(df_db) if df_db is not None else 0
+    logger.warning(
+        "[DB] Only %d rows for %s (need %d) — falling back to Binance CCXT download",
+        db_rows, symbol, _MIN_ROWS_FOR_TRAINING,
+    )
+    return _fetch_ohlcv_ccxt(symbol, days)
 
 
 def _add_vibe_features(df: pd.DataFrame, add_noise: bool = True) -> pd.DataFrame:
