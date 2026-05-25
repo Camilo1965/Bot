@@ -122,6 +122,7 @@ class OpenPosition:
     close_pending: bool = False
     last_close_error: str | None = None
     direction: str = "long"  # "long" or "short"
+    partial_exit_done: bool = False
 
     def __post_init__(self) -> None:
         if self.stop_loss_price <= 0.0 and self.sl_price > 0.0:
@@ -440,6 +441,80 @@ class PaperExecutor:
         logger.info("[SELL SHORT] %s entry=%.4f size=%.2f SL=%.4f TP=%.4f (ML=%.2f%%)", symbol, entry_price, pos_size_quote, sl_price, tp_price, win_probability * 100)
         return True
 
+    async def _partial_close_position(
+        self,
+        symbol: str,
+        exit_price: float,
+        close_fraction: float,
+        reason: str,
+    ) -> float:
+        """Close *close_fraction* of an open position, credit partial PnL, move SL to break-even."""
+        pos = self.open_positions.get(symbol)
+        if not pos:
+            return 0.0
+        partial_size = pos.position_size * close_fraction
+        remaining_size = pos.position_size * (1.0 - close_fraction)
+        is_short = getattr(pos, "direction", "long") == "short"
+        if pos.entry_price <= 0.0:
+            pnl_pct = 0.0
+        elif is_short:
+            pnl_pct = (pos.entry_price - exit_price) / pos.entry_price
+        else:
+            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
+        partial_pnl = pnl_pct * partial_size
+
+        # Append journal entry BEFORE modifying pos.position_size
+        partial_pos_snapshot = OpenPosition(
+            trade_id=str(pos.trade_id) + "_p",
+            symbol=pos.symbol,
+            entry_time=pos.entry_time,
+            entry_price=pos.entry_price,
+            position_size=partial_size,
+            sl_price=pos.sl_price,
+            activation_price=pos.activation_price,
+            trailing_distance_pct=pos.trailing_distance_pct,
+            peak_price=pos.peak_price,
+            ml_confidence=pos.ml_confidence,
+            sl_pct=pos.sl_pct,
+        )
+        self._append_to_journal(partial_pos_snapshot, exit_price, datetime.now(tz=timezone.utc), reason)
+
+        # Update accounting
+        self.total_pnl += partial_pnl
+        self._risk.credit(partial_size + partial_pnl)
+        self._risk.register_close(risk_usd=partial_size * pos.sl_pct)
+        if partial_pnl < 0:
+            self._risk.record_daily_loss(abs(partial_pnl))
+
+        # Shrink position and mark partial done
+        pos.position_size = remaining_size
+        pos.partial_exit_done = True
+
+        # Move SL to break-even
+        if is_short:
+            if pos.sl_price > pos.entry_price:
+                pos.sl_price = pos.entry_price
+                pos.current_stop_loss = pos.entry_price
+                pos.stop_loss_price = pos.entry_price
+        else:
+            if pos.sl_price < pos.entry_price:
+                pos.sl_price = pos.entry_price
+                pos.current_stop_loss = pos.entry_price
+                pos.stop_loss_price = pos.entry_price
+
+        self.save_state()
+        logger.info(
+            "📤 [PARTIAL 1R] %s exit=%.4f pnl=%.2f (%.2f%%) remaining=%.2f SL→BE=%.4f",
+            symbol, exit_price, partial_pnl, pnl_pct * 100, remaining_size, pos.entry_price,
+        )
+        await send_telegram_alert(
+            f"📤 *PARTIAL 1R* {symbol}\n"
+            f"Exit {close_fraction:.0%}: {exit_price:.4f}\n"
+            f"PnL: {partial_pnl:+.2f} ({pnl_pct * 100:+.2f}%)\n"
+            f"Remaining: {remaining_size:.2f} | SL → Break-even"
+        )
+        return partial_pnl
+
     async def check_and_close(self, symbol: str, current_price: float) -> str | None:
         pos = self.open_positions.get(symbol)
         if not pos: return None
@@ -478,6 +553,17 @@ class PaperExecutor:
                         pos.current_stop_loss = new_sl
                         logger.info("SL RATCHET %s: %.4f new_sl=%.4f (peak=%.4f)", symbol, pos.stop_loss_price, new_sl, pos.peak_price)
                         pos.stop_loss_price = new_sl
+
+        # 1b. Partial exit at +1R: close 50% and move SL to break-even
+        if not pos.partial_exit_done:
+            if is_short:
+                one_r_price = pos.entry_price * (1.0 - pos.sl_pct)
+                if current_price <= one_r_price:
+                    await self._partial_close_position(symbol, current_price, 0.5, "partial_1R")
+            else:
+                one_r_price = pos.entry_price * (1.0 + pos.sl_pct)
+                if current_price >= one_r_price:
+                    await self._partial_close_position(symbol, current_price, 0.5, "partial_1R")
 
         # 2. Check Exits
         exit_reason = None
