@@ -293,6 +293,12 @@ async def signal_emitter(
                     _bg_tasks.add(_vibe_task)
                     _vibe_task.add_done_callback(_bg_tasks.discard)
 
+            # ── Regime prediction (once per tick, reused for exit + entry gate) ───
+            _regime_enabled = os.environ.get("REGIME_FILTER_ENABLED", "1").strip() in ("1", "true", "yes")
+            _regime_result: tuple[str, float] | None = None
+            if _regime_enabled:
+                _regime_result = predict_regime(symbol, prices, highs=highs or None, lows=lows or None, volumes=volumes or None)
+
             # Single-pass prediction
             _t0_pred = time.time()
             signal, win_prob = predictor.generate_signal(
@@ -367,29 +373,25 @@ async def signal_emitter(
                     logger.warning("⚠️ [ALERTA] check_ml_exit failed for %s: %s %s", symbol, exc, DEBUG_LOG_HINT)
 
                 # [REGIME] Close open position if ranging
-                if os.environ.get("REGIME_FILTER_ENABLED", "1").strip() in ("1", "true", "yes"):
-                    regime_result = predict_regime(symbol, prices, highs=highs, lows=lows, volumes=volumes)
-                    if regime_result is not None:
-                        regime, regime_prob = regime_result
-                        if regime == "RANGING":
-                            logger.warning("[REGIME] Closing %s position: market entered RANGING (prob=%.2f)", symbol, regime_prob)
-                            close_pnl = await paper_executor._close_position(symbol, current_price, "REGIME_RANGING")
-                            logger.info("[REGIME] Position %s closed. PnL=%.4f", symbol, close_pnl or 0.0)
-                            return
+                if _regime_result is not None:
+                    regime, regime_prob = _regime_result
+                    if regime == "RANGING":
+                        logger.warning("[REGIME] Closing %s position: market entered RANGING (prob=%.2f)", symbol, regime_prob)
+                        close_pnl = await paper_executor._close_position(symbol, current_price, "REGIME_RANGING")
+                        logger.info("[REGIME] Position %s closed. PnL=%.4f", symbol, close_pnl or 0.0)
+                        return
 
             # ------------------------------------------------------------------
             # [REGIME] Filter new entries by market regime
             # ------------------------------------------------------------------
             regime_gate_passed = True
-            if os.environ.get("REGIME_FILTER_ENABLED", "1").strip() in ("1", "true", "yes"):
-                regime_result = predict_regime(symbol, prices, highs=highs, lows=lows, volumes=volumes)
-                if regime_result is not None:
-                    regime_str, regime_prob = regime_result
-                    if regime_str == "RANGING":
-                        regime_gate_passed = False
-                        logger.info("[REGIME] Entry blocked for %s: market is RANGING (prob=%.2f)", symbol, regime_prob)
-                else:
-                    logger.debug("[REGIME] No regime model available for %s", symbol)
+            if _regime_result is not None:
+                regime_str, regime_prob = _regime_result
+                if regime_str == "RANGING":
+                    regime_gate_passed = False
+                    logger.info("[REGIME] Entry blocked for %s: market is RANGING (prob=%.2f)", symbol, regime_prob)
+            elif _regime_enabled:
+                logger.debug("[REGIME] No regime model available for %s", symbol)
 
             # ------------------------------------------------------------------
             # [VIBE FASE 1] Gating de entradas - Veto Probabilístico Híbrido
