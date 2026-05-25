@@ -72,7 +72,7 @@ from bot.market_consumer import market_consumer
 from bot.mt5_preload import preload_historical_data_mt5
 from bot.signal_emitter import signal_emitter
 from bot.web_server import start_web_dashboard
-from bot.weekly_retrainer import weekly_retrainer
+from bot.biweekly_retrainer import biweekly_retrainer
 from data_ingestion.mt5_market_client import MT5MarketDataClient
 from database.db_manager import close_db, db, init_db
 from execution.mt5_executor import (
@@ -934,8 +934,8 @@ async def main() -> None:
 
     # NON-CRITICAL tasks: se reinician automáticamente si crashean
     supervisor.spawn(
-        "weekly_retrainer",
-        lambda: weekly_retrainer(predictor, watchlist=WATCHLIST, model_path=_MODEL_PATH),
+        "biweekly_retrainer",
+        lambda: biweekly_retrainer(watchlist=WATCHLIST),
         critical=False,
         restart=True,
         restart_delay_s=60.0,

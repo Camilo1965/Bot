@@ -49,9 +49,9 @@ TRAILING_DISTANCE = 0.02
 DAILY_LOSS_LIMIT = 0.03
 
 SYMBOL_CONFIG = {
-    "BTC/USDT": {"prob_threshold": 0.60, "fixed_sl_pct": 0.02, "risk": 0.03, "timeframe": "30m", "horizon": 12},
-    "ETH/USDT": {"prob_threshold": 0.65, "fixed_sl_pct": 0.02, "risk": 0.03, "timeframe": "15m", "horizon": 8},
-    "XRP/USDT": {"prob_threshold": 0.65, "fixed_sl_pct": 0.025, "risk": 0.03, "timeframe": "5m", "horizon": 4},
+    "BTC/USDT": {"prob_threshold": 0.60, "fixed_sl_pct": 0.015, "risk": 0.015, "timeframe": "30m", "horizon": 12, "regime_adx": 25.0, "max_spw": None},
+    "ETH/USDT": {"prob_threshold": 0.50, "fixed_sl_pct": 0.015, "risk": 0.015, "timeframe": "15m", "horizon": 8,  "regime_adx": 25.0, "max_spw": 8.0},
+    "XRP/USDT": {"prob_threshold": 0.30, "fixed_sl_pct": 0.015, "risk": 0.015, "timeframe": "15m", "horizon": 8,  "regime_adx": 20.0, "max_spw": 8.0, "skip_regime": True},
 }
 
 
@@ -97,11 +97,12 @@ class BacktestState:
 
 # ── Modelos ──────────────────────────────────────────────────────────────────
 
-def train_regime_model(df_train: pd.DataFrame, look_ahead: int) -> XGBClassifier:
+def train_regime_model(df_train: pd.DataFrame, look_ahead: int, adx_threshold: float = 25.0) -> XGBClassifier:
+    margin = max(4.0, adx_threshold * 0.20)
     feat = add_quant_features(df_train.copy(), base_timeframe_min=15)
     feat["future_adx"] = feat["adx"].shift(-look_ahead)
-    feat["label"] = (feat["future_adx"] > 25.0).astype(int)
-    feat = feat[(feat["adx"] > 30) | (feat["adx"] < 20)].copy()
+    feat["label"] = (feat["future_adx"] > adx_threshold).astype(int)
+    feat = feat[(feat["adx"] > adx_threshold + margin) | (feat["adx"] < adx_threshold - margin)].copy()
     feat = feat.dropna(subset=list(QUANT_FEATURE_COLS) + ["label"])
     if len(feat) < 100:
         # Fallback: neutral model
@@ -123,7 +124,7 @@ def train_regime_model(df_train: pd.DataFrame, look_ahead: int) -> XGBClassifier
 
 LABEL_THRESHOLD: float = float(os.environ.get("BACKTEST_LABEL_THRESHOLD", "0.015"))  # 1.5% default
 
-def train_direction_model(df_train: pd.DataFrame, horizon: int) -> XGBClassifier:
+def train_direction_model(df_train: pd.DataFrame, horizon: int, max_spw: float | None = None) -> XGBClassifier:
     feat = add_quant_features(df_train.copy(), base_timeframe_min=15)
     # CRITICAL FIX: label must exceed SL to justify the risk
     fwd = feat["close"].shift(-horizon) / feat["close"] - 1.0
@@ -135,7 +136,8 @@ def train_direction_model(df_train: pd.DataFrame, horizon: int) -> XGBClassifier
     y = feat["label"].to_numpy(dtype=np.int32)
     n_pos = int((y == 1).sum())
     n_neg = int((y == 0).sum())
-    spw = max(1.0, n_neg / n_pos) if n_pos > 0 else 1.0
+    raw_spw = max(1.0, n_neg / n_pos) if n_pos > 0 else 1.0
+    spw = min(raw_spw, max_spw) if max_spw is not None else raw_spw
     model = XGBClassifier(
         n_estimators=300, max_depth=6, learning_rate=0.05,
         subsample=0.9, colsample_bytree=0.9,
@@ -399,11 +401,12 @@ def run_backtest(symbol: str, limit: int = 30_000) -> dict[str, Any]:
     logger.info("Training models on %d rows, testing on %d rows (%.1f days)...", len(train_df), len(test_df), test_days)
 
     # Train models
-    regime_model = train_regime_model(train_df, hor)
-    direction_model = train_direction_model(train_df, hor)
+    regime_model = train_regime_model(train_df, hor, adx_threshold=cfg.get("regime_adx", 25.0))
+    direction_model = train_direction_model(train_df, hor, max_spw=cfg.get("max_spw", 12.0))
 
-    # Backtest: bot completo
-    state_full = simulate_bot(test_df, regime_model, direction_model, symbol, use_regime=True)
+    # Backtest: bot completo (skip_regime overrides use_regime for this symbol)
+    _use_regime_full = not cfg.get("skip_regime", False)
+    state_full = simulate_bot(test_df, regime_model, direction_model, symbol, use_regime=_use_regime_full)
     metrics_full = calc_metrics(state_full, test_days)
 
     # Backtest: sin regime
@@ -446,10 +449,13 @@ def main() -> int:
         if "error" in r:
             continue
         m = r["bot_with_regime"]
+        if m["trades"] == 0:
+            logger.info("%-10s | NO TRADES (regime+threshold too strict)", r["symbol"])
+            continue
         logger.info(
             "%-10s | %-8d | %-8.1f | %-8.2f | %-8.2f | %-8.2f | %-8.2f | %-6.1f",
             r["symbol"], m["trades"], m["win_rate"] * 100, m["pnl_pct"],
-            m["max_drawdown_pct"], m["profit_factor"], m["sharpe"], m["trades_per_week"],
+            m.get("max_drawdown_pct", 0.0), m.get("profit_factor", 0.0), m.get("sharpe", 0.0), m.get("trades_per_week", 0.0),
         )
 
     logger.info("-" * 80)
@@ -458,10 +464,13 @@ def main() -> int:
         if "error" in r:
             continue
         m = r["bot_without_regime"]
+        if m["trades"] == 0:
+            logger.info("%-10s | NO TRADES", r["symbol"])
+            continue
         logger.info(
             "%-10s | %-8d | %-8.1f | %-8.2f | %-8.2f | %-8.2f | %-8.2f | %-6.1f",
             r["symbol"], m["trades"], m["win_rate"] * 100, m["pnl_pct"],
-            m["max_drawdown_pct"], m["profit_factor"], m["sharpe"], m["trades_per_week"],
+            m.get("max_drawdown_pct", 0.0), m.get("profit_factor", 0.0), m.get("sharpe", 0.0), m.get("trades_per_week", 0.0),
         )
 
     logger.info("-" * 80)

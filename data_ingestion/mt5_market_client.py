@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import random
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -23,6 +25,16 @@ _TF_MAP: dict[str, int] = {
     "1h": TIMEFRAME_H1,
     "4h": TIMEFRAME_H4,
 }
+
+_BACKOFF_BASE_S: float = float(os.environ.get("MT5_BACKOFF_BASE_S", "1.0") or "1.0")
+_BACKOFF_MAX_S: float = float(os.environ.get("MT5_BACKOFF_MAX_S", "60.0") or "60.0")
+_BACKOFF_EXP: float = float(os.environ.get("MT5_BACKOFF_EXP", "2.0") or "2.0")
+
+
+def _backoff_delay(n: int) -> float:
+    """Full-jitter exponential backoff: uniform random in [0, min(cap, base * exp^n)]."""
+    ceiling = min(_BACKOFF_MAX_S, _BACKOFF_BASE_S * (_BACKOFF_EXP ** n))
+    return random.uniform(0.0, ceiling)
 
 
 class MT5MarketDataClient:
@@ -46,6 +58,10 @@ class MT5MarketDataClient:
         self._last_kline_ts: dict[str, dict[str, int]] = {
             sym: {"15m": -1, "1h": -1, "4h": -1} for sym in watchlist
         }
+        self._tick_fails: dict[str, int] = {s: 0 for s in watchlist}
+        self._kline_fails: dict[str, dict[str, int]] = {
+            s: {tf: 0 for tf in _TF_MAP} for s in watchlist
+        }
 
     async def run(self) -> None:
         """Run tick and kline pollers concurrently."""
@@ -67,8 +83,15 @@ class MT5MarketDataClient:
                         self.shared_state["api_latency_ms"] = (end_t - start_t) * 1000.0
                         
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("[MT5 FEED] tick fetch failed for %s: %s", sym, exc)
+                    self._tick_fails[sym] += 1
+                    delay = _backoff_delay(self._tick_fails[sym])
+                    logger.warning(
+                        "[MT5 FEED] tick %s fail #%d: %s — backoff=%.1fs",
+                        sym, self._tick_fails[sym], exc, delay,
+                    )
+                    await asyncio.sleep(delay)
                     continue
+                self._tick_fails[sym] = 0
                 if not tick:
                     continue
                 bid = float(tick.get("bid") or 0.0)
@@ -126,8 +149,15 @@ class MT5MarketDataClient:
                             start_pos=0,
                         )
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("[MT5 FEED] kline fetch failed for %s/%s: %s", sym, tf_name, exc)
+                        self._kline_fails[sym][tf_name] += 1
+                        delay = _backoff_delay(self._kline_fails[sym][tf_name])
+                        logger.warning(
+                            "[MT5 FEED] kline %s/%s fail #%d: %s — backoff=%.1fs",
+                            sym, tf_name, self._kline_fails[sym][tf_name], exc, delay,
+                        )
+                        await asyncio.sleep(delay)
                         continue
+                    self._kline_fails[sym][tf_name] = 0
                     if df is None or df.empty:
                         continue
                     row = df.iloc[-1]

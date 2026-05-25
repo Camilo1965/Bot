@@ -27,7 +27,7 @@ from bot.constants import DEBUG_LOG_HINT
 from bot.observability import TradeMetrics, ExitMetrics, get_buffer
 from database.db_manager import DatabaseManager
 from risk import risk_manager as _rm_mod
-from risk.risk_manager import RiskManager, get_execution_thresholds
+from risk.risk_manager import RiskManager, BASE_SL, get_execution_thresholds
 
 _SL_CAP_FRAC = float(getattr(_rm_mod, "_SL_CAP", 0.05))
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, get_symbol_config
@@ -66,9 +66,21 @@ _JOURNAL_COLUMNS: list[str] = [
 
 # ── Legacy compatibility constants ──────────────────────────────────────────
 _TAKER_FEE_RATE: float = 0.0004
-# Stop inicial largos: distancia_sl ≈ ATR_SL_MULTIPLIER × ATR (tope risk_manager._SL_CAP).
 ATR_SL_MULTIPLIER: float = 2.0
 ATR_TRAILING_MULTIPLIER: float = 2.0
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+_DEFAULT_TP_PCT: float = _float_env("DEFAULT_TP_PCT", 0.03)
+_BREAK_EVEN_HOURS: float = _float_env("BREAK_EVEN_HOURS", 4.0)
+_ATR_TP_MULT: float = _float_env("ATR_TP_MULT", 2.5)
 
 # ── Error messages ───────────────────────────────────────────────────────────
 _ERRORS = {
@@ -109,6 +121,7 @@ class OpenPosition:
     last_mt5_modify_mono: float = 0.0
     close_pending: bool = False
     last_close_error: str | None = None
+    direction: str = "long"  # "long" or "short"
 
     def __post_init__(self) -> None:
         if self.stop_loss_price <= 0.0 and self.sl_price > 0.0:
@@ -242,23 +255,32 @@ class PaperExecutor:
         cfg = get_symbol_config(symbol)
         
         # Risk Management: Portfolio level
-        sl_frac = min(float(cfg.get("fixed_sl_pct", 0.025)), _SL_CAP_FRAC)
+        # ATR-based dynamic SL: sl = clamp(ATR_SL_MULT * atr_pct, cfg_sl, SL_CAP)
+        cfg_fixed_sl = float(cfg.get("fixed_sl_pct", BASE_SL))
+        atr_pct = (current_atr / entry_price) if (current_atr and entry_price > 0.0) else None
+        thresh = get_execution_thresholds(atr_pct=atr_pct)
+        sl_frac = min(max(thresh.sl_pct, cfg_fixed_sl), _SL_CAP_FRAC)
+
         pos_size_quote = self._risk.calculate_position_size(
-            win_probability, 
+            win_probability,
             risk_pct=float(cfg.get("risk", 0.02)),
             sl_distance_pct=sl_frac,
             vibe_quality=vibe_quality,
         )
-        
-        if pos_size_quote <= 0 or not self._risk.has_sufficient_balance(pos_size_quote): 
+
+        if pos_size_quote <= 0 or not self._risk.has_sufficient_balance(pos_size_quote):
             return False
-            
-        thresh = get_execution_thresholds()
+
         sl_price = entry_price * (1.0 - sl_frac)
         act_price = entry_price * (1.0 + thresh.activation_pct)
-        
-        # [PRO] Fixed percentage Take Profit (3.0% default for R:R 1:2)
-        tp_frac = float(cfg.get("fixed_tp_pct", 0.03))
+
+        # Take Profit: max(fixed_tp_pct, ATR_TP_MULT × atr_pct) — widens TP in high-volatility
+        _fixed_tp = float(cfg.get("fixed_tp_pct", _DEFAULT_TP_PCT))
+        if current_atr and entry_price > 0.0:
+            _atr_tp = (_ATR_TP_MULT * current_atr) / entry_price
+            tp_frac = max(_fixed_tp, _atr_tp)
+        else:
+            tp_frac = _fixed_tp
         tp_price = entry_price * (1.0 + tp_frac)
         
         trade_id = str(uuid.uuid4())
@@ -327,50 +349,166 @@ class PaperExecutor:
 
         self.save_state()
         tp_str = f"TP={tp_price:.4f}" if tp_price else "TP=NONE"
-        logger.info("🚀 [BUY] %s entry=%.4f size=%.2f SL=%.4f %s (ML=%.2f%%)", symbol, entry_price, pos_size_quote, sl_price, tp_str, win_probability * 100)
+        logger.info("[BUY] %s entry=%.4f size=%.2f SL=%.4f %s (ML=%.2f%%)", symbol, entry_price, pos_size_quote, sl_price, tp_str, win_probability * 100)
+        return True
+
+    async def try_open_short_trade(
+        self,
+        entry_price: float,
+        win_probability: float,
+        symbol: str,
+        current_atr: float | None = None,
+        vibe_quality: float = 1.0,
+    ) -> bool:
+        """Open a SHORT (sell) position. Symmetric to try_open_trade but inverted TP/SL/trail."""
+        if symbol in self.open_positions:
+            return False
+        if not self._risk.can_open_position():
+            return False
+        cfg = get_symbol_config(symbol)
+
+        cfg_fixed_sl = float(cfg.get("fixed_sl_pct", BASE_SL))
+        atr_pct = (current_atr / entry_price) if (current_atr and entry_price > 0.0) else None
+        thresh = get_execution_thresholds(atr_pct=atr_pct)
+        sl_frac = min(max(thresh.sl_pct, cfg_fixed_sl), _SL_CAP_FRAC)
+
+        pos_size_quote = self._risk.calculate_position_size(
+            win_probability,
+            risk_pct=float(cfg.get("risk", 0.02)),
+            sl_distance_pct=sl_frac,
+            vibe_quality=vibe_quality,
+        )
+        if pos_size_quote <= 0 or not self._risk.has_sufficient_balance(pos_size_quote):
+            return False
+
+        # SHORT: SL is ABOVE entry, TP is BELOW entry
+        sl_price = entry_price * (1.0 + sl_frac)
+        _fixed_tp = float(cfg.get("fixed_tp_pct", _DEFAULT_TP_PCT))
+        if current_atr and entry_price > 0.0:
+            _atr_tp = (_ATR_TP_MULT * current_atr) / entry_price
+            tp_frac = max(_fixed_tp, _atr_tp)
+        else:
+            tp_frac = _fixed_tp
+        tp_price = entry_price * (1.0 - tp_frac)
+
+        # Activation: price must fall by activation_pct before trailing kicks in
+        activation_pct = thresh.activation_pct
+        activation_price = entry_price * (1.0 - activation_pct)
+
+        trade_id = str(uuid.uuid4())
+        self._risk.debit(pos_size_quote)
+        risk_usd = pos_size_quote * sl_frac
+        self._risk.register_open(risk_usd=risk_usd)
+
+        tf = cfg.get("timeframe", "15m")
+        pos = OpenPosition(
+            trade_id=trade_id,
+            symbol=symbol,
+            entry_time=datetime.now(tz=timezone.utc),
+            entry_price=entry_price,
+            position_size=pos_size_quote,
+            sl_price=sl_price,
+            activation_price=activation_price,
+            trailing_distance_pct=thresh.trailing_pct,
+            peak_price=entry_price,  # for SHORT: track minimum (starts at entry)
+            tp_price=tp_price,
+            ml_confidence=win_probability,
+            sl_pct=sl_frac,
+            activation_pct=activation_pct,
+            stop_loss_price=sl_price,
+            current_stop_loss=sl_price,
+            atr_at_entry=current_atr,
+            timeframe=tf,
+            direction="short",
+        )
+        self.open_positions[symbol] = pos
+
+        try:
+            await self._db.save_trade(
+                trade_id=trade_id,
+                symbol=symbol,
+                entry_price=entry_price,
+                position_size=pos_size_quote,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                direction="short",
+            )
+        except Exception as exc:
+            logger.warning("DB save_trade (short) failed: %s", exc)
+
+        self.save_state()
+        logger.info("[SELL SHORT] %s entry=%.4f size=%.2f SL=%.4f TP=%.4f (ML=%.2f%%)", symbol, entry_price, pos_size_quote, sl_price, tp_price, win_probability * 100)
         return True
 
     async def check_and_close(self, symbol: str, current_price: float) -> str | None:
         pos = self.open_positions.get(symbol)
         if not pos: return None
         
-        # 1. Update Peak and Trailing Stop
-        gain = (current_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
-        logger.debug(
-            "TRAIL CHECK sym=%s gain=%.4f activation=%.4f trail=%s peak=%.4f",
-            symbol, gain, pos.activation_pct, pos.trailing_stop_active, pos.peak_price,
-        )
-        if current_price > pos.peak_price:
-            pos.peak_price = current_price
-            if current_price >= pos.activation_price:
-                if not pos.trailing_stop_active:
-                    pos.trailing_stop_active = True
-                    logger.info("📈 [TS] %s trailing stop ACTIVATED at %.4f", symbol, current_price)
-                new_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
-                if new_sl > pos.sl_price:
-                    pos.sl_price = new_sl
-                    pos.current_stop_loss = new_sl
-                    logger.info("SL RATCHET %s: %.4f → %.4f (peak=%.4f)", symbol, pos.stop_loss_price, new_sl, pos.peak_price)
-                    pos.stop_loss_price = new_sl
+        # 1. Update Best Price and Trailing Stop (direction-aware)
+        is_short = getattr(pos, "direction", "long") == "short"
+        if is_short:
+            # SHORT: "peak" = trough (lowest price = best for short)
+            gain = (pos.entry_price - current_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+            if current_price < pos.peak_price:
+                pos.peak_price = current_price
+                if current_price <= pos.activation_price:
+                    if not pos.trailing_stop_active:
+                        pos.trailing_stop_active = True
+                        logger.info("[TS SHORT] %s trailing stop ACTIVATED at %.4f", symbol, current_price)
+                    new_sl = pos.peak_price * (1.0 + pos.trailing_distance_pct)
+                    if new_sl < pos.sl_price:
+                        pos.sl_price = new_sl
+                        pos.current_stop_loss = new_sl
+                        pos.stop_loss_price = new_sl
+        else:
+            gain = (current_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+            logger.debug(
+                "TRAIL CHECK sym=%s gain=%.4f activation=%.4f trail=%s peak=%.4f",
+                symbol, gain, pos.activation_pct, pos.trailing_stop_active, pos.peak_price,
+            )
+            if current_price > pos.peak_price:
+                pos.peak_price = current_price
+                if current_price >= pos.activation_price:
+                    if not pos.trailing_stop_active:
+                        pos.trailing_stop_active = True
+                        logger.info("[TS] %s trailing stop ACTIVATED at %.4f", symbol, current_price)
+                    new_sl = pos.peak_price * (1.0 - pos.trailing_distance_pct)
+                    if new_sl > pos.sl_price:
+                        pos.sl_price = new_sl
+                        pos.current_stop_loss = new_sl
+                        logger.info("SL RATCHET %s: %.4f new_sl=%.4f (peak=%.4f)", symbol, pos.stop_loss_price, new_sl, pos.peak_price)
+                        pos.stop_loss_price = new_sl
 
         # 2. Check Exits
         exit_reason = None
-        
-        # Dynamic Take Profit (ATR-based)
-        if pos.tp_price and current_price >= pos.tp_price:
-            exit_reason = "take_profit"
-        # Trailing / Stop Loss
-        elif current_price <= pos.sl_price: 
-            exit_reason = "trailing_stop" if pos.trailing_stop_active else "stop_loss"
-        
-        # [PRO] Time-based exit improvement: Move SL to entry after 4 hours if in profit
+        if is_short:
+            if pos.tp_price and current_price <= pos.tp_price:
+                exit_reason = "take_profit"
+            elif current_price >= pos.sl_price:
+                exit_reason = "trailing_stop" if pos.trailing_stop_active else "stop_loss"
+        else:
+            # Dynamic Take Profit (ATR-based)
+            if pos.tp_price and current_price >= pos.tp_price:
+                exit_reason = "take_profit"
+            # Trailing / Stop Loss
+            elif current_price <= pos.sl_price:
+                exit_reason = "trailing_stop" if pos.trailing_stop_active else "stop_loss"
+
+        # [PRO] Time-based exit: Move SL to entry after 4 hours if in profit
         now = datetime.now(tz=timezone.utc)
         duration_h = (now - pos.entry_time).total_seconds() / 3600.0
-        if not pos.trailing_stop_active and duration_h >= 4.0 and current_price > pos.entry_price:
-            if pos.sl_price < pos.entry_price:
-                pos.sl_price = pos.entry_price
-                pos.current_stop_loss = pos.entry_price
-                logger.info("⏱️ [TIME] %s duration=%.1fh: SL moved to entry (Break-even).", symbol, duration_h)
+        in_profit = (current_price < pos.entry_price) if is_short else (current_price > pos.entry_price)
+        if not pos.trailing_stop_active and duration_h >= _BREAK_EVEN_HOURS and in_profit:
+            if is_short:
+                if pos.sl_price > pos.entry_price:
+                    pos.sl_price = pos.entry_price
+                    pos.current_stop_loss = pos.entry_price
+                    logger.info("[TIME SHORT] %s duration=%.1fh: SL moved to entry.", symbol, duration_h)
+            else:
+                if pos.sl_price < pos.entry_price:
+                    pos.sl_price = pos.entry_price
+                    pos.current_stop_loss = pos.entry_price
+                    logger.info("[TIME] %s duration=%.1fh: SL moved to entry (Break-even).", symbol, duration_h)
 
         if exit_reason:
             await self._close_position(symbol, current_price, exit_reason)
@@ -398,8 +536,14 @@ class PaperExecutor:
         pos = self.open_positions.pop(symbol)
         exit_time = datetime.now(tz=timezone.utc)
         
-        # PnL Calculation
-        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
+        # PnL Calculation (direction-aware)
+        if pos.entry_price <= 0.0:
+            logger.error("_close_position: entry_price=%s invalid for %s — PnL forced to 0.", pos.entry_price, symbol)
+            pnl_pct = 0.0
+        elif getattr(pos, "direction", "long") == "short":
+            pnl_pct = (pos.entry_price - exit_price) / pos.entry_price  # SHORT: profit when price drops
+        else:
+            pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
         gross_pnl = pnl_pct * pos.position_size
         
         self.total_pnl += gross_pnl

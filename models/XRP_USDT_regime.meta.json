@@ -1,14 +1,22 @@
 {
   "symbol": "XRP/USDT",
-  "timeframe": "5m",
+  "timeframe": "15m",
+  "adx_threshold": 20.0,
+  "clear_margin": 4,
+  "look_ahead": 8,
+  "n_train": 26373,
+  "n_test": 6594,
+  "pos_rate": 0.7244,
   "metrics": {
-    "accuracy": 0.9775591761450968,
-    "precision": 0.9805940594059406,
-    "recall": 0.9623008161678974,
-    "f1": 0.9713613181639859,
-    "auc": 0.9951468480649797
+    "auc": 0.9442,
+    "precision": 0.93,
+    "recall": 0.9243,
+    "f1": 0.9271
   },
-  "n_train": 26021,
-  "n_test": 6506,
-  "pos_rate": 0.4074
+  "prob_dist": {
+    "p50": 0.9736,
+    "p90": 0.9999,
+    "p99": 1.0
+  },
+  "pct_above_065": 0.7087
 }

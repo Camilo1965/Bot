@@ -53,6 +53,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -78,22 +79,22 @@ def _int_env(name: str, default: int) -> int:
 
 
 # ── Trade parameters ──────────────────────────────────────────────────────────
-INITIAL_SL: float = 0.025          # 2.5 % hard stop loss for initial protection
-ACTIVATION_PCT: float = 0.02       # 2.0 % profit to activate trailing stop (module-level legacy)
-TRAILING_DISTANCE: float = 0.02    # 2.0 % trailing gap from peak once active
+INITIAL_SL: float = _float_env("INITIAL_SL", 0.025)
+ACTIVATION_PCT: float = _float_env("ACTIVATION_PCT", 0.02)
+TRAILING_DISTANCE: float = _float_env("TRAILING_DISTANCE", 0.02)
 
 # ── Futures / leverage parameters ─────────────────────────────────────────────
-LEVERAGE: int = 5                   # 5× futures leverage
-RISK_PER_TRADE: float = _float_env("RISK_PER_TRADE", 0.05)  # default 5 % (max-performance profile)
+LEVERAGE: int = _int_env("LEVERAGE", 5)
+RISK_PER_TRADE: float = _float_env("RISK_PER_TRADE", 0.05)
 
 # ── Daily-loss safety break ───────────────────────────────────────────────────
-MAX_DAILY_LOSS_PCT: float = 0.03    # 3 % maximum daily loss before halting
-_HALT_DURATION: timedelta = timedelta(hours=24)
+MAX_DAILY_LOSS_PCT: float = _float_env("MAX_DAILY_LOSS_PCT", 0.03)
+_HALT_DURATION: timedelta = timedelta(hours=_float_env("HALT_DURATION_HOURS", 24.0))
 
-MAX_POSITIONS: int = _int_env("MAX_POSITIONS", 2)  # Maximum simultaneous open positions
+MAX_POSITIONS: int = _int_env("MAX_POSITIONS", 2)
 
 # ── Portfolio drawdown circuit-breaker ───────────────────────────────────────
-MAX_PORTFOLIO_DD_PCT: float = 0.15  # 15 % max peak-to-trough loss from initial balance
+MAX_PORTFOLIO_DD_PCT: float = _float_env("MAX_PORTFOLIO_DD_PCT", 0.15)
 
 # ── Sector / correlation-group mapping ────────────────────────────────────────
 # Used by :func:`get_sector` and :meth:`RiskManager.is_sector_exposed` to
@@ -129,19 +130,23 @@ def get_sector(symbol: str) -> str:
 
 
 # ── Dynamic risk management - base thresholds (neutral market) ────────────────
-BASE_SL: float = 0.025                      # 2.5 % base stop loss
-BASE_ACTIVATION_PCT: float = 0.020          # 2.0 % profit to activate trailing stop
-BASE_TRAILING_DISTANCE: float = 0.020       # 2.0 % trailing distance
+BASE_SL: float = _float_env("BASE_SL", 0.025)
+BASE_ACTIVATION_PCT: float = _float_env("BASE_ACTIVATION_PCT", 0.020)
+BASE_TRAILING_DISTANCE: float = _float_env("BASE_TRAILING_DISTANCE", 0.020)
 
 # ── Dynamic risk management - sentiment multiplier bounds ─────────────────────
-_SENTIMENT_LOW_THRESHOLD: float = 0.30      # below this → scalping regime
-_SENTIMENT_HIGH_THRESHOLD: float = 0.60    # above this → swing-trading regime
-_MULTIPLIER_LOW: float = 0.8               # shrink thresholds in low-sentiment markets
-_MULTIPLIER_HIGH: float = 1.8              # expand thresholds in high-sentiment markets
-_MULTIPLIER_MIN: float = 0.5               # absolute floor (safety net)
-_MULTIPLIER_MAX: float = 2.5               # absolute cap (safety net)
-_SL_CAP: float = 0.05                      # maximum allowed stop-loss fraction (5 %)
-_ACTIVATION_PCT_MIN: float = 0.005         # Floor lowered to 0.5 % to allow 1.0 % strategy (covers 0.08 % fees)
+_SENTIMENT_LOW_THRESHOLD: float = 0.30
+_SENTIMENT_HIGH_THRESHOLD: float = 0.60
+_MULTIPLIER_LOW: float = 0.8
+_MULTIPLIER_HIGH: float = 1.8
+_MULTIPLIER_MIN: float = 0.5
+_MULTIPLIER_MAX: float = 2.5
+_SL_CAP: float = _float_env("SL_CAP", 0.05)
+_ACTIVATION_PCT_MIN: float = 0.005
+
+# ── Risk reduction / ATR scaling parameters ───────────────────────────────────
+_HALFRISK_MULTIPLIER: float = _float_env("HALFRISK_MULTIPLIER", 0.5)
+_ATR_SL_MULT: float = _float_env("ATR_SL_MULT", 2.0)
 
 
 @dataclass
@@ -154,16 +159,20 @@ class DynamicThresholds:
     multiplier: float
 
 
-def get_execution_thresholds() -> DynamicThresholds:
-    """Fixed execution thresholds without LLM sentiment (simplified live path).
+def get_execution_thresholds(atr_pct: float | None = None) -> DynamicThresholds:
+    """Fixed execution thresholds, optionally scaled by ATR.
 
-    Uses :data:`BASE_SL`, :data:`BASE_ACTIVATION_PCT`, and
-    :data:`BASE_TRAILING_DISTANCE` directly so stops are predictable and wide
-    enough to avoid structural noise exits.
+    When *atr_pct* is provided (ATR as fraction of price), the stop-loss is
+    ``clamp(_ATR_SL_MULT * atr_pct, BASE_SL, _SL_CAP)``.  Falls back to
+    ``BASE_SL`` when *atr_pct* is None or zero — fully backward compatible.
     """
+    if atr_pct is not None and atr_pct > 0.0:
+        dynamic_sl = max(BASE_SL, min(_ATR_SL_MULT * atr_pct, _SL_CAP))
+    else:
+        dynamic_sl = min(BASE_SL, _SL_CAP)
     activation_pct = max(BASE_ACTIVATION_PCT, _ACTIVATION_PCT_MIN)
     return DynamicThresholds(
-        sl_pct=min(BASE_SL, _SL_CAP),
+        sl_pct=dynamic_sl,
         activation_pct=activation_pct,
         trailing_distance_pct=BASE_TRAILING_DISTANCE,
         multiplier=1.0,
@@ -171,8 +180,8 @@ def get_execution_thresholds() -> DynamicThresholds:
 
 
 # ── Portfolio risk parameters ──────────────────────────────────────────────────
-MAX_PORTFOLIO_RISK_PCT: float = 0.10 # 10% maximum capital at risk across all positions
-DRAWDOWN_HALFRISK_THRESHOLD: float = 0.05 # Reduce risk by 50% if weekly DD > 5%
+MAX_PORTFOLIO_RISK_PCT: float = _float_env("MAX_PORTFOLIO_RISK_PCT", 0.10)
+DRAWDOWN_HALFRISK_THRESHOLD: float = _float_env("DRAWDOWN_HALFRISK_THRESHOLD", 0.05)
 
 class RiskManager:
     """Calculate position sizes for MetaTrader 5 with portfolio-level risk control.
@@ -228,26 +237,30 @@ class RiskManager:
         base_r = RISK_PER_TRADE if risk_pct is None else float(risk_pct)
 
         # [VIBE FASE 2] Aplicar multiplicador de calidad acotado
-        _quality_min = float(os.environ.get("VIBE_QUALITY_MIN", "0.5").strip() or "0.5")
-        _quality_max = float(os.environ.get("VIBE_QUALITY_MAX", "1.5").strip() or "1.5")
+        _quality_min = _float_env("VIBE_QUALITY_MIN", 0.5)
+        _quality_max = _float_env("VIBE_QUALITY_MAX", 1.5)
         effective_quality = max(_quality_min, min(_quality_max, float(vibe_quality)))
         base_r *= effective_quality
+
+        # Guard: no position sizing on non-positive balance
+        if self.balance <= 0.0:
+            logger.warning("calculate_position_size: non-positive balance=%.4f — returning 0.", self.balance)
+            return 0.0
 
         # 1. Drawdown 'Thermometer' - reduce risk if weekly performance is poor
         weekly_dd = (self._weekly_start_balance - self.balance) / self._weekly_start_balance
         if weekly_dd > DRAWDOWN_HALFRISK_THRESHOLD:
-            base_r *= 0.5
+            base_r *= _HALFRISK_MULTIPLIER
             logger.warning(
-                "Risk reduced by 50%% due to weekly drawdown (%.2f%% > %.2f%%)",
-                weekly_dd * 100, DRAWDOWN_HALFRISK_THRESHOLD * 100
+                "Risk reduced by %.0f%% due to weekly drawdown (%.2f%% > %.2f%%)",
+                _HALFRISK_MULTIPLIER * 100, weekly_dd * 100, DRAWDOWN_HALFRISK_THRESHOLD * 100,
             )
 
         # 2. Portfolio Exposure Check
         current_exposure = self.get_current_risk_exposure()
         if current_exposure + base_r > MAX_PORTFOLIO_RISK_PCT:
-            # Scale down base_r to fit remaining risk budget
             base_r = max(0.0, MAX_PORTFOLIO_RISK_PCT - current_exposure)
-            if base_r < 0.005: # Minimum 0.5% risk to bother opening
+            if base_r < 0.005:
                 logger.warning("Portfolio risk budget full (%.2f%%). Skipping trade.", current_exposure * 100)
                 return 0.0
             logger.info("Risk scaled to %.2f%% to fit portfolio budget.", base_r * 100)

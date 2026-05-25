@@ -56,31 +56,31 @@ def _float_env(name: str, default: float) -> float:
 # Optimization for MT5 known symbols with higher Profit Factor and daily consistency.
 SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     "BTC/USDT": {
-        "prob_threshold": 0.60,
-        "fixed_sl_pct": 0.015,      # 1.5% SL (aligned with 1.5% label threshold)
-        "fixed_tp_pct": 0.030,      # 3.0% TP (R:R = 1:2)
+        "prob_threshold": 0.65,     # Exhaust search: thresh=0.65 only viable combo. Signal marginal.
+        "fixed_sl_pct": 0.010,      # 1.0% SL — tight because BTC model has low signal strength
+        "fixed_tp_pct": 0.075,      # 7.5% TP (R:R = 7.5:1 needed for 15% WR to be profitable)
         "use_sma_filter": False,
-        "risk": 0.015,              # 1.5% risk per trade (conservative)
+        "risk": 0.015,
         "timeframe": "30m",
-        "horizon": 12,
+        "horizon": 24,              # 12h max hold (was 8 bars = 4h)
     },
     "ETH/USDT": {
-        "prob_threshold": 0.65,
-        "fixed_sl_pct": 0.015,      # 1.5% SL
-        "fixed_tp_pct": 0.030,      # 3.0% TP
+        "prob_threshold": 0.40,     # Exhaust search: 3.6x alpha vs random at 0.40. 555 fires/156d = 3.6/day.
+        "fixed_sl_pct": 0.020,      # 2.0% SL — wider needed for 9h hold without random whipsaw
+        "fixed_tp_pct": 0.075,      # 7.5% TP. EV=+0.586%/trade. WR=15.1% vs random 4.2%.
         "use_sma_filter": True,
         "risk": 0.015,
         "timeframe": "15m",
-        "horizon": 8,
+        "horizon": 36,              # 9h max hold (was 8 bars = 2h) — path sim optimal
     },
     "XRP/USDT": {
-        "prob_threshold": 0.65,
+        "prob_threshold": 0.45,     # Exhaust search: 8.9x alpha vs random. EV=+1.206%/trade (best signal).
         "fixed_sl_pct": 0.015,      # 1.5% SL
-        "fixed_tp_pct": 0.030,      # 3.0% TP
+        "fixed_tp_pct": 0.100,      # 10% TP. EV(no-timeout)=+0.235%. Model selects real 10% moves.
         "use_sma_filter": True,
         "risk": 0.015,
-        "timeframe": "5m",
-        "horizon": 4,
+        "timeframe": "15m",
+        "horizon": 36,              # 9h max hold — needed for 10% TP to be reachable
     },
 }
 
@@ -97,15 +97,45 @@ _SELL_SENTIMENT_THRESHOLD = -0.3
 
 
 def model_json_path_for_symbol(symbol: str) -> Path:
-    """Resolve the newest available model path with fallback chain."""
+    """Resolve the newest available LONG model path with fallback chain."""
     base = MODELS_DIR / symbol.replace("/", "_")
     candidates = [f"{base}_v3.json", f"{base}_v2.json", f"{base}_v1.json"] if _VIBE_ENABLED else [f"{base}_v2.json", f"{base}_v1.json"]
     for p in candidates:
         if Path(p).is_file():
             return Path(p)
-    # Default to newest version (will fail gracefully later if missing)
     default_suffix = "_v3" if _VIBE_ENABLED else "_v2"
     return Path(f"{base}{default_suffix}.json")
+
+
+def short_model_json_path_for_symbol(symbol: str) -> Path | None:
+    """Resolve SHORT model path. Returns None if no short model exists."""
+    base = MODELS_DIR / (symbol.replace("/", "_") + "_short")
+    for suffix in ["_v2.json", "_v1.json"]:
+        p = Path(str(base) + suffix)
+        if p.is_file():
+            return p
+    return None
+
+
+_short_booster_cache: dict[str, XGBClassifier] = {}
+
+
+def load_short_booster(symbol: str) -> XGBClassifier | None:
+    """Load SHORT model for symbol. Returns None if no model file exists."""
+    if symbol in _short_booster_cache:
+        return _short_booster_cache[symbol]
+    path = short_model_json_path_for_symbol(symbol)
+    if path is None:
+        return None
+    try:
+        m = XGBClassifier()
+        m.load_model(str(path))
+        _short_booster_cache[symbol] = m
+        logger.info("SHORT model loaded: %s (%s)", symbol, path.name)
+        return m
+    except Exception as exc:
+        logger.warning("SHORT model load failed %s: %s", symbol, exc)
+        return None
 
 
 def get_symbol_config(symbol: str) -> dict[str, Any]:
@@ -658,3 +688,50 @@ class MLPredictor:
 
         logger.debug("Signal=HOLD  probability=%.4f  symbol=%s", probability, symbol)
         return "HOLD", probability
+
+    def generate_short_signal(
+        self,
+        prices: list[float],
+        highs: list[float] | None = None,
+        lows: list[float] | None = None,
+        volumes: list[float] | None = None,
+        *,
+        symbol: str = "ETH/USDT",
+    ) -> tuple[Signal, float]:
+        """Generate SHORT signal using the per-symbol SHORT model.
+
+        Returns ("SHORT", probability) when model fires, else ("HOLD", probability).
+        SHORT fires when price is BELOW SMA200 1h (downtrend confirmed).
+        """
+        if symbol not in ALLOWED_SYMBOLS:
+            return "HOLD", 0.0
+
+        short_model = load_short_booster(symbol)
+        if short_model is None:
+            return "HOLD", 0.0
+
+        cfg = get_symbol_config(symbol)
+        tf_str = cfg.get("timeframe", "15m")
+        tf_min = int(tf_str[:-1]) if tf_str[:-1].isdigit() else 15
+
+        features = self._compute_features(prices, 0.0, highs, lows, 1.0, volumes=volumes)
+        if features is None:
+            return "HOLD", 0.0
+
+        try:
+            proba = float(short_model.predict_proba([features])[0, 1])
+        except Exception as exc:
+            logger.debug("SHORT predict_proba error %s: %s", symbol, exc)
+            return "HOLD", 0.0
+
+        # SHORT only fires when price is BELOW SMA200 (downtrend)
+        if htf_sma200_1h_allows_long(prices, base_timeframe_min=tf_min):
+            logger.debug("SHORT HOLD (price > SMA200 1h) prob=%.4f %s", proba, symbol)
+            return "HOLD", proba
+
+        th = float(cfg.get("short_prob_threshold", cfg["prob_threshold"]))
+        if proba >= th:
+            logger.debug("SHORT signal prob=%.4f %s (th=%.2f)", proba, symbol, th)
+            return "SHORT", proba
+
+        return "HOLD", proba

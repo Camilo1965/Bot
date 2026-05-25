@@ -250,7 +250,13 @@ class DatabaseManager:
 
     async def connect(self) -> None:
         dsn = os.environ.get("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/postgres")
-        self._pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
+        _acquire_timeout = float(os.environ.get("DB_POOL_ACQUIRE_TIMEOUT_S", "5.0") or "5.0")
+        self._pool = await asyncpg.create_pool(
+            dsn=dsn,
+            min_size=1,
+            max_size=10,
+            command_timeout=_acquire_timeout,
+        )
         logger.info("Connected to TimescaleDB.")
 
     async def disconnect(self) -> None:
@@ -263,32 +269,42 @@ class DatabaseManager:
         async with self._pool.acquire() as conn:
             try:
                 await conn.execute(_MIGRATE_MARKET_BUCKET_TO_TS)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _exc:  # noqa: BLE001
+                logger.debug("market_data bucket migration skipped: %s", _exc)
             await conn.execute(_CREATE_MARKET_DATA)
             try:
                 await conn.execute(_MIGRATE_ADD_MARKET_OHLC)
-            except Exception:  # noqa: BLE001
-                logger.warning("market_data OHLC migration skipped: check Timescale/locks.")
-            try: await conn.execute(_CREATE_HYPERTABLE_MARKET)
-            except Exception: pass
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("market_data OHLC migration skipped: %s", _exc)
+            try:
+                await conn.execute(_CREATE_HYPERTABLE_MARKET)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("Hypertable market_data skipped (may already exist): %s", _exc)
             await conn.execute(_CREATE_ML_PREDICTIONS)
-            try: await conn.execute(_CREATE_HYPERTABLE_PRED)
-            except Exception: pass
+            try:
+                await conn.execute(_CREATE_HYPERTABLE_PRED)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("Hypertable ml_predictions skipped: %s", _exc)
             await conn.execute(_CREATE_HTF_TREND)
-            try: await conn.execute(_CREATE_HYPERTABLE_HTF)
-            except Exception: pass
+            try:
+                await conn.execute(_CREATE_HYPERTABLE_HTF)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("Hypertable htf_trend skipped: %s", _exc)
 
             try:
                 await conn.execute(_MIGRATE_TRADES_HISTORY)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _exc:  # noqa: BLE001
+                logger.debug("trades_history migration skipped: %s", _exc)
             await conn.execute(_CREATE_TRADE_HISTORY)
-            try: await conn.execute(_CREATE_HYPERTABLE_TRADES)
-            except Exception: pass
-            try: await conn.execute(_CREATE_INDEXES)
-            except Exception: pass
-            
+            try:
+                await conn.execute(_CREATE_HYPERTABLE_TRADES)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("Hypertable trades_history skipped: %s", _exc)
+            try:
+                await conn.execute(_CREATE_INDEXES)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("Index creation partially failed: %s", _exc)
+
             await self._refresh_market_columns(conn)
         logger.info("Database schema initialised.")
 

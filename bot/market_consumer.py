@@ -43,6 +43,7 @@ async def market_consumer(
             continue
 
         if price <= 0.0:
+            logger.debug("[MARKET] Rejected %s msg for %s: price=%s (zero/negative)", mtype, sym, price)
             queue.task_done()
             continue
 
