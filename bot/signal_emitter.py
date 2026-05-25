@@ -58,7 +58,7 @@ def _get_signal_semaphore() -> asyncio.Semaphore:
 _VOL_FILTER_ENABLED: bool = os.environ.get("VOL_FILTER_ENABLED", "1").strip() in ("1", "true")
 _VOL_FILTER_PERIODS: int = int(os.environ.get("VOL_FILTER_PERIODS", "20") or "20")
 _VOL_FILTER_MULT: float = float(os.environ.get("VOL_FILTER_MULT", "0.5") or "0.5")
-_SPREAD_FILTER_ENABLED: bool = os.environ.get("SPREAD_FILTER_ENABLED", "0").strip() in ("1", "true")
+_SPREAD_FILTER_ENABLED: bool = os.environ.get("SPREAD_FILTER_ENABLED", "1").strip() in ("1", "true")
 _MAX_SPREAD_PCT: float = float(os.environ.get("MAX_SPREAD_PCT", "0.002") or "0.002")
 _HTF_GATE_ENABLED: bool = os.environ.get("HTF_GATE_ENABLED", "0").strip() in ("1", "true")
 
