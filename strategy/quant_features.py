@@ -17,6 +17,8 @@ to the classic forward-return threshold.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
 import pandas as pd
 
@@ -272,7 +274,10 @@ def add_quant_features(
     df["stoch_rsi_k"] = stoch_k
     df["stoch_rsi_d"] = stoch_d
     df["williams_r"] = _williams_r(high, low, close, _WILLIAMS_R_PERIOD)
-    df["obv"] = _obv(close, vol)
+    _obv_raw = _obv(close, vol)
+    _obv_mean = _obv_raw.rolling(_ROLL_WIN, min_periods=5).mean()
+    _obv_std = _obv_raw.rolling(_ROLL_WIN, min_periods=5).std().replace(0, np.nan)
+    df["obv"] = ((_obv_raw - _obv_mean) / _obv_std).fillna(0.0)
     df["cmf"] = _cmf(high, low, close, vol, _CMF_PERIOD)
 
     returns = df["log_ret_1"]
@@ -305,6 +310,8 @@ def compute_quant_vector_from_lists(
     lows: list[float],
     volumes: list[float] | None,
     base_timeframe_min: int = 15,
+    *,
+    now: datetime | None = None,
 ) -> list[float] | None:
     """Latest feature vector aligned with QUANT_FEATURE_COLS (for live inference)."""
     if len(closes) < MIN_OHLC_ROWS or len(highs) < MIN_OHLC_ROWS or len(lows) < MIN_OHLC_ROWS:
@@ -314,8 +321,12 @@ def compute_quant_vector_from_lists(
         vol = [0.0] * n
     else:
         vol = volumes[-n:]
+    _now = now if now is not None else datetime.now(tz=timezone.utc)
+    step = timedelta(minutes=base_timeframe_min)
+    timestamps = [_now - step * (n - 1 - i) for i in range(n)]
     df = pd.DataFrame(
         {
+            "timestamp": timestamps,
             "open": closes[-n:],
             "high": highs[-n:],
             "low": lows[-n:],
@@ -364,12 +375,20 @@ def triple_barrier_label(
     sl_mult: float = 1.5,
     tp_mult: float = 2.5,
     volatility: pd.Series | None = None,
+    *,
+    fixed_sl_pct: float | None = None,
+    fixed_tp_pct: float | None = None,
 ) -> pd.Series:
     """Triple-barrier label: 1 if price hits take-profit before stop-loss within *horizon*.
 
-    Uses ATR-based barriers when *volatility* is provided, else percentage-based.
+    Priority: fixed_sl_pct/fixed_tp_pct > ATR-based (volatility) > hard-coded defaults.
+    Pass fixed_sl_pct/fixed_tp_pct to align training barriers with live SYMBOL_CONFIG.
     """
-    if volatility is None:
+    if fixed_sl_pct is not None and fixed_tp_pct is not None:
+        sl_pct = fixed_sl_pct
+        tp_pct = fixed_tp_pct
+        volatility = None  # force scalar path below
+    elif volatility is None:
         # Default: 2% SL, 4% TP (approx for crypto 15m)
         sl_pct = 0.02
         tp_pct = 0.04

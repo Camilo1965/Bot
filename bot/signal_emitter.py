@@ -39,7 +39,7 @@ _BG_TASK_MAX: int = int(os.environ.get("BG_TASK_MAX", "50") or "50")
 # ── Trading hour filter ──────────────────────────────────────────────────────
 # Only open new positions between UTC 08:00-22:00 (peak liquidity: Asia close + EU + US)
 # Disabled by default: set TRADE_HOUR_FILTER=1 to enable
-_TRADE_HOUR_FILTER: bool = os.environ.get("TRADE_HOUR_FILTER", "0").strip() == "1"
+_TRADE_HOUR_FILTER: bool = os.environ.get("TRADE_HOUR_FILTER", "1").strip() == "1"
 _TRADE_HOUR_START: int = int(os.environ.get("TRADE_HOUR_START_UTC", "8"))
 _TRADE_HOUR_END: int = int(os.environ.get("TRADE_HOUR_END_UTC", "22"))
 
@@ -55,10 +55,10 @@ def _get_signal_semaphore() -> asyncio.Semaphore:
 
 
 # ── Advanced entry filters (all off by default) ───────────────────────────────
-_VOL_FILTER_ENABLED: bool = os.environ.get("VOL_FILTER_ENABLED", "0").strip() in ("1", "true")
+_VOL_FILTER_ENABLED: bool = os.environ.get("VOL_FILTER_ENABLED", "1").strip() in ("1", "true")
 _VOL_FILTER_PERIODS: int = int(os.environ.get("VOL_FILTER_PERIODS", "20") or "20")
 _VOL_FILTER_MULT: float = float(os.environ.get("VOL_FILTER_MULT", "0.5") or "0.5")
-_SPREAD_FILTER_ENABLED: bool = os.environ.get("SPREAD_FILTER_ENABLED", "0").strip() in ("1", "true")
+_SPREAD_FILTER_ENABLED: bool = os.environ.get("SPREAD_FILTER_ENABLED", "1").strip() in ("1", "true")
 _MAX_SPREAD_PCT: float = float(os.environ.get("MAX_SPREAD_PCT", "0.002") or "0.002")
 _HTF_GATE_ENABLED: bool = os.environ.get("HTF_GATE_ENABLED", "0").strip() in ("1", "true")
 
@@ -293,6 +293,12 @@ async def signal_emitter(
                     _bg_tasks.add(_vibe_task)
                     _vibe_task.add_done_callback(_bg_tasks.discard)
 
+            # ── Regime prediction (once per tick, reused for exit + entry gate) ───
+            _regime_enabled = os.environ.get("REGIME_FILTER_ENABLED", "1").strip() in ("1", "true", "yes")
+            _regime_result: tuple[str, float] | None = None
+            if _regime_enabled:
+                _regime_result = predict_regime(symbol, prices, highs=highs or None, lows=lows or None, volumes=volumes or None)
+
             # Single-pass prediction
             _t0_pred = time.time()
             signal, win_prob = predictor.generate_signal(
@@ -367,29 +373,44 @@ async def signal_emitter(
                     logger.warning("⚠️ [ALERTA] check_ml_exit failed for %s: %s %s", symbol, exc, DEBUG_LOG_HINT)
 
                 # [REGIME] Close open position if ranging
-                if os.environ.get("REGIME_FILTER_ENABLED", "1").strip() in ("1", "true", "yes"):
-                    regime_result = predict_regime(symbol, prices, highs=highs, lows=lows, volumes=volumes)
-                    if regime_result is not None:
-                        regime, regime_prob = regime_result
-                        if regime == "RANGING":
-                            logger.warning("[REGIME] Closing %s position: market entered RANGING (prob=%.2f)", symbol, regime_prob)
-                            close_pnl = await paper_executor._close_position(symbol, current_price, "REGIME_RANGING")
-                            logger.info("[REGIME] Position %s closed. PnL=%.4f", symbol, close_pnl or 0.0)
-                            return
+                if _regime_result is not None:
+                    regime, regime_prob = _regime_result
+                    if regime == "RANGING":
+                        logger.warning("[REGIME] Closing %s position: market entered RANGING (prob=%.2f)", symbol, regime_prob)
+                        close_pnl = await paper_executor._close_position(symbol, current_price, "REGIME_RANGING")
+                        logger.info("[REGIME] Position %s closed. PnL=%.4f", symbol, close_pnl or 0.0)
+                        return
 
             # ------------------------------------------------------------------
             # [REGIME] Filter new entries by market regime
             # ------------------------------------------------------------------
             regime_gate_passed = True
-            if os.environ.get("REGIME_FILTER_ENABLED", "1").strip() in ("1", "true", "yes"):
-                regime_result = predict_regime(symbol, prices, highs=highs, lows=lows, volumes=volumes)
-                if regime_result is not None:
-                    regime_str, regime_prob = regime_result
-                    if regime_str == "RANGING":
-                        regime_gate_passed = False
-                        logger.info("[REGIME] Entry blocked for %s: market is RANGING (prob=%.2f)", symbol, regime_prob)
-                else:
-                    logger.debug("[REGIME] No regime model available for %s", symbol)
+            if _regime_result is not None:
+                regime_str, regime_prob = _regime_result
+                if regime_str == "RANGING":
+                    regime_gate_passed = False
+                    logger.info("[REGIME] Entry blocked for %s: market is RANGING (prob=%.2f)", symbol, regime_prob)
+            elif _regime_enabled:
+                logger.debug("[REGIME] No regime model available for %s", symbol)
+
+            # ------------------------------------------------------------------
+            # [REGIME-ONLY] Fallback entry for symbols with dead direction models
+            # ------------------------------------------------------------------
+            _sym_cfg = get_symbol_config(symbol)
+            if signal == "HOLD" and _sym_cfg.get("regime_only", False) and _regime_result is not None:
+                _r_str, _r_prob = _regime_result
+                _r_entry_th = float(_sym_cfg.get("regime_entry_threshold", 0.82))
+                if _r_str == "TRENDING" and _r_prob >= _r_entry_th:
+                    # Verify price is in an uptrend (SMA200 gate) before entering
+                    _tf_str = str(_sym_cfg.get("timeframe", "15m"))
+                    _tf_min = int(_tf_str[:-1]) if _tf_str[:-1].isdigit() else 15
+                    if htf_sma200_1h_allows_long(prices, base_timeframe_min=_tf_min):
+                        signal = "BUY"
+                        win_prob = _r_prob * 0.6  # conservative sizing
+                        logger.info(
+                            "[REGIME-ONLY] %s regime_prob=%.2f >= %.2f + SMA200 OK → BUY (prob=%.2f)",
+                            symbol, _r_prob, _r_entry_th, win_prob,
+                        )
 
             # ------------------------------------------------------------------
             # [VIBE FASE 1] Gating de entradas - Veto Probabilístico Híbrido

@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
+from strategy.prob_calibration import calibrate_probability
 from strategy.quant_features import (
     DEFAULT_LABEL_ROUND_TRIP,
     FINAL_FEATURE_ORDER,
@@ -81,6 +82,10 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "risk": 0.015,
         "timeframe": "15m",
         "horizon": 36,              # 9h max hold — needed for 10% TP to be reachable
+        # Direction model v2 has precision=0 (p99=0.38 < threshold=0.45).
+        # Use regime model (AUC=0.94) as fallback entry signal until retrain.
+        "regime_only": True,
+        "regime_entry_threshold": 0.82,
     },
 }
 
@@ -609,6 +614,9 @@ class MLPredictor:
             )
             return None
 
+        # Apply isotonic calibration if a calibration file exists for this symbol
+        proba = calibrate_probability(proba, sym)
+
         logger.debug(
             "[QUANT_FEAT] rsi=%.2f macd_hist=%.6f atr=%.6f vol_rel=%.3f",
             features[0],
@@ -638,7 +646,7 @@ class MLPredictor:
         
         Returns tuple of (Signal, Probability).
         """
-        del funding_rate, htf_trend_4h, htf_trend_1h
+        del htf_trend_4h, htf_trend_1h
         if symbol not in ALLOWED_SYMBOLS:
             logger.debug("Signal=HOLD (symbol %s not in ALLOWED_SYMBOLS)", symbol)
             return "HOLD", 0.0
@@ -667,6 +675,15 @@ class MLPredictor:
         if probability is None:
             logger.debug("Signal=HOLD (model not ready or insufficient data)")
             return "HOLD", 0.0
+
+        # Funding-rate bias: extreme positive → overleveraged longs, penalise BUY
+        #                    extreme negative → shorts squeezed out, small boost
+        if funding_rate > _FUNDING_RATE_EXTREME_GREED:
+            probability = max(0.0, probability * 0.90)
+            logger.debug("[FUNDING] %s rate=%.6f → prob penalised to %.4f", symbol, funding_rate, probability)
+        elif funding_rate < _FUNDING_RATE_EXTREME_FEAR:
+            probability = min(0.99, probability * 1.10)
+            logger.debug("[FUNDING] %s rate=%.6f → prob boosted to %.4f", symbol, funding_rate, probability)
 
         if cfg["use_sma_filter"] and not htf_sma200_1h_allows_long(prices, base_timeframe_min=tf_min):
             logger.debug(

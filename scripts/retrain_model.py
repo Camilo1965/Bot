@@ -36,6 +36,7 @@ from strategy.quant_features import (
     triple_barrier_label,
     DEFAULT_LABEL_ROUND_TRIP,
 )
+from strategy.ml_predictor import get_symbol_config
 from vibe.feature_bridge import VIBE_FEATURE_NEUTRAL
 
 _MODELS_DIR = _ROOT / "models"
@@ -158,8 +159,22 @@ def retrain_and_validate(
 
     # 2. Compute quant features
     feat = add_quant_features(df)
+    # Use symbol-specific SL/TP/horizon so training barriers match live execution
+    _sym_cfg = get_symbol_config(symbol)
+    _sl_pct = float(_sym_cfg.get("fixed_sl_pct", 0.02))
+    _tp_pct = float(_sym_cfg.get("fixed_tp_pct", 0.04))
+    _horizon = int(_sym_cfg.get("horizon", 8))
     feat["label"] = triple_barrier_label(
-        feat["close"], feat["high"], feat["low"], horizon=8, volatility=feat["atr"]
+        feat["close"],
+        feat["high"],
+        feat["low"],
+        horizon=_horizon,
+        fixed_sl_pct=_sl_pct,
+        fixed_tp_pct=_tp_pct,
+    )
+    logger.info(
+        "[LABEL] %s  triple-barrier  SL=%.1f%%  TP=%.1f%%  horizon=%d bars",
+        symbol, _sl_pct * 100, _tp_pct * 100, _horizon,
     )
 
     # 3. Inject VIBE features if requested
@@ -183,6 +198,9 @@ def retrain_and_validate(
     tscv = TimeSeriesSplit(n_splits=n_splits)
     cv_scores: list[float] = []
     cv_metrics: list[dict[str, float]] = []
+    # Accumulate hold-out predictions across all folds for calibration fitting
+    all_y_va: list[np.ndarray] = []
+    all_probas: list[np.ndarray] = []
 
     for train_idx, val_idx in tscv.split(X):
         x_tr = X.iloc[train_idx].to_numpy(dtype=np.float32)
@@ -211,6 +229,8 @@ def retrain_and_validate(
         m = _compute_metrics(y_va, preds, probas)
         cv_scores.append(m["auc"])
         cv_metrics.append(m)
+        all_y_va.append(y_va)
+        all_probas.append(probas)
 
     mean_metrics = {
         k: round(sum(m[k] for m in cv_metrics) / len(cv_metrics), 4)
@@ -298,6 +318,19 @@ def retrain_and_validate(
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     logger.info("Model UPDATED for %s → %s (AUC %.4f)", symbol, model_path, mean_auc)
+
+    # 8. Fit isotonic calibration from accumulated hold-out predictions
+    try:
+        from strategy.prob_calibration import fit_and_save_calibration as _fit_cal
+        cal_path = _fit_cal(
+            symbol,
+            np.concatenate(all_y_va),
+            np.concatenate(all_probas),
+        )
+        logger.info("Calibration saved → %s", cal_path)
+    except Exception as exc:
+        logger.warning("Calibration fitting failed (non-fatal): %s", exc)
+
     return True
 
 
