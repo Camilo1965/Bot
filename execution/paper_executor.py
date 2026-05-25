@@ -523,11 +523,23 @@ class PaperExecutor:
         if ml_signal == "SELL" and (ml_probability is None or ml_probability >= min_confidence):
             logger.info("📉 [SELL] %s ML Reversal triggered early exit.", symbol)
             return await self._close_position(symbol, current_price, "ml_reversal")
-        if duration_h >= POSITION_TTL_HOURS:
+
+        # Per-symbol TTL derived from horizon × timeframe so ETH/XRP expire at ~9h, not 12h
+        cfg = get_symbol_config(symbol)
+        tf_str: str = str(cfg.get("timeframe", "15m"))
+        if tf_str.endswith("h"):
+            tf_min = int(tf_str[:-1]) * 60
+        else:
+            tf_min = int(tf_str[:-1]) if tf_str[:-1].isdigit() else 15
+        horizon_bars = int(cfg.get("horizon", 24))
+        symbol_ttl_h = max(POSITION_TTL_HOURS, horizon_bars * tf_min / 60.0)
+
+        if duration_h >= symbol_ttl_h:
             logger.info(
-                "⏱️ [TTL] %s position reached max age (%.1fh).",
+                "⏱️ [TTL] %s position reached max age (%.1fh, symbol-horizon=%.1fh).",
                 symbol,
-                POSITION_TTL_HOURS,
+                symbol_ttl_h,
+                horizon_bars * tf_min / 60.0,
             )
             return await self._close_position(symbol, current_price, "ttl_expiry")
         return None

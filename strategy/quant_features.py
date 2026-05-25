@@ -17,6 +17,8 @@ to the classic forward-return threshold.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
 import pandas as pd
 
@@ -305,6 +307,8 @@ def compute_quant_vector_from_lists(
     lows: list[float],
     volumes: list[float] | None,
     base_timeframe_min: int = 15,
+    *,
+    now: datetime | None = None,
 ) -> list[float] | None:
     """Latest feature vector aligned with QUANT_FEATURE_COLS (for live inference)."""
     if len(closes) < MIN_OHLC_ROWS or len(highs) < MIN_OHLC_ROWS or len(lows) < MIN_OHLC_ROWS:
@@ -314,8 +318,12 @@ def compute_quant_vector_from_lists(
         vol = [0.0] * n
     else:
         vol = volumes[-n:]
+    _now = now if now is not None else datetime.now(tz=timezone.utc)
+    step = timedelta(minutes=base_timeframe_min)
+    timestamps = [_now - step * (n - 1 - i) for i in range(n)]
     df = pd.DataFrame(
         {
+            "timestamp": timestamps,
             "open": closes[-n:],
             "high": highs[-n:],
             "low": lows[-n:],

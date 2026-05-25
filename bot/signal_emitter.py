@@ -39,7 +39,7 @@ _BG_TASK_MAX: int = int(os.environ.get("BG_TASK_MAX", "50") or "50")
 # ── Trading hour filter ──────────────────────────────────────────────────────
 # Only open new positions between UTC 08:00-22:00 (peak liquidity: Asia close + EU + US)
 # Disabled by default: set TRADE_HOUR_FILTER=1 to enable
-_TRADE_HOUR_FILTER: bool = os.environ.get("TRADE_HOUR_FILTER", "0").strip() == "1"
+_TRADE_HOUR_FILTER: bool = os.environ.get("TRADE_HOUR_FILTER", "1").strip() == "1"
 _TRADE_HOUR_START: int = int(os.environ.get("TRADE_HOUR_START_UTC", "8"))
 _TRADE_HOUR_END: int = int(os.environ.get("TRADE_HOUR_END_UTC", "22"))
 
@@ -55,7 +55,7 @@ def _get_signal_semaphore() -> asyncio.Semaphore:
 
 
 # ── Advanced entry filters (all off by default) ───────────────────────────────
-_VOL_FILTER_ENABLED: bool = os.environ.get("VOL_FILTER_ENABLED", "0").strip() in ("1", "true")
+_VOL_FILTER_ENABLED: bool = os.environ.get("VOL_FILTER_ENABLED", "1").strip() in ("1", "true")
 _VOL_FILTER_PERIODS: int = int(os.environ.get("VOL_FILTER_PERIODS", "20") or "20")
 _VOL_FILTER_MULT: float = float(os.environ.get("VOL_FILTER_MULT", "0.5") or "0.5")
 _SPREAD_FILTER_ENABLED: bool = os.environ.get("SPREAD_FILTER_ENABLED", "0").strip() in ("1", "true")
