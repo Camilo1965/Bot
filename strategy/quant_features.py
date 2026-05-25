@@ -274,7 +274,10 @@ def add_quant_features(
     df["stoch_rsi_k"] = stoch_k
     df["stoch_rsi_d"] = stoch_d
     df["williams_r"] = _williams_r(high, low, close, _WILLIAMS_R_PERIOD)
-    df["obv"] = _obv(close, vol)
+    _obv_raw = _obv(close, vol)
+    _obv_mean = _obv_raw.rolling(_ROLL_WIN, min_periods=5).mean()
+    _obv_std = _obv_raw.rolling(_ROLL_WIN, min_periods=5).std().replace(0, np.nan)
+    df["obv"] = ((_obv_raw - _obv_mean) / _obv_std).fillna(0.0)
     df["cmf"] = _cmf(high, low, close, vol, _CMF_PERIOD)
 
     returns = df["log_ret_1"]
