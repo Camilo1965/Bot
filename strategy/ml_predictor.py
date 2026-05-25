@@ -82,6 +82,10 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "risk": 0.015,
         "timeframe": "15m",
         "horizon": 36,              # 9h max hold — needed for 10% TP to be reachable
+        # Direction model v2 has precision=0 (p99=0.38 < threshold=0.45).
+        # Use regime model (AUC=0.94) as fallback entry signal until retrain.
+        "regime_only": True,
+        "regime_entry_threshold": 0.82,
     },
 }
 

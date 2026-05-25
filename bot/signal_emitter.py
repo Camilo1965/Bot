@@ -394,6 +394,25 @@ async def signal_emitter(
                 logger.debug("[REGIME] No regime model available for %s", symbol)
 
             # ------------------------------------------------------------------
+            # [REGIME-ONLY] Fallback entry for symbols with dead direction models
+            # ------------------------------------------------------------------
+            _sym_cfg = get_symbol_config(symbol)
+            if signal == "HOLD" and _sym_cfg.get("regime_only", False) and _regime_result is not None:
+                _r_str, _r_prob = _regime_result
+                _r_entry_th = float(_sym_cfg.get("regime_entry_threshold", 0.82))
+                if _r_str == "TRENDING" and _r_prob >= _r_entry_th:
+                    # Verify price is in an uptrend (SMA200 gate) before entering
+                    _tf_str = str(_sym_cfg.get("timeframe", "15m"))
+                    _tf_min = int(_tf_str[:-1]) if _tf_str[:-1].isdigit() else 15
+                    if htf_sma200_1h_allows_long(prices, base_timeframe_min=_tf_min):
+                        signal = "BUY"
+                        win_prob = _r_prob * 0.6  # conservative sizing
+                        logger.info(
+                            "[REGIME-ONLY] %s regime_prob=%.2f >= %.2f + SMA200 OK → BUY (prob=%.2f)",
+                            symbol, _r_prob, _r_entry_th, win_prob,
+                        )
+
+            # ------------------------------------------------------------------
             # [VIBE FASE 1] Gating de entradas - Veto Probabilístico Híbrido
             # ------------------------------------------------------------------
             gated_signal, gate_reason = _apply_vibe_gating(state, symbol, signal, win_prob)
