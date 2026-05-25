@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
+from strategy.prob_calibration import calibrate_probability
 from strategy.quant_features import (
     DEFAULT_LABEL_ROUND_TRIP,
     FINAL_FEATURE_ORDER,
@@ -608,6 +609,9 @@ class MLPredictor:
                 exc,
             )
             return None
+
+        # Apply isotonic calibration if a calibration file exists for this symbol
+        proba = calibrate_probability(proba, sym)
 
         logger.debug(
             "[QUANT_FEAT] rsi=%.2f macd_hist=%.6f atr=%.6f vol_rel=%.3f",

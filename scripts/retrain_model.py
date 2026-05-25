@@ -183,6 +183,9 @@ def retrain_and_validate(
     tscv = TimeSeriesSplit(n_splits=n_splits)
     cv_scores: list[float] = []
     cv_metrics: list[dict[str, float]] = []
+    # Accumulate hold-out predictions across all folds for calibration fitting
+    all_y_va: list[np.ndarray] = []
+    all_probas: list[np.ndarray] = []
 
     for train_idx, val_idx in tscv.split(X):
         x_tr = X.iloc[train_idx].to_numpy(dtype=np.float32)
@@ -211,6 +214,8 @@ def retrain_and_validate(
         m = _compute_metrics(y_va, preds, probas)
         cv_scores.append(m["auc"])
         cv_metrics.append(m)
+        all_y_va.append(y_va)
+        all_probas.append(probas)
 
     mean_metrics = {
         k: round(sum(m[k] for m in cv_metrics) / len(cv_metrics), 4)
@@ -298,6 +303,19 @@ def retrain_and_validate(
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     logger.info("Model UPDATED for %s → %s (AUC %.4f)", symbol, model_path, mean_auc)
+
+    # 8. Fit isotonic calibration from accumulated hold-out predictions
+    try:
+        from strategy.prob_calibration import fit_and_save_calibration as _fit_cal
+        cal_path = _fit_cal(
+            symbol,
+            np.concatenate(all_y_va),
+            np.concatenate(all_probas),
+        )
+        logger.info("Calibration saved → %s", cal_path)
+    except Exception as exc:
+        logger.warning("Calibration fitting failed (non-fatal): %s", exc)
+
     return True
 
 
