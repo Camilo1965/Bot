@@ -40,18 +40,18 @@ logger = logging.getLogger("backtest_full_bot")
 # ── Configuración del bot ────────────────────────────────────────────────────
 INITIAL_BALANCE = 10_000.0
 MAX_POSITIONS = 2
-RISK_PER_TRADE = 0.03
+RISK_PER_TRADE = 0.015      # match production
 LEVERAGE = 5
-TTL_HOURS = 12.0
+TTL_HOURS = 5.0             # match horizon=16-20 bars (4-5h)
 TP_ATR_MULT = 2.5
-ACTIVATION_PCT = 0.02
+ACTIVATION_PCT = 0.05       # activate trailing only ABOVE TP=4-6%
 TRAILING_DISTANCE = 0.02
 DAILY_LOSS_LIMIT = 0.03
 
 SYMBOL_CONFIG = {
-    "BTC/USDT": {"prob_threshold": 0.60, "fixed_sl_pct": 0.015, "risk": 0.015, "timeframe": "30m", "horizon": 12, "regime_adx": 25.0, "max_spw": None},
-    "ETH/USDT": {"prob_threshold": 0.50, "fixed_sl_pct": 0.015, "risk": 0.015, "timeframe": "15m", "horizon": 8,  "regime_adx": 25.0, "max_spw": 8.0},
-    "XRP/USDT": {"prob_threshold": 0.30, "fixed_sl_pct": 0.015, "risk": 0.015, "timeframe": "15m", "horizon": 8,  "regime_adx": 20.0, "max_spw": 8.0, "skip_regime": True},
+    "BTC/USDT": {"prob_threshold": 0.60, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.030, "risk": 0.015, "timeframe": "30m", "horizon": 36, "regime_adx": 25.0, "max_spw": None},
+    "ETH/USDT": {"prob_threshold": 0.22, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.060, "risk": 0.015, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0},
+    "XRP/USDT": {"prob_threshold": 0.30, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.015, "timeframe": "15m", "horizon": 16, "regime_adx": 20.0, "max_spw": 8.0, "skip_regime": True},
 }
 
 
@@ -300,7 +300,18 @@ def simulate_bot(
 
         # ── Open position ──
         sl_price = current_price * (1.0 - sl_frac)
-        tp_price = current_price + (current_atr * TP_ATR_MULT) if current_atr > 0 else None
+        # Match production: TP = max(fixed_tp_pct, ATR_TP_MULT * atr_pct)
+        fixed_tp = cfg.get("fixed_tp_pct")
+        if fixed_tp is not None and current_atr > 0:
+            atr_tp_frac = (current_atr * TP_ATR_MULT) / current_price
+            tp_frac = max(float(fixed_tp), atr_tp_frac)
+            tp_price = current_price * (1.0 + tp_frac)
+        elif fixed_tp is not None:
+            tp_price = current_price * (1.0 + float(fixed_tp))
+        elif current_atr > 0:
+            tp_price = current_price + (current_atr * TP_ATR_MULT)
+        else:
+            tp_price = None
 
         pos = OpenPosition(
             symbol=symbol,

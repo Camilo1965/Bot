@@ -57,35 +57,31 @@ def _float_env(name: str, default: float) -> float:
 # Optimization for MT5 known symbols with higher Profit Factor and daily consistency.
 SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     "BTC/USDT": {
-        "prob_threshold": 0.65,     # Exhaust search: thresh=0.65 only viable combo. Signal marginal.
-        "fixed_sl_pct": 0.010,      # 1.0% SL — tight because BTC model has low signal strength
-        "fixed_tp_pct": 0.075,      # 7.5% TP (R:R = 7.5:1 needed for 15% WR to be profitable)
-        "use_sma_filter": False,
+        "prob_threshold": 0.60,     # Recent-regime: disk model p99=0.63, thresh=0.60 fires ~4%.
+        "fixed_sl_pct": 0.025,      # 2.5% SL
+        "fixed_tp_pct": 0.030,      # 3.0% TP — recent path sim WR~64%, net EV=+0.18%/trade.
+        "use_sma_filter": True,
         "risk": 0.015,
         "timeframe": "30m",
-        "horizon": 24,              # 12h max hold (was 8 bars = 4h)
+        "horizon": 36,              # 18h max hold (36 bars * 30m).
     },
     "ETH/USDT": {
-        "prob_threshold": 0.40,     # Exhaust search: 3.6x alpha vs random at 0.40. 555 fires/156d = 3.6/day.
-        "fixed_sl_pct": 0.020,      # 2.0% SL — wider needed for 9h hold without random whipsaw
-        "fixed_tp_pct": 0.075,      # 7.5% TP. EV=+0.586%/trade. WR=15.1% vs random 4.2%.
+        "prob_threshold": 0.22,     # Recent-regime (model recent p99=0.30). Fires ~2-3 trades/day.
+        "fixed_sl_pct": 0.025,      # 2.5% SL
+        "fixed_tp_pct": 0.060,      # 6.0% TP — wider TP catches breakout moves.
         "use_sma_filter": True,
         "risk": 0.015,
         "timeframe": "15m",
-        "horizon": 36,              # 9h max hold (was 8 bars = 2h) — path sim optimal
+        "horizon": 20,              # 5h max hold.
     },
     "XRP/USDT": {
-        "prob_threshold": 0.45,     # Exhaust search: 8.9x alpha vs random. EV=+1.206%/trade (best signal).
-        "fixed_sl_pct": 0.015,      # 1.5% SL
-        "fixed_tp_pct": 0.100,      # 10% TP. EV(no-timeout)=+0.235%. Model selects real 10% moves.
+        "prob_threshold": 0.20,     # Recent-regime (model recent p99=0.30).
+        "fixed_sl_pct": 0.025,      # 2.5% SL
+        "fixed_tp_pct": 0.040,      # 4.0% TP. Recent path sim: WR>70%, net EV positive.
         "use_sma_filter": True,
         "risk": 0.015,
         "timeframe": "15m",
-        "horizon": 36,              # 9h max hold — needed for 10% TP to be reachable
-        # Direction model v2 has precision=0 (p99=0.38 < threshold=0.45).
-        # Use regime model (AUC=0.94) as fallback entry signal until retrain.
-        "regime_only": True,
-        "regime_entry_threshold": 0.82,
+        "horizon": 16,              # 4h max hold.
     },
 }
 

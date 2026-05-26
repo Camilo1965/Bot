@@ -204,11 +204,12 @@ def retrain_and_validate(
 
     # 2. Compute quant features (DB DataFrame has timestamp col → temporal features computed correctly)
     feat = add_quant_features(df)
-    # forward_return_label: predicts short-term momentum (>1.5% in 8 bars)
-    # This is what the original AUC-0.71 models used. The trailing stop + partial
-    # exits in the executor then capture the extended 7.5%+ moves when momentum continues.
-    feat["label"] = forward_return_label(feat["close"], horizon=8, round_trip_cost=DEFAULT_LABEL_ROUND_TRIP)
-    logger.info("[LABEL] %s  forward_return  horizon=8  threshold=%.3f", symbol, DEFAULT_LABEL_ROUND_TRIP)
+    # forward_return_label: model predicts whether short-term move exceeds threshold within RETRAIN_LABEL_HORIZON bars.
+    # Keep horizon=8 (proven AUC 0.71+); cfg "horizon" controls live TTL not label horizon.
+    label_horizon = int(os.environ.get("RETRAIN_LABEL_HORIZON", "8") or "8")
+    label_thr = float(os.environ.get("RETRAIN_LABEL_THRESHOLD", "0.015"))
+    feat["label"] = forward_return_label(feat["close"], horizon=label_horizon, round_trip_cost=label_thr)
+    logger.info("[LABEL] %s  forward_return  horizon=%d  threshold=%.4f", symbol, label_horizon, label_thr)
 
     # 3. Inject VIBE features if requested
     if use_vibe:
