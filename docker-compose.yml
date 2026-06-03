@@ -1,3 +1,9 @@
+# OPTIONAL — only needed if DB_BACKEND=postgres (default).
+# For zero-dep VPS install (no Docker), set in .env:
+#   DB_BACKEND=sqlite
+#   REDIS_BACKEND=memory
+# Then run: bash scripts/install_vps_zerodep.sh
+
 version: "3.9"
 
 services:

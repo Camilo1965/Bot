@@ -19,9 +19,7 @@ import json
 import os
 from datetime import datetime, timezone
 
-import redis.asyncio as aioredis
-
-_redis: aioredis.Redis | None = None
+from dashboard.api.db.redis_client import get_redis as _get_redis
 
 _7D = 7 * 24 * 3600
 _1H = 3600
@@ -29,13 +27,6 @@ _1H = 3600
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-async def _get_redis() -> aioredis.Redis:
-    global _redis
-    if _redis is None:
-        _redis = aioredis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))
-    return _redis
 
 
 async def write_state(

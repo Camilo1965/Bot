@@ -694,6 +694,24 @@ class DatabaseManager:
             logger.warning("fetch_daily_pnl_series failed: %s", exc)
             return []
 
-db = DatabaseManager()
-async def init_db() -> None: await db.connect(); await db.initialize()
-async def close_db() -> None: await db.disconnect()
+def _make_db():
+    """Pick backend based on DB_BACKEND env. Defaults to TimescaleDB (asyncpg)."""
+    backend = os.environ.get("DB_BACKEND", "postgres").strip().lower()
+    if backend == "sqlite":
+        from database.sqlite_manager import get_sqlite_db
+        logger.info("DB backend: SQLite (zero-dep, no Docker)")
+        return get_sqlite_db()
+    logger.info("DB backend: TimescaleDB/asyncpg")
+    return DatabaseManager()
+
+
+db = _make_db()
+
+
+async def init_db() -> None:
+    await db.connect()
+    await db.initialize()
+
+
+async def close_db() -> None:
+    await db.disconnect()

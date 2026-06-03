@@ -27,6 +27,9 @@ feedparser
 # Storage / caching
 # redis  # Comentado: Opcional, no usado por el bucle principal
 asyncpg
+# Zero-dep alternatives for VPS without Docker (DB_BACKEND=sqlite, REDIS_BACKEND=memory)
+aiosqlite>=0.19.0
+fakeredis>=2.20.0
 
 # Backtesting / portfolio analytics
 # vectorbt  # Comentado: No se usa en los scripts de backtest actuales
