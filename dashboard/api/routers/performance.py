@@ -159,6 +159,106 @@ async def get_performance_by_hour() -> list[dict]:
     return result
 
 
+@router.get("/api/performance/pnl-histogram")
+async def get_pnl_histogram(bins: int = Query(default=20, ge=5, le=100), days: int = Query(default=90, ge=1, le=365)) -> dict:
+    """Histogram of PnL per trade (USD). Returns bin edges + counts."""
+    trades = await query_trades(days=days)
+    if not trades:
+        return {"bin_edges": [], "counts": [], "stats": {}}
+
+    def _pnl(t: dict) -> float:
+        for k in ("pnl_usd", "pnl", "profit_usd", "profit"):
+            v = t.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        return 0.0
+
+    pnls = [_pnl(t) for t in trades]
+    pnls = [p for p in pnls if p == p]  # filter NaN
+    if not pnls:
+        return {"bin_edges": [], "counts": [], "stats": {}}
+
+    lo, hi = min(pnls), max(pnls)
+    if lo == hi:
+        return {"bin_edges": [lo], "counts": [len(pnls)], "stats": {"mean": lo, "median": lo, "n": len(pnls)}}
+
+    step = (hi - lo) / bins
+    edges = [lo + i * step for i in range(bins + 1)]
+    counts = [0] * bins
+    for p in pnls:
+        idx = min(int((p - lo) / step), bins - 1)
+        counts[idx] += 1
+
+    pnls_sorted = sorted(pnls)
+    median = pnls_sorted[len(pnls_sorted) // 2]
+    mean = sum(pnls) / len(pnls)
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    return {
+        "bin_edges": [round(e, 2) for e in edges],
+        "counts": counts,
+        "stats": {
+            "n": len(pnls),
+            "mean": round(mean, 2),
+            "median": round(median, 2),
+            "min": round(lo, 2),
+            "max": round(hi, 2),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(len(wins) / len(pnls), 4) if pnls else 0.0,
+        },
+    }
+
+
+@router.get("/api/performance/rolling-sharpe")
+async def get_rolling_sharpe(window: int = Query(default=20, ge=5, le=200), days: int = Query(default=90, ge=1, le=365)) -> list[dict]:
+    """Rolling Sharpe ratio over last N trades. Annualized assuming ~250 trade days."""
+    from datetime import datetime
+    import math as _m
+
+    trades = await query_trades(days=days)
+    if not trades:
+        return []
+
+    def _pnl(t: dict) -> float:
+        for k in ("pnl_usd", "pnl", "profit_usd", "profit"):
+            v = t.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        return 0.0
+
+    rows = []
+    for t in trades:
+        try:
+            dt = datetime.fromisoformat(str(t.get("exit_time", "")).replace("Z", "+00:00"))
+            rows.append((dt, _pnl(t)))
+        except Exception:
+            pass
+    rows.sort(key=lambda x: x[0])
+    if len(rows) < window:
+        return []
+
+    out: list[dict] = []
+    for i in range(window, len(rows) + 1):
+        sub = [p for _, p in rows[i - window:i]]
+        mean = sum(sub) / len(sub)
+        var = sum((x - mean) ** 2 for x in sub) / max(len(sub) - 1, 1)
+        std = _m.sqrt(var)
+        sharpe = (mean / std * _m.sqrt(252)) if std > 0 else 0.0
+        out.append({
+            "ts": rows[i - 1][0].isoformat(),
+            "sharpe": round(sharpe, 3),
+            "n": len(sub),
+        })
+    return out
+
+
 @router.get("/api/performance/by-dow")
 async def get_performance_by_dow() -> list[dict]:
     trades = await query_trades(days=90)

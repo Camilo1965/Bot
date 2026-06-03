@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { WebPushPrompt, pushNotify } from "@/components/WebPushPrompt";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -38,8 +39,10 @@ export default function AlertsPage() {
     fetch(`${API}/api/alerts?status=unread`)
       .then((r) => r.json())
       .then((data) => {
-        setAlerts(Array.isArray(data) ? data : []);
+        const arr = Array.isArray(data) ? data : [];
+        setAlerts(arr);
         setLoading(false);
+        arr.slice(0, 3).forEach((a) => pushNotify(`ClawdBot · ${a.severity}`, a.message, a.id));
       })
       .catch((e) => {
         setError(String(e));
@@ -78,16 +81,19 @@ export default function AlertsPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-3">
         <h1 className="text-xl font-semibold text-[#F3F4F6]">Alerts</h1>
-        {alerts.length > 0 && (
-          <button
-            onClick={ackAll}
-            className="px-3 py-1.5 rounded bg-[#374151] text-[#9CA3AF] text-sm hover:text-[#F3F4F6] transition-colors"
-          >
-            Ack All ({alerts.length})
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          <WebPushPrompt />
+          {alerts.length > 0 && (
+            <button
+              onClick={ackAll}
+              className="px-3 py-1.5 rounded bg-[#374151] text-[#9CA3AF] text-sm hover:text-[#F3F4F6] transition-colors"
+            >
+              Ack All ({alerts.length})
+            </button>
+          )}
+        </div>
       </div>
 
       {loading && (

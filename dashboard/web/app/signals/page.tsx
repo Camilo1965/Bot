@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { TradingViewChart } from "@/components/TradingViewChart";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -114,6 +115,7 @@ function SymbolColumn({ data }: { data: SymbolSignals }) {
 
 export default function SignalsPage() {
   const [columns, setColumns] = useState<SymbolSignals[]>([]);
+  const [selectedSymbol, setSelectedSymbol] = useState<string>("BTC/USDT");
 
   useEffect(() => {
     fetch(`${API}/api/symbols/config`)
@@ -124,6 +126,9 @@ export default function SignalsPage() {
           : SYMBOLS_FALLBACK;
         const initial = symbols.map((s) => ({ symbol: s, rows: [] as SignalRow[], loading: true, error: null as string | null }));
         setColumns(initial);
+        if (symbols.length > 0 && !symbols.includes(selectedSymbol)) {
+          setSelectedSymbol(symbols[0]);
+        }
         symbols.forEach((sym, idx) => {
           const slug = sym.replace("/", "_");
           fetch(`${API}/api/signals/by-symbol/${slug}?limit=10`)
@@ -152,9 +157,29 @@ export default function SignalsPage() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-[#F3F4F6]">Signals</h1>
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h1 className="text-xl font-semibold text-[#F3F4F6]">Signals</h1>
+        <div className="flex items-center gap-2">
+          <label className="text-xs text-[#9CA3AF]">Chart:</label>
+          <select
+            value={selectedSymbol}
+            onChange={(e) => setSelectedSymbol(e.target.value)}
+            className="bg-[#0a0e15] border border-[#374151] rounded px-2 py-1 text-xs text-[#F3F4F6] font-mono focus:outline-none focus:border-[#3B82F6]"
+          >
+            {columns.map((c) => (
+              <option key={c.symbol} value={c.symbol}>{c.symbol}</option>
+            ))}
+          </select>
+        </div>
+      </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
+      {selectedSymbol && (
+        <div className="bg-[#10151D] border border-[#374151] rounded-lg p-2">
+          <TradingViewChart symbol={selectedSymbol} interval="15m" height={460} />
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
         {columns.map((col) => (
           <SymbolColumn key={col.symbol} data={col} />
         ))}
