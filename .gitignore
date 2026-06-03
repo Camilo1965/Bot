@@ -29,3 +29,16 @@ state.json
 
 # Runtime logs and session output
 logs/
+
+# DuckDB cache (runtime, can be large)
+data/cache/
+*.duckdb
+*.duckdb.wal
+
+# Model backups
+*.json.bak
+*.meta.json.bak
+
+# Plan/patch files (working docs, not source)
+plan_final.md
+profitabilityfixes.patch

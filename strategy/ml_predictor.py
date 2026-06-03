@@ -170,6 +170,20 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "skip_regime": True,
         "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10},
     },
+    "JTO/USDT": {
+        # Symbol scan 2026-06-03 (54d OOS): pt=default tp=0.040 sl=0.025
+        # → 66 trades, WR 60.6%, PnL +15.84%, PF 2.17, score 32.84. Top new survivor.
+        # Needs retrain before activation. Add to WATCHLIST after Phase F validation.
+        "prob_threshold": 0.50,
+        "fixed_sl_pct": 0.025,
+        "fixed_tp_pct": 0.040,
+        "use_sma_filter": True,
+        "risk": 0.010,
+        "timeframe": "15m",
+        "horizon": 20,
+        "skip_regime": True,
+        "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15},
+    },
 }
 
 ALLOWED_SYMBOLS: tuple[str, ...] = tuple(SYMBOL_CONFIG.keys())

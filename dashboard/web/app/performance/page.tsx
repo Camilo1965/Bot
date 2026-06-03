@@ -28,12 +28,68 @@ interface PerformanceData {
   by_symbol: SymbolPerf[];
 }
 
-function HeatmapPlaceholder({ title }: { title: string }) {
+interface HourBucket { hour: number; win_rate: number; count: number; }
+interface DowBucket  { dow: number; day_name: string; win_rate: number; count: number; }
+
+function winRateColor(wr: number, count: number): string {
+  if (count === 0) return "#1E2530";
+  if (wr >= 0.7)  return "#10B981";
+  if (wr >= 0.55) return "#34d399";
+  if (wr >= 0.45) return "#F59E0B";
+  if (wr >= 0.35) return "#f97316";
+  return "#EF4444";
+}
+
+function HourHeatmap({ data }: { data: HourBucket[] }) {
   return (
     <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
-      <div className="text-xs uppercase tracking-widest text-[#9CA3AF] mb-3">{title}</div>
-      <div className="h-32 flex items-center justify-center border border-dashed border-[#374151] rounded text-[#9CA3AF] text-sm">
-        Chart placeholder — implement with a heatmap library
+      <div className="text-xs uppercase tracking-widest text-[#9CA3AF] mb-4">Hour of Day — Win Rate</div>
+      <div className="grid gap-1" style={{ gridTemplateColumns: "repeat(24, 1fr)" }}>
+        {data.map((b) => (
+          <div key={b.hour} className="flex flex-col items-center gap-1">
+            <div
+              className="w-full rounded-sm transition-colors"
+              style={{ height: 32, backgroundColor: winRateColor(b.win_rate, b.count) }}
+              title={`${b.hour}:00 — WR ${(b.win_rate * 100).toFixed(0)}% (${b.count} trades)`}
+            />
+            <span className="text-[9px] text-[#9CA3AF] font-mono tabular-nums">
+              {String(b.hour).padStart(2, "0")}
+            </span>
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-3 mt-3">
+        {[["#10B981","≥70%"],["#F59E0B","45–55%"],["#EF4444","<35%"],["#1E2530","No data"]].map(([c,l]) => (
+          <div key={l} className="flex items-center gap-1.5">
+            <div className="w-3 h-3 rounded-sm flex-shrink-0" style={{ backgroundColor: c }} />
+            <span className="text-[10px] text-[#9CA3AF]">{l}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DowHeatmap({ data }: { data: DowBucket[] }) {
+  return (
+    <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
+      <div className="text-xs uppercase tracking-widest text-[#9CA3AF] mb-4">Day of Week — Win Rate</div>
+      <div className="grid grid-cols-7 gap-2">
+        {data.map((b) => (
+          <div key={b.dow} className="flex flex-col items-center gap-2">
+            <div
+              className="w-full rounded-md flex flex-col items-center justify-center transition-colors"
+              style={{ height: 64, backgroundColor: winRateColor(b.win_rate, b.count) }}
+              title={`${b.day_name} — WR ${(b.win_rate * 100).toFixed(0)}% (${b.count} trades)`}
+            >
+              <span className="text-xs font-mono font-bold text-white/90 tabular-nums">
+                {b.count > 0 ? `${(b.win_rate * 100).toFixed(0)}%` : "—"}
+              </span>
+              <span className="text-[9px] text-white/60">{b.count}t</span>
+            </div>
+            <span className="text-[10px] text-[#9CA3AF]">{b.day_name.slice(0, 3)}</span>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -41,13 +97,23 @@ function HeatmapPlaceholder({ title }: { title: string }) {
 
 export default function PerformancePage() {
   const [data, setData] = useState<PerformanceData | null>(null);
+  const [hourData, setHourData] = useState<HourBucket[]>([]);
+  const [dowData, setDowData]   = useState<DowBucket[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${API}/api/performance?range=30d`)
-      .then((r) => r.json())
-      .then((d) => { setData(d); setLoading(false); })
+    Promise.all([
+      fetch(`${API}/api/performance?range=30d`).then((r) => r.json()),
+      fetch(`${API}/api/performance/by-hour`).then((r) => r.json()),
+      fetch(`${API}/api/performance/by-dow`).then((r) => r.json()),
+    ])
+      .then(([perf, hours, dows]) => {
+        setData(perf);
+        setHourData(hours);
+        setDowData(dows);
+        setLoading(false);
+      })
       .catch((e) => { setError(String(e)); setLoading(false); });
   }, []);
 
@@ -147,11 +213,9 @@ export default function PerformancePage() {
         </>
       )}
 
-      {/* Heatmap placeholders (always shown) */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <HeatmapPlaceholder title="Hour of Day Win Rate" />
-        <HeatmapPlaceholder title="Day of Week Win Rate" />
-      </div>
+      {/* Heatmaps (always shown, show empty cells when no trades yet) */}
+      {hourData.length > 0 && <HourHeatmap data={hourData} />}
+      {dowData.length > 0 && <DowHeatmap data={dowData} />}
     </div>
   );
 }

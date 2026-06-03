@@ -55,9 +55,14 @@ class OHLCVCache:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        with self._conn() as con:
-            con.execute(_CREATE_TABLE)
-        logger.debug("OHLCVCache ready at %s", self._db_path)
+        self._available = True
+        try:
+            with self._conn() as con:
+                con.execute(_CREATE_TABLE)
+            logger.debug("OHLCVCache ready at %s", self._db_path)
+        except Exception as exc:
+            logger.warning("OHLCVCache init failed (DB locked?): %s — cache disabled", exc)
+            self._available = False
 
     def _conn(self) -> duckdb.DuckDBPyConnection:
         return duckdb.connect(str(self._db_path))
@@ -72,7 +77,13 @@ class OHLCVCache:
         """Return cached OHLCV df if fresh + sufficient, else refetch and upsert.
 
         Returns a DataFrame with columns: timestamp, open, high, low, close, volume.
+        Falls back to direct CCXT fetch if DB is locked or unavailable.
         """
+        if not self._available:
+            logger.debug("[cache SKIP] DB unavailable, fetching %s %s from CCXT", symbol, timeframe)
+            df = self._live_fetch(symbol, timeframe, limit)
+            return df if df is not None else pd.DataFrame()
+
         with self._lock:
             if self._is_fresh(symbol, timeframe, limit, max_age_s):
                 df = self._read(symbol, timeframe, limit)
@@ -192,5 +203,12 @@ def get_cache(db_path: Path | str = _DEFAULT_DB) -> OHLCVCache:
     if _cache is None:
         with _cache_lock:
             if _cache is None:
-                _cache = OHLCVCache(db_path)
+                try:
+                    _cache = OHLCVCache(db_path)
+                except Exception as exc:
+                    logger.warning("get_cache: could not init OHLCVCache: %s", exc)
+                    _cache = OHLCVCache.__new__(OHLCVCache)
+                    _cache._db_path = Path(db_path)
+                    _cache._lock = threading.Lock()
+                    _cache._available = False
     return _cache
