@@ -69,12 +69,18 @@ class EnsemblePredictor:
             w = np.array([self._w[0] + self._w[1] / 2, 0.0, self._w[2] + self._w[1] / 2])
             self._w = w / w.sum()
 
-        self._lr = LogisticRegression(
-            max_iter=1000,
-            class_weight="balanced",
-            solver="lbfgs",
-            n_jobs=-1,
-        )
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.pipeline import Pipeline
+
+        self._lr = Pipeline([
+            ("scaler", StandardScaler()),
+            ("lr", LogisticRegression(
+                max_iter=5000,
+                class_weight="balanced",
+                solver="lbfgs",
+                n_jobs=-1,
+            )),
+        ])
         self._lr.fit(X, y)
 
         self._fitted = True
@@ -122,7 +128,7 @@ class EnsemblePredictor:
 
         lr_pkl = base.parent / f"{base.stem}_lr.pkl"
         with open(lr_pkl, "wb") as f:
-            pickle.dump(self._lr, f)
+            pickle.dump(self._lr, f)  # Pipeline (scaler + LR) or bare LR
 
         meta = {
             "type": "EnsemblePredictor",
