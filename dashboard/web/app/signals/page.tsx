@@ -4,14 +4,11 @@ import { useEffect, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-const SYMBOLS = [
-  "BTC/USDT",
-  "ETH/USDT",
-  "SOL/USDT",
-  "DOGE/USDT",
-  "NEAR/USDT",
-  "ATOM/USDT",
-  "LINK/USDT",
+// Symbols fetched dynamically from /api/symbols/config so dashboard
+// always reflects SYMBOL_CONFIG without hardcoded list.
+const SYMBOLS_FALLBACK = [
+  "BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT", "DOGE/USDT",
+  "NEAR/USDT", "LINK/USDT", "JTO/USDT", "INJ/USDT",
 ];
 
 interface SignalRow {
@@ -116,30 +113,41 @@ function SymbolColumn({ data }: { data: SymbolSignals }) {
 }
 
 export default function SignalsPage() {
-  const [columns, setColumns] = useState<SymbolSignals[]>(
-    SYMBOLS.map((s) => ({ symbol: s, rows: [], loading: true, error: null }))
-  );
+  const [columns, setColumns] = useState<SymbolSignals[]>([]);
 
   useEffect(() => {
-    SYMBOLS.forEach((sym, idx) => {
-      const slug = sym.replace("/", "_");
-      fetch(`${API}/api/signals/by-symbol/${slug}?limit=10`)
-        .then((r) => r.json())
-        .then((data) => {
-          setColumns((prev) =>
-            prev.map((c, i) =>
-              i === idx ? { ...c, rows: Array.isArray(data) ? data : [], loading: false } : c
-            )
-          );
-        })
-        .catch((e) => {
-          setColumns((prev) =>
-            prev.map((c, i) =>
-              i === idx ? { ...c, loading: false, error: String(e) } : c
-            )
-          );
+    fetch(`${API}/api/symbols/config`)
+      .then((r) => r.json())
+      .then((cfg) => {
+        const symbols: string[] = Array.isArray(cfg) && cfg.length > 0
+          ? cfg.filter((c: any) => c.enabled !== false).map((c: any) => c.symbol)
+          : SYMBOLS_FALLBACK;
+        const initial = symbols.map((s) => ({ symbol: s, rows: [] as SignalRow[], loading: true, error: null as string | null }));
+        setColumns(initial);
+        symbols.forEach((sym, idx) => {
+          const slug = sym.replace("/", "_");
+          fetch(`${API}/api/signals/by-symbol/${slug}?limit=10`)
+            .then((r) => r.json())
+            .then((data) => {
+              setColumns((prev) =>
+                prev.map((c, i) =>
+                  i === idx ? { ...c, rows: Array.isArray(data) ? data : [], loading: false } : c
+                )
+              );
+            })
+            .catch((e) => {
+              setColumns((prev) =>
+                prev.map((c, i) =>
+                  i === idx ? { ...c, loading: false, error: String(e) } : c
+                )
+              );
+            });
         });
-    });
+      })
+      .catch(() => {
+        const initial = SYMBOLS_FALLBACK.map((s) => ({ symbol: s, rows: [] as SignalRow[], loading: false, error: "config_fetch_failed" }));
+        setColumns(initial);
+      });
   }, []);
 
   return (
