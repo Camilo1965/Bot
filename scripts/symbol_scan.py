@@ -166,8 +166,14 @@ def scan_one(symbol: str, limit: int = 17280) -> dict[str, Any]:
 
 
 def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbols", type=str, default=None, help="Comma-separated subset of CANDIDATES")
+    args = parser.parse_args()
+
+    pool = [s.strip() for s in args.symbols.split(",")] if args.symbols else CANDIDATES
     rows: list[dict[str, Any]] = []
-    for sym in CANDIDATES:
+    for sym in pool:
         try:
             res = scan_one(sym)
         except Exception as exc:

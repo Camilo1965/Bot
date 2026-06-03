@@ -72,10 +72,10 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05},
     },
     "ETH/USDT": {
-        # Disk sweep 2026-06-02 (60d, calibrated): pt=0.50 tp=0.030 sl=0.020
-        # → 17 trades, WR 88.2%, PnL +21.33%, PF 9.04. Old pt=0.60 baseline was
-        # break-even; calibration moved the prob distribution, threshold follows.
-        "prob_threshold": 0.50,
+        # PT raised 2026-06-03: portfolio backtest 60d showed WR 32% PnL -$353
+        # with pt=0.50. Calibration shifted post v3 retrain; raising threshold
+        # filters weak signals. Reevaluate after 30d demo.
+        "prob_threshold": 0.75,
         "fixed_sl_pct": 0.020,
         "fixed_tp_pct": 0.030,
         "use_sma_filter": True,
@@ -166,6 +166,19 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     "JTO/USDT": {
         # Threshold sweep 2026-06-03: pt=0.70 → 54 trades, Sharpe +0.29, PnL +5.40%.
         "prob_threshold": 0.70,
+        "fixed_sl_pct": 0.025,
+        "fixed_tp_pct": 0.040,
+        "use_sma_filter": True,
+        "risk": 0.010,
+        "timeframe": "15m",
+        "horizon": 20,
+        "skip_regime": True,
+        "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15},
+    },
+    "INJ/USDT": {
+        # Phase E survivor (scan 2026-06-03): WR 53%, PnL +9.82%, PF 1.50.
+        # Best of 7 new candidates (RUNE/ARB/OP/SUI/SEI/INJ/TIA).
+        "prob_threshold": 0.55,
         "fixed_sl_pct": 0.025,
         "fixed_tp_pct": 0.040,
         "use_sma_filter": True,

@@ -54,8 +54,9 @@ MODELS_DIR = _REPO / "models"
 
 MAX_PORTFOLIO_RISK_PCT = 0.10  # max fraction of balance in open risk across all symbols
 MAX_SYMBOL_NOTIONAL_FRACTION = 0.35  # single symbol notional cap: max 35% of balance
-MAX_SYMBOL_PNL_FRACTION = 0.35  # once one symbol > 35% of total realized PnL, halve its risk
+MAX_SYMBOL_PNL_FRACTION = 0.25  # 2026-06-03: tightened from 35% — NEAR was 66% of portfolio PnL
 KELLY_MAX_FRACTION = 0.25       # half-Kelly cap: never exceed 25% of balance on a single bet
+MIN_ATR_PCT = 0.005             # 2026-06-03: skip flat markets (ATR < 0.5% of price) to avoid chop
 
 ACTIVE_SYMBOLS = list(SYMBOL_CONFIG.keys())
 
@@ -267,6 +268,9 @@ def run_portfolio(days: int = 30, initial_balance: float = INITIAL_BALANCE) -> d
             if USE_HTF_FILTER and not np.isnan(htf_sma) and cur_p < float(htf_sma):
                 continue
             if MAX_ATR_PCT is not None and cur_p > 0 and cur_atr / cur_p > MAX_ATR_PCT:
+                continue
+            # 2026-06-03: volatility floor — skip flat markets (chop kills WR)
+            if cur_p > 0 and cur_atr / cur_p < MIN_ATR_PCT:
                 continue
             # E3: ADX-based regime gate (only when skip_regime=False in config)
             if not cfg.get("skip_regime", True):
