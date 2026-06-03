@@ -115,8 +115,48 @@ def _simulate_trades(
     }
 
 
-async def _fetch_ohlcv(symbol: str, days: int) -> pd.DataFrame | None:
-    """Fetch OHLCV from TimescaleDB."""
+def _bars_per_day(timeframe: str) -> int:
+    tf = timeframe.strip().lower()
+    if tf.endswith("m"):
+        return 24 * 60 // int(tf[:-1])
+    if tf.endswith("h"):
+        return 24 // int(tf[:-1])
+    return 96
+
+
+def _fetch_ohlcv_ccxt(symbol: str, days: int, timeframe: str = "15m") -> pd.DataFrame | None:
+    """Download OHLCV from Binance via CCXT (no auth required)."""
+    try:
+        import ccxt
+    except ImportError:
+        logger.warning("ccxt not installed — pip install ccxt")
+        return None
+    bars_needed = days * _bars_per_day(timeframe)
+    try:
+        ex = ccxt.binance({"enableRateLimit": True})
+        all_rows: list = []
+        since = int((datetime.now(tz=timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+        while len(all_rows) < bars_needed:
+            rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=1000)
+            if not rows:
+                break
+            all_rows.extend(rows)
+            since = rows[-1][0] + 1
+            if len(rows) < 1000:
+                break
+        if not all_rows:
+            return None
+        df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        logger.info("[CCXT] Downloaded %d rows for %s from Binance", len(df), symbol)
+        return df
+    except Exception as exc:
+        logger.warning("[CCXT] Download failed for %s: %s", symbol, exc)
+        return None
+
+
+async def _fetch_ohlcv(symbol: str, days: int, timeframe: str = "15m") -> pd.DataFrame | None:
+    """Fetch OHLCV from TimescaleDB; falls back to Binance CCXT if DB unavailable."""
     import os
     import asyncpg
     url = os.environ.get("DATABASE_URL")
@@ -133,19 +173,25 @@ async def _fetch_ohlcv(symbol: str, days: int) -> pd.DataFrame | None:
         "FROM market_data WHERE symbol = $1 AND timestamp >= $2 "
         "ORDER BY timestamp ASC"
     )
+    df_db: pd.DataFrame | None = None
     try:
         conn = await asyncpg.connect(dsn=url)
         rows = await conn.fetch(query, symbol, cutoff)
         await conn.close()
+        if rows:
+            df_db = pd.DataFrame([dict(r) for r in rows])
+            for col in ("open", "high", "low", "close", "volume"):
+                df_db[col] = pd.to_numeric(df_db[col], errors="coerce")
+            df_db = df_db.dropna()
     except Exception as exc:
-        logger.error("DB fetch failed: %s", exc)
-        return None
-    if not rows:
-        return None
-    df = pd.DataFrame([dict(r) for r in rows])
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna()
+        logger.warning("DB fetch failed: %s", exc)
+
+    if df_db is not None and len(df_db) >= 500:
+        return df_db
+
+    db_rows = len(df_db) if df_db is not None else 0
+    logger.warning("[DB] Only %d rows for %s — falling back to Binance CCXT", db_rows, symbol)
+    return _fetch_ohlcv_ccxt(symbol, days, timeframe)
 
 
 def walk_forward_validate(
@@ -286,7 +332,7 @@ def main() -> int:
 
     logger.info("Symbol=%s  SL=%.1f%%  TP=%.1f%%  horizon=%d  threshold=%.2f", args.symbol, sl_pct*100, tp_pct*100, horizon, prob_threshold)
 
-    df = asyncio.run(_fetch_ohlcv(args.symbol, args.days))
+    df = asyncio.run(_fetch_ohlcv(args.symbol, args.days, tf_str))
     if df is None or len(df) < 500:
         logger.error("Insufficient data for %s", args.symbol)
         return 1

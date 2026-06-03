@@ -61,15 +61,24 @@ def _build_dsn() -> str:
 _MIN_ROWS_FOR_TRAINING = 5_000  # ~52 days of 15m data minimum
 
 
-def _fetch_ohlcv_ccxt(symbol: str, days: int) -> pd.DataFrame | None:
+def _bars_per_day(timeframe: str) -> int:
+    """Return number of bars per day for a CCXT timeframe string (15m/30m/1h/4h)."""
+    tf = timeframe.strip().lower()
+    if tf.endswith("m"):
+        return 24 * 60 // int(tf[:-1])
+    if tf.endswith("h"):
+        return 24 // int(tf[:-1])
+    return 96  # default 15m
+
+
+def _fetch_ohlcv_ccxt(symbol: str, days: int, timeframe: str = "15m") -> pd.DataFrame | None:
     """Download OHLCV from Binance via CCXT (no auth required for public data)."""
     try:
         import ccxt
     except ImportError:
         logger.warning("ccxt not installed — skipping Binance fallback (pip install ccxt)")
         return None
-    timeframe = "15m"
-    bars_needed = days * 24 * 4  # 15m bars per day = 96
+    bars_needed = days * _bars_per_day(timeframe)
     limit = min(bars_needed, 1000)
     try:
         ex = ccxt.binance({"enableRateLimit": True})
@@ -95,7 +104,7 @@ def _fetch_ohlcv_ccxt(symbol: str, days: int) -> pd.DataFrame | None:
         return None
 
 
-async def _fetch_ohlcv(symbol: str, days: int) -> pd.DataFrame | None:
+async def _fetch_ohlcv(symbol: str, days: int, timeframe: str = "15m") -> pd.DataFrame | None:
     """Fetch OHLCV from TimescaleDB; falls back to Binance CCXT if DB has insufficient data."""
     dsn = _build_dsn()
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
@@ -126,7 +135,7 @@ async def _fetch_ohlcv(symbol: str, days: int) -> pd.DataFrame | None:
         "[DB] Only %d rows for %s (need %d) — falling back to Binance CCXT download",
         db_rows, symbol, _MIN_ROWS_FOR_TRAINING,
     )
-    return _fetch_ohlcv_ccxt(symbol, days)
+    return _fetch_ohlcv_ccxt(symbol, days, timeframe)
 
 
 def _add_vibe_features(df: pd.DataFrame, add_noise: bool = True) -> pd.DataFrame:
@@ -192,8 +201,16 @@ def retrain_and_validate(
         logger.error("Missing dependency: %s", exc)
         return False
 
-    # 1. Load market data
-    df = asyncio.run(_fetch_ohlcv(symbol, lookback_days))
+    # 1. Resolve per-symbol timeframe from production cfg
+    sym_cfg = get_symbol_config(symbol)
+    timeframe = str(sym_cfg.get("timeframe", "15m"))
+    tf_min = int(timeframe[:-1]) if timeframe[:-1].isdigit() else 15
+    if timeframe.endswith("h"):
+        tf_min = int(timeframe[:-1]) * 60
+    logger.info("[CFG] %s using timeframe=%s (%dmin)", symbol, timeframe, tf_min)
+
+    # 2. Load market data on the right timeframe
+    df = asyncio.run(_fetch_ohlcv(symbol, lookback_days, timeframe))
     if df is None or len(df) < 500:
         logger.warning(
             "Not enough OHLCV data for %s (need >=500 rows, got %s).",
@@ -202,8 +219,8 @@ def retrain_and_validate(
         )
         return False
 
-    # 2. Compute quant features (DB DataFrame has timestamp col → temporal features computed correctly)
-    feat = add_quant_features(df)
+    # 3. Compute quant features with correct base_timeframe_min (affects ATR/MACD scale)
+    feat = add_quant_features(df, base_timeframe_min=tf_min)
     # forward_return_label: model predicts whether short-term move exceeds threshold within RETRAIN_LABEL_HORIZON bars.
     # Keep horizon=8 (proven AUC 0.71+); cfg "horizon" controls live TTL not label horizon.
     label_horizon = int(os.environ.get("RETRAIN_LABEL_HORIZON", "8") or "8")

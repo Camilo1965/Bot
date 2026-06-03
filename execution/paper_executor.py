@@ -123,6 +123,10 @@ class OpenPosition:
     last_close_error: str | None = None
     direction: str = "long"  # "long" or "short"
     partial_exit_done: bool = False
+    # Margin actually deducted from simulated balance at entry (notional /
+    # LEVERAGE). Required so _close_position credits margin back, not notional
+    # — otherwise paper balance inflates by 5× on every close.
+    margin_used: float = 0.0
 
     def __post_init__(self) -> None:
         if self.stop_loss_price <= 0.0 and self.sl_price > 0.0:
@@ -254,7 +258,7 @@ class PaperExecutor:
         if symbol in self.open_positions: return False
         if not self._risk.can_open_position(): return False
         cfg = get_symbol_config(symbol)
-        
+
         # Risk Management: Portfolio level
         # ATR-based dynamic SL: sl = clamp(ATR_SL_MULT * atr_pct, cfg_sl, SL_CAP)
         cfg_fixed_sl = float(cfg.get("fixed_sl_pct", BASE_SL))
@@ -262,10 +266,19 @@ class PaperExecutor:
         thresh = get_execution_thresholds(atr_pct=atr_pct)
         sl_frac = min(max(thresh.sl_pct, cfg_fixed_sl), _SL_CAP_FRAC)
 
+        # Take Profit computed BEFORE sizing so Kelly can use TP/SL ratio.
+        _fixed_tp = float(cfg.get("fixed_tp_pct", _DEFAULT_TP_PCT))
+        if current_atr and entry_price > 0.0:
+            _atr_tp = (_ATR_TP_MULT * current_atr) / entry_price
+            tp_frac = max(_fixed_tp, _atr_tp)
+        else:
+            tp_frac = _fixed_tp
+
         pos_size_quote = self._risk.calculate_position_size(
             win_probability,
             risk_pct=float(cfg.get("risk", 0.02)),
             sl_distance_pct=sl_frac,
+            tp_distance_pct=tp_frac,
             vibe_quality=vibe_quality,
         )
 
@@ -274,14 +287,6 @@ class PaperExecutor:
 
         sl_price = entry_price * (1.0 - sl_frac)
         act_price = entry_price * (1.0 + thresh.activation_pct)
-
-        # Take Profit: max(fixed_tp_pct, ATR_TP_MULT × atr_pct) — widens TP in high-volatility
-        _fixed_tp = float(cfg.get("fixed_tp_pct", _DEFAULT_TP_PCT))
-        if current_atr and entry_price > 0.0:
-            _atr_tp = (_ATR_TP_MULT * current_atr) / entry_price
-            tp_frac = max(_fixed_tp, _atr_tp)
-        else:
-            tp_frac = _fixed_tp
         tp_price = entry_price * (1.0 + tp_frac)
         
         trade_id = str(uuid.uuid4())
@@ -308,14 +313,16 @@ class PaperExecutor:
             timeframe=tf,
             sentiment_score=sentiment_score,
             current_stop_loss=sl_price,
+            margin_used=self._risk.margin_for(pos_size_quote),
         )
-        
+
         self.open_positions[symbol] = pos
-        
-        # Risk accounting
+
+        # Risk accounting — deduct MARGIN (notional / LEVERAGE), not notional,
+        # so simulated equity tracks broker behavior on futures.
         risk_usd = pos_size_quote * sl_frac
         self._risk.register_open(risk_usd=risk_usd)
-        self._risk.deduct(pos_size_quote)
+        self._risk.deduct(pos.margin_used)
         
         # DB Record
         try:
@@ -373,10 +380,19 @@ class PaperExecutor:
         thresh = get_execution_thresholds(atr_pct=atr_pct)
         sl_frac = min(max(thresh.sl_pct, cfg_fixed_sl), _SL_CAP_FRAC)
 
+        # TP first so Kelly sizing can use TP/SL ratio.
+        _fixed_tp = float(cfg.get("fixed_tp_pct", _DEFAULT_TP_PCT))
+        if current_atr and entry_price > 0.0:
+            _atr_tp = (_ATR_TP_MULT * current_atr) / entry_price
+            tp_frac = max(_fixed_tp, _atr_tp)
+        else:
+            tp_frac = _fixed_tp
+
         pos_size_quote = self._risk.calculate_position_size(
             win_probability,
             risk_pct=float(cfg.get("risk", 0.02)),
             sl_distance_pct=sl_frac,
+            tp_distance_pct=tp_frac,
             vibe_quality=vibe_quality,
         )
         if pos_size_quote <= 0 or not self._risk.has_sufficient_balance(pos_size_quote):
@@ -384,12 +400,6 @@ class PaperExecutor:
 
         # SHORT: SL is ABOVE entry, TP is BELOW entry
         sl_price = entry_price * (1.0 + sl_frac)
-        _fixed_tp = float(cfg.get("fixed_tp_pct", _DEFAULT_TP_PCT))
-        if current_atr and entry_price > 0.0:
-            _atr_tp = (_ATR_TP_MULT * current_atr) / entry_price
-            tp_frac = max(_fixed_tp, _atr_tp)
-        else:
-            tp_frac = _fixed_tp
         tp_price = entry_price * (1.0 - tp_frac)
 
         # Activation: price must fall by activation_pct before trailing kicks in
@@ -397,7 +407,8 @@ class PaperExecutor:
         activation_price = entry_price * (1.0 - activation_pct)
 
         trade_id = str(uuid.uuid4())
-        self._risk.debit(pos_size_quote)
+        margin_used = self._risk.margin_for(pos_size_quote)
+        self._risk.deduct(margin_used)
         risk_usd = pos_size_quote * sl_frac
         self._risk.register_open(risk_usd=risk_usd)
 
@@ -410,7 +421,7 @@ class PaperExecutor:
             position_size=pos_size_quote,
             sl_price=sl_price,
             activation_price=activation_price,
-            trailing_distance_pct=thresh.trailing_pct,
+            trailing_distance_pct=thresh.trailing_distance_pct,
             peak_price=entry_price,  # for SHORT: track minimum (starts at entry)
             tp_price=tp_price,
             ml_confidence=win_probability,
@@ -421,6 +432,7 @@ class PaperExecutor:
             atr_at_entry=current_atr,
             timeframe=tf,
             direction="short",
+            margin_used=margin_used,
         )
         self.open_positions[symbol] = pos
 
@@ -479,15 +491,17 @@ class PaperExecutor:
         )
         self._append_to_journal(partial_pos_snapshot, exit_price, datetime.now(tz=timezone.utc), reason)
 
-        # Update accounting
+        # Update accounting — credit margin slice (not notional slice) + PnL.
+        partial_margin = self._risk.margin_for(partial_size)
         self.total_pnl += partial_pnl
-        self._risk.credit(partial_size + partial_pnl)
+        self._risk.credit(partial_margin + partial_pnl)
         self._risk.register_close(risk_usd=partial_size * pos.sl_pct)
         if partial_pnl < 0:
             self._risk.record_daily_loss(abs(partial_pnl))
 
-        # Shrink position and mark partial done
+        # Shrink position and mark partial done; shrink remaining margin
         pos.position_size = remaining_size
+        pos.margin_used = max(0.0, pos.margin_used - partial_margin)
         pos.partial_exit_done = True
 
         # Move SL to break-even
@@ -645,8 +659,11 @@ class PaperExecutor:
         gross_pnl = pnl_pct * pos.position_size
         
         self.total_pnl += gross_pnl
-        self._risk.credit(pos.position_size + gross_pnl)
-        
+        # Credit MARGIN (locked at entry) + PnL. Crediting notional would
+        # inflate balance by 5× on every close in 5x-leverage paper mode.
+        margin_back = pos.margin_used if pos.margin_used > 0.0 else self._risk.margin_for(pos.position_size)
+        self._risk.credit(margin_back + gross_pnl)
+
         # Risk accounting
         risk_usd = pos.position_size * pos.sl_pct
         self._risk.register_close(risk_usd=risk_usd)

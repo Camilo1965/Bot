@@ -14,6 +14,7 @@ import aiohttp
 from bot.constants import DEBUG_LOG_HINT
 from database.db_manager import db
 from execution.paper_executor import PaperExecutor
+from risk.kill_switch import is_halted as kill_switch_is_halted, reason as kill_switch_reason
 from strategy.feature_engineer import FeatureEngineer
 from strategy.quant_features import MIN_OHLC_ROWS, htf_sma200_1h_allows_long
 from strategy.ml_predictor import BUY_PROB_THRESHOLD, MLPredictor, get_symbol_config, model_json_path_for_symbol, load_short_booster
@@ -293,10 +294,14 @@ async def signal_emitter(
                     _bg_tasks.add(_vibe_task)
                     _vibe_task.add_done_callback(_bg_tasks.discard)
 
+            # ── Per-symbol config (needed before regime blocks below) ────────────
+            _sym_cfg = get_symbol_config(symbol)
+            _skip_regime = _sym_cfg.get("skip_regime", False)
+
             # ── Regime prediction (once per tick, reused for exit + entry gate) ───
             _regime_enabled = os.environ.get("REGIME_FILTER_ENABLED", "1").strip() in ("1", "true", "yes")
             _regime_result: tuple[str, float] | None = None
-            if _regime_enabled:
+            if _regime_enabled and not _skip_regime:
                 _regime_result = predict_regime(symbol, prices, highs=highs or None, lows=lows or None, volumes=volumes or None)
 
             # Single-pass prediction
@@ -372,8 +377,8 @@ async def signal_emitter(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("⚠️ [ALERTA] check_ml_exit failed for %s: %s %s", symbol, exc, DEBUG_LOG_HINT)
 
-                # [REGIME] Close open position if ranging
-                if _regime_result is not None:
+                # [REGIME] Close open position if ranging (skipped for symbols with skip_regime)
+                if not _skip_regime and _regime_result is not None:
                     regime, regime_prob = _regime_result
                     if regime == "RANGING":
                         logger.warning("[REGIME] Closing %s position: market entered RANGING (prob=%.2f)", symbol, regime_prob)
@@ -385,18 +390,17 @@ async def signal_emitter(
             # [REGIME] Filter new entries by market regime
             # ------------------------------------------------------------------
             regime_gate_passed = True
-            if _regime_result is not None:
+            if not _skip_regime and _regime_result is not None:
                 regime_str, regime_prob = _regime_result
                 if regime_str == "RANGING":
                     regime_gate_passed = False
                     logger.info("[REGIME] Entry blocked for %s: market is RANGING (prob=%.2f)", symbol, regime_prob)
-            elif _regime_enabled:
+            elif not _skip_regime and _regime_enabled:
                 logger.debug("[REGIME] No regime model available for %s", symbol)
 
             # ------------------------------------------------------------------
             # [REGIME-ONLY] Fallback entry for symbols with dead direction models
             # ------------------------------------------------------------------
-            _sym_cfg = get_symbol_config(symbol)
             if signal == "HOLD" and _sym_cfg.get("regime_only", False) and _regime_result is not None:
                 _r_str, _r_prob = _regime_result
                 _r_entry_th = float(_sym_cfg.get("regime_entry_threshold", 0.82))
@@ -429,6 +433,16 @@ async def signal_emitter(
                 if h1_closes and not htf_sma200_1h_allows_long(h1_closes):
                     logger.info("[HTF GATE] %s: price < 1H SMA200 — BUY blocked.", symbol)
                     return
+
+            # Kill Switch — file-flag global halt blocks ALL new entries.
+            # Existing positions still managed by smart-exit / SL / TTL.
+            if kill_switch_is_halted():
+                logger.warning(
+                    "[KILL] halt active (%s) — entry skipped for %s",
+                    kill_switch_reason() or "no-reason",
+                    symbol,
+                )
+                return
 
             if signal == "BUY" and prices and regime_gate_passed:
                 # [VIBE FASE 2] Sizing dinámico por calidad del setup

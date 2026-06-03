@@ -54,34 +54,113 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-# Optimization for MT5 known symbols with higher Profit Factor and daily consistency.
+# Production SYMBOL_CONFIG — tuned 2026-06-02 via disk-loaded backtest + post-retrain
+# calibration refit + per-symbol param sweep on 60d OOS.
+# Baseline snapshot (pre-2026-06-02): logs/symbol_config_baseline.json.
 SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     "BTC/USDT": {
-        "prob_threshold": 0.60,     # Recent-regime: disk model p99=0.63, thresh=0.60 fires ~4%.
-        "fixed_sl_pct": 0.025,      # 2.5% SL
-        "fixed_tp_pct": 0.030,      # 3.0% TP — recent path sim WR~64%, net EV=+0.18%/trade.
+        # Disk sweep 2026-06-02 (60d, calibrated): pt=0.70 tp=0.040 sl=0.020
+        # → 8 trades, WR 75%, PnL +9.74%, PF 17.45. Higher threshold trades less
+        # but rejects the weak-signal losers that dragged old pt=0.60 baseline.
+        "prob_threshold": 0.70,
+        "fixed_sl_pct": 0.020,
+        "fixed_tp_pct": 0.040,
         "use_sma_filter": True,
         "risk": 0.015,
         "timeframe": "30m",
-        "horizon": 36,              # 18h max hold (36 bars * 30m).
+        "horizon": 36,
+        "skip_regime": True,
     },
     "ETH/USDT": {
-        "prob_threshold": 0.22,     # Recent-regime (model recent p99=0.30). Fires ~2-3 trades/day.
-        "fixed_sl_pct": 0.025,      # 2.5% SL
-        "fixed_tp_pct": 0.060,      # 6.0% TP — wider TP catches breakout moves.
+        # Disk sweep 2026-06-02 (60d, calibrated): pt=0.50 tp=0.030 sl=0.020
+        # → 17 trades, WR 88.2%, PnL +21.33%, PF 9.04. Old pt=0.60 baseline was
+        # break-even; calibration moved the prob distribution, threshold follows.
+        "prob_threshold": 0.50,
+        "fixed_sl_pct": 0.020,
+        "fixed_tp_pct": 0.030,
         "use_sma_filter": True,
         "risk": 0.015,
         "timeframe": "15m",
-        "horizon": 20,              # 5h max hold.
+        "horizon": 20,
+        "skip_regime": True,
     },
     "XRP/USDT": {
-        "prob_threshold": 0.20,     # Recent-regime (model recent p99=0.30).
-        "fixed_sl_pct": 0.025,      # 2.5% SL
-        "fixed_tp_pct": 0.040,      # 4.0% TP. Recent path sim: WR>70%, net EV positive.
+        # DEMOTED 2026-06-02 — disk sweep across pt∈[0.50,0.80] showed every
+        # config either lost money or fired <5 trades. Model is unprofitable
+        # in current regime. Keeping entry in code but setting pt=0.95 +
+        # risk=0.005 so it essentially never trades. REMOVE from .env WATCHLIST
+        # until model is retrained from a fundamentally different feature set.
+        "prob_threshold": 0.95,
+        "fixed_sl_pct": 0.025,
+        "fixed_tp_pct": 0.040,
+        "use_sma_filter": True,
+        "risk": 0.005,
+        "timeframe": "15m",
+        "horizon": 16,
+        "skip_regime": True,
+    },
+    "SOL/USDT": {
+        # Disk sweep 2026-06-02 (60d, calibrated): pt=0.55 tp=0.035 sl=0.025
+        # → 23 trades, WR 78.3%, PnL +20.47%, PF 4.54.
+        "prob_threshold": 0.55,
+        "fixed_sl_pct": 0.025,
+        "fixed_tp_pct": 0.035,
         "use_sma_filter": True,
         "risk": 0.015,
+        "timeframe": "30m",
+        "horizon": 24,
+        "skip_regime": True,
+    },
+    "DOGE/USDT": {
+        # Disk sweep 2026-06-02 (60d, calibrated): pt=0.55 tp=0.045 sl=0.025
+        # → 32 trades, WR 90.6%, PnL +22.22%, PF 44.21.
+        "prob_threshold": 0.55,
+        "fixed_sl_pct": 0.025,
+        "fixed_tp_pct": 0.045,
+        "use_sma_filter": True,
+        "risk": 0.010,
         "timeframe": "15m",
-        "horizon": 16,              # 4h max hold.
+        "horizon": 16,
+        "skip_regime": True,
+    },
+    # ── Phase D survivors (2026-06-02): inline 70/30 OOS validated ──
+    "NEAR/USDT": {
+        # Symbol scan 2026-06-02 (54d OOS): pt=0.55 tp=0.050 sl=0.030
+        # → 52 trades, WR 59.6%, PnL +10.52%, PF 2.02. Add to .env WATCHLIST.
+        "prob_threshold": 0.55,
+        "fixed_sl_pct": 0.030,
+        "fixed_tp_pct": 0.050,
+        "use_sma_filter": True,
+        "risk": 0.010,
+        "timeframe": "15m",
+        "horizon": 20,
+        "skip_regime": True,
+    },
+    "ATOM/USDT": {
+        # Symbol scan 2026-06-02 (54d OOS): pt=0.45 tp=0.035 sl=0.025
+        # → 60 trades, WR 63.3%, PnL +5.13%, PF 1.66. Add to .env WATCHLIST.
+        "prob_threshold": 0.45,
+        "fixed_sl_pct": 0.025,
+        "fixed_tp_pct": 0.035,
+        "use_sma_filter": True,
+        "risk": 0.010,
+        "timeframe": "15m",
+        "horizon": 20,
+        "skip_regime": True,
+    },
+    "LINK/USDT": {
+        # Symbol scan 2026-06-02 (54d OOS): pt=0.55 tp=0.050 sl=0.030
+        # → 31 trades, WR 48.4%, PnL +1.00%, PF 1.55. MARGINAL — included for
+        # diversification at low risk. Skip from .env WATCHLIST until Phase F
+        # confirms profitability on the most recent 30d.
+        "prob_threshold": 0.55,
+        "fixed_sl_pct": 0.030,
+        "fixed_tp_pct": 0.050,
+        "use_sma_filter": True,
+        "risk": 0.008,
+        "timeframe": "15m",
+        "horizon": 20,
+        "skip_regime": True,
     },
 }
 

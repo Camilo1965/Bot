@@ -47,11 +47,27 @@ TP_ATR_MULT = 2.5
 ACTIVATION_PCT = 0.05       # activate trailing only ABOVE TP=4-6%
 TRAILING_DISTANCE = 0.02
 DAILY_LOSS_LIMIT = 0.03
+# Module-level overrides for param sweep (monkey-patched in param_sweep_v2.py)
+REGIME_BUY_THRESHOLD = 0.65  # entry only if regime_prob >= this
+MAX_ATR_PCT = None           # if set, skip entry when atr_pct > this (vol filter)
+USE_KELLY = False            # if True, scale risk by fractional Kelly (1/4 cap)
+KELLY_FRACTION = 0.25
+USE_HTF_FILTER = True        # match production htf_sma200_1h_allows_long (proxy on entry TF)
+HTF_SLOW_PERIOD = 100        # SMA period on entry timeframe (proxy for trend)
+COOLDOWN_AFTER_LOSSES = 0    # 0 disabled; else pause N bars after 2 consec losses
 
 SYMBOL_CONFIG = {
-    "BTC/USDT": {"prob_threshold": 0.60, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.030, "risk": 0.015, "timeframe": "30m", "horizon": 36, "regime_adx": 25.0, "max_spw": None},
-    "ETH/USDT": {"prob_threshold": 0.22, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.060, "risk": 0.015, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0},
-    "XRP/USDT": {"prob_threshold": 0.30, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.015, "timeframe": "15m", "horizon": 16, "regime_adx": 20.0, "max_spw": 8.0, "skip_regime": True},
+    # Mirrors strategy/ml_predictor.py:SYMBOL_CONFIG (canonical). Tuned 2026-06-02
+    # via disk-loaded backtest + post-retrain calibration refit + per-symbol param sweep.
+    "BTC/USDT": {"prob_threshold": 0.70, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.040, "risk": 0.015, "timeframe": "30m", "horizon": 36, "regime_adx": 25.0, "max_spw": None, "skip_regime": True},
+    "ETH/USDT": {"prob_threshold": 0.50, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.030, "risk": 0.015, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
+    "XRP/USDT": {"prob_threshold": 0.95, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.005, "timeframe": "15m", "horizon": 16, "regime_adx": 20.0, "max_spw": 8.0, "skip_regime": True},  # DEMOTED
+    "SOL/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.015, "timeframe": "30m", "horizon": 24, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
+    "DOGE/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.045, "risk": 0.010, "timeframe": "15m", "horizon": 16, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
+    # Phase D survivors (2026-06-02, inline 70/30 OOS)
+    "NEAR/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
+    "ATOM/USDT": {"prob_threshold": 0.45, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
+    "LINK/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.008, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
 }
 
 
@@ -157,28 +173,49 @@ def simulate_bot(
     symbol: str,
     use_regime: bool = True,
 ) -> BacktestState:
-    """Simula el bot completo en datos de test."""
+    """Simula el bot completo en datos de test (inline-trained probs)."""
+    cfg = SYMBOL_CONFIG[symbol]
+    tf_min = int(cfg["timeframe"][:-1])
+    feat = add_quant_features(df_test.copy(), base_timeframe_min=tf_min)
+    feat = feat.dropna(subset=QUANT_FEATURE_COLS).reset_index(drop=True)
+    if len(feat) < 10:
+        return BacktestState()
+
+    X = feat[QUANT_FEATURE_COLS].to_numpy(dtype=np.float32)
+    regime_probs = regime_model.predict_proba(X)[:, 1] if hasattr(regime_model, "predict_proba") else np.full(len(X), 0.5)
+    direction_probs = direction_model.predict_proba(X)[:, 1] if hasattr(direction_model, "predict_proba") else np.full(len(X), 0.5)
+    return _run_simulation_loop(feat, regime_probs, direction_probs, symbol, use_regime=use_regime)
+
+
+def _run_simulation_loop(
+    feat: pd.DataFrame,
+    regime_probs: np.ndarray,
+    direction_probs: np.ndarray,
+    symbol: str,
+    use_regime: bool = True,
+) -> BacktestState:
+    """Trading-loop core. Accepts pre-computed feature df + prob arrays so disk-loaded
+    backtests (calibrated probs from {SYMBOL}_v2.json + {SYMBOL}_calibration.json) and
+    inline-trained backtests share the exact same execution logic."""
     state = BacktestState()
     cfg = SYMBOL_CONFIG[symbol]
     sl_frac = cfg["fixed_sl_pct"]
     prob_threshold = cfg["prob_threshold"]
     risk_pct = cfg["risk"]
-    ttl_hours = TTL_HOURS
     tf_min = int(cfg["timeframe"][:-1])
+    horizon_bars = int(cfg.get("horizon", 20))
+    ttl_hours = max(TTL_HOURS, horizon_bars * tf_min / 60.0)
 
-    feat = add_quant_features(df_test.copy(), base_timeframe_min=tf_min)
-    feat = feat.dropna(subset=QUANT_FEATURE_COLS).reset_index(drop=True)
-    if len(feat) < 10:
+    if len(feat) < 10 or len(direction_probs) != len(feat) or len(regime_probs) != len(feat):
         return state
-
-    X = feat[QUANT_FEATURE_COLS].to_numpy(dtype=np.float32)
-    regime_probs = regime_model.predict_proba(X)[:, 1] if hasattr(regime_model, "predict_proba") else np.full(len(X), 0.5)
-    direction_probs = direction_model.predict_proba(X)[:, 1] if hasattr(direction_model, "predict_proba") else np.full(len(X), 0.5)
 
     closes = feat["close"].to_numpy()
     highs = feat["high"].to_numpy()
     lows = feat["low"].to_numpy()
     atrs = feat["atr"].fillna(0.0).to_numpy()
+    htf_sma_slow = feat["close"].rolling(HTF_SLOW_PERIOD, min_periods=HTF_SLOW_PERIOD).mean().to_numpy()
+    cooldown_until = -1  # bar index; -1 = no cooldown
+    last_losses_streak = 0
     timestamps = feat["timestamp"] if "timestamp" in feat.columns else pd.RangeIndex(len(feat))
 
     for i in range(len(feat)):
@@ -234,9 +271,14 @@ def simulate_bot(
             if pnl_usd > 0:
                 state.n_wins += 1
                 state.gross_wins += pnl_usd
+                last_losses_streak = 0
             else:
                 state.n_losses += 1
                 state.gross_losses += abs(pnl_usd)
+                last_losses_streak += 1
+                if COOLDOWN_AFTER_LOSSES > 0 and last_losses_streak >= 2:
+                    cooldown_until = i + COOLDOWN_AFTER_LOSSES
+                    last_losses_streak = 0
 
             pos.close_reason = reason
             pos.exit_price = exit_p
@@ -277,19 +319,45 @@ def simulate_bot(
         if symbol in state.open_positions:
             continue
 
+        # ── Cooldown after losses streak ──
+        if cooldown_until > 0 and i < cooldown_until:
+            continue
+
+        # ── HTF trend filter (price > SMA slow on entry TF as trend proxy) ──
+        if USE_HTF_FILTER and not np.isnan(htf_sma_slow[i]):
+            if current_price < float(htf_sma_slow[i]):
+                continue
+
         # ── Regime filter ──
         regime_prob = float(regime_probs[i])
-        is_trending = regime_prob >= 0.65
+        is_trending = regime_prob >= REGIME_BUY_THRESHOLD
         if use_regime and not is_trending:
             continue
+
+        # ── Volatility filter (skip if ATR_pct exceeds threshold) ──
+        if MAX_ATR_PCT is not None and current_price > 0:
+            atr_pct_cur = current_atr / current_price
+            if atr_pct_cur > MAX_ATR_PCT:
+                continue
 
         # ── Direction filter ──
         direction_prob = float(direction_probs[i])
         if direction_prob < prob_threshold:
             continue
 
-        # ── Risk manager sizing ──
-        risk_amount = state.balance * risk_pct
+        # ── Risk manager sizing (optional fractional Kelly) ──
+        effective_risk = risk_pct
+        if USE_KELLY:
+            # Need TP fraction for Kelly. Approx with cfg fixed_tp_pct.
+            tp_frac_est = cfg.get("fixed_tp_pct", 0.03)
+            b = max(0.1, tp_frac_est / max(0.001, sl_frac))
+            p = max(0.0, min(1.0, direction_prob))
+            kelly_f = max(0.0, (p * b - (1.0 - p)) / b)
+            f_safe = min(kelly_f * KELLY_FRACTION, risk_pct)
+            if f_safe < 0.001:
+                continue
+            effective_risk = f_safe
+        risk_amount = state.balance * effective_risk
         position_size = risk_amount / max(0.001, sl_frac)
         max_allocation = (state.balance / MAX_POSITIONS) * LEVERAGE
         position_size = min(position_size, max_allocation)

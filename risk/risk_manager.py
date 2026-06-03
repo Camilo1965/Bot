@@ -148,6 +148,13 @@ _ACTIVATION_PCT_MIN: float = 0.005
 _HALFRISK_MULTIPLIER: float = _float_env("HALFRISK_MULTIPLIER", 0.5)
 _ATR_SL_MULT: float = _float_env("ATR_SL_MULT", 2.0)
 
+# ── Kelly fractional sizing ───────────────────────────────────────────────────
+# When `calculate_position_size` receives `tp_distance_pct`, the per-trade
+# risk fraction `f_safe = min(f_kelly * KELLY_FRACTION, base_r)` replaces the
+# legacy fixed-fractional rule. Capped by `base_r` so existing daily-loss and
+# portfolio-exposure caps remain authoritative.
+KELLY_FRACTION: float = _float_env("KELLY_FRACTION", 0.25)
+
 
 @dataclass
 class DynamicThresholds:
@@ -227,12 +234,18 @@ class RiskManager:
         *,
         risk_pct: float | None = None,
         sl_distance_pct: float = 0.02,
+        tp_distance_pct: float | None = None,
         vibe_quality: float = 1.0,
     ) -> float:
-        """Return the position size in quote currency for the next trade.
+        """Return the position size (notional in quote currency) for the next trade.
 
-        Includes dynamic risk reduction based on drawdown, portfolio exposure,
-        and VIBE quality multiplier (Phase-2).
+        When `tp_distance_pct` is provided, applies fractional-Kelly sizing
+        bounded by `base_r`: prevents over-allocation when ML probability is
+        marginal. Falls back to legacy fixed-fractional rule otherwise (kept
+        for backward compatibility with `mt5_executor.try_open_market_buy`).
+
+        Margin requirement (for futures) is `position_size / LEVERAGE`; use
+        `margin_for()` to retrieve it.
         """
         base_r = RISK_PER_TRADE if risk_pct is None else float(risk_pct)
 
@@ -265,19 +278,39 @@ class RiskManager:
                 return 0.0
             logger.info("Risk scaled to %.2f%% to fit portfolio budget.", base_r * 100)
 
-        # 3. Size by SL distance: risk_amount = balance * base_r
-        # position_size = risk_amount / sl_distance_pct
-        position_size = (self.balance * base_r) / max(0.001, sl_distance_pct)
+        # 3. Fractional-Kelly when TP distance is known (preferred path).
+        f_safe = base_r
+        if tp_distance_pct is not None and tp_distance_pct > 0.0 and sl_distance_pct > 0.0:
+            p = max(0.0, min(1.0, float(win_probability)))
+            b = max(0.1, float(tp_distance_pct) / float(sl_distance_pct))
+            kelly_f = max(0.0, (p * b - (1.0 - p)) / b)
+            f_safe = min(kelly_f * KELLY_FRACTION, base_r)
+            logger.debug(
+                "kelly  p=%.3f b=%.2f f_kelly=%.4f f_safe=%.4f base_r=%.4f",
+                p, b, kelly_f, f_safe, base_r,
+            )
+            if f_safe < 0.001:
+                # Kelly says don't bet; respect it.
+                return 0.0
 
-        # Cap allocation to an equal share of the current balance
+        # 4. Notional = risk_$ / sl_pct
+        position_size = (self.balance * f_safe) / max(0.001, sl_distance_pct)
+
+        # 5. Cap allocation to an equal share of the current balance (margin headroom)
         max_allocation = (self.balance / self.max_positions) * LEVERAGE
         position_size = min(position_size, max_allocation)
 
         logger.debug(
             "position_size=%.2f  balance=%.2f  risk_per_trade=%.4f  max_allocation=%.2f  vibe_q=%.2f",
-            position_size, self.balance, base_r, max_allocation, effective_quality,
+            position_size, self.balance, f_safe, max_allocation, effective_quality,
         )
         return position_size
+
+    def margin_for(self, notional: float) -> float:
+        """Margin required to hold `notional` quote units at LEVERAGE."""
+        if notional <= 0.0:
+            return 0.0
+        return float(notional) / float(LEVERAGE)
 
     def register_open(self, risk_usd: float) -> None:
         """Increment open count and track total risk."""
@@ -377,6 +410,10 @@ class RiskManager:
     def deduct(self, amount: float) -> None:
         """Subtract *amount* from the simulated balance (trade entry)."""
         self.balance -= amount
+
+    # Alias kept for call sites that wrote `debit` (paper SHORT path). Same
+    # semantics as `deduct` — removing it would crash try_open_short_trade.
+    debit = deduct
 
     def credit(self, amount: float) -> None:
         """Add *amount* to the simulated balance (trade close + PnL)."""
