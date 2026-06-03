@@ -29,6 +29,8 @@ from fastapi.responses import JSONResponse
 load_dotenv()
 
 from dashboard.api.routers import state, positions, signals, performance, risk, models, alerts
+from dashboard.api.routers import backtest as backtest_router
+from dashboard.api.routers import symbols as symbols_router
 from dashboard.api.ws.stream import handle_ws, start_background_tasks
 
 _API_KEY = os.environ.get("DASHBOARD_API_KEY", "dev-secret")
@@ -86,3 +88,5 @@ app.include_router(performance.router)
 app.include_router(risk.router)
 app.include_router(models.router)
 app.include_router(alerts.router)
+app.include_router(backtest_router.router)
+app.include_router(symbols_router.router)

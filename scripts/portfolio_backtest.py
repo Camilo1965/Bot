@@ -53,9 +53,11 @@ logger = logging.getLogger("portfolio_backtest")
 MODELS_DIR = _REPO / "models"
 
 MAX_PORTFOLIO_RISK_PCT = 0.10  # max fraction of balance in open risk across all symbols
+MAX_SYMBOL_NOTIONAL_FRACTION = 0.35  # single symbol notional cap: max 35% of balance
+MAX_SYMBOL_PNL_FRACTION = 0.35  # once one symbol > 35% of total realized PnL, halve its risk
+KELLY_MAX_FRACTION = 0.25       # half-Kelly cap: never exceed 25% of balance on a single bet
 
-# XRP excluded: demoted (pt=0.95, essentially never fires)
-ACTIVE_SYMBOLS = [s for s in SYMBOL_CONFIG if s != "XRP/USDT"]
+ACTIVE_SYMBOLS = list(SYMBOL_CONFIG.keys())
 
 
 @dataclass
@@ -155,6 +157,7 @@ def run_portfolio(days: int = 30, initial_balance: float = INITIAL_BALANCE) -> d
     signals_executed = 0
     signals_dropped_cap = 0
     cap_util_sum = 0.0
+    sym_realized_pnl: dict[str, float] = {s: 0.0 for s in ACTIVE_SYMBOLS}
 
     for bar_ts in grid:
         bar_date = bar_ts.date()
@@ -204,6 +207,7 @@ def run_portfolio(days: int = 30, initial_balance: float = INITIAL_BALANCE) -> d
             pnl_usd = pnl_pct * pos.position_size - pos.position_size * 0.0004 * 2
             balance += pnl_usd
             daily_loss += min(0.0, pnl_usd)
+            sym_realized_pnl[sym] = sym_realized_pnl.get(sym, 0.0) + pnl_usd
             pos.close_reason = reason
             pos.exit_price = exit_p
             pos.exit_time = bar_ts
@@ -264,6 +268,11 @@ def run_portfolio(days: int = 30, initial_balance: float = INITIAL_BALANCE) -> d
                 continue
             if MAX_ATR_PCT is not None and cur_p > 0 and cur_atr / cur_p > MAX_ATR_PCT:
                 continue
+            # E3: ADX-based regime gate (only when skip_regime=False in config)
+            if not cfg.get("skip_regime", True):
+                adx_val = float(row.get("adx", 0.0))
+                if adx_val < cfg.get("regime_adx", 25.0):
+                    continue
 
             signals_total += 1
             candidates.append((cal_prob - pt, sym, cal_prob, row, cfg))
@@ -277,7 +286,7 @@ def run_portfolio(days: int = 30, initial_balance: float = INITIAL_BALANCE) -> d
                 signals_dropped_cap += 1
                 continue
 
-            sl_frac = cfg["fixed_sl_pct"]
+            base_sl = cfg["fixed_sl_pct"]
             risk_pct = cfg["risk"]
             ec = cfg.get("exec_costs", {})
             spread_frac = ec.get("spread_bps", 3.0) / 10000.0
@@ -285,13 +294,40 @@ def run_portfolio(days: int = 30, initial_balance: float = INITIAL_BALANCE) -> d
             cur_p = float(row["close"])
             cur_atr = float(row.get("atr", 0.0))
             atr_pct = cur_atr / cur_p if cur_p > 0 else 0.0
+            # E4: ATR-adaptive SL — tighter in quiet markets, wider in volatile
+            # Clamp: [fixed_sl * 0.5, fixed_sl * 2.0] so we never go absurd
+            if cur_atr > 0 and cur_p > 0:
+                atr_sl = 2.0 * atr_pct
+                sl_frac = float(np.clip(atr_sl, base_sl * 0.5, base_sl * 2.0))
+            else:
+                sl_frac = base_sl
+
+            # B1: if one symbol dominates realized PnL, halve its risk
+            total_realized = sum(sym_realized_pnl.values())
+            sym_pnl_share = sym_realized_pnl.get(sym, 0.0) / total_realized if total_realized > 0 else 0.0
+            if sym_pnl_share > MAX_SYMBOL_PNL_FRACTION:
+                risk_pct = risk_pct * 0.5
 
             new_risk = balance * risk_pct
             if open_risk + new_risk > balance * MAX_PORTFOLIO_RISK_PCT:
                 signals_dropped_cap += 1
                 continue
 
-            pos_size = (balance * risk_pct) / max(0.001, sl_frac)
+            # B2: Kelly fraction sizing
+            # f* = (p*b - q) / b  where b = tp/sl R:R ratio
+            fixed_tp = cfg.get("fixed_tp_pct", sl_frac * 2.0)
+            b = float(fixed_tp) / max(sl_frac, 0.001)  # R:R ratio
+            p = float(cal_prob)
+            q = 1.0 - p
+            kelly_f = (p * b - q) / b if b > 0 else 0.0
+            half_kelly = max(0.0, kelly_f * 0.5)  # half-Kelly reduces over-betting
+            kelly_risk = min(half_kelly, KELLY_MAX_FRACTION)
+            # Use Kelly if it's more conservative than config risk; else use config
+            effective_risk = min(risk_pct, kelly_risk) if kelly_risk > 0 else risk_pct
+
+            pos_size = (balance * effective_risk) / max(0.001, sl_frac)
+            # B1: hard cap — single symbol notional ≤ 35% of balance
+            pos_size = min(pos_size, balance * MAX_SYMBOL_NOTIONAL_FRACTION)
             pos_size = min(pos_size, (balance / MAX_POSITIONS) * LEVERAGE)
             if pos_size <= 0 or pos_size > balance * LEVERAGE:
                 continue
@@ -300,7 +336,9 @@ def run_portfolio(days: int = 30, initial_balance: float = INITIAL_BALANCE) -> d
             sl_price = entry_fill * (1.0 - sl_frac)
             fixed_tp = cfg.get("fixed_tp_pct")
             if fixed_tp is not None and cur_atr > 0:
-                tp_frac = max(float(fixed_tp), (cur_atr * TP_ATR_MULT) / entry_fill)
+                # E4: TP scales proportionally with adaptive SL to keep R:R constant
+                rr_ratio = float(fixed_tp) / max(base_sl, 0.001)
+                tp_frac = max(sl_frac * rr_ratio, (cur_atr * TP_ATR_MULT) / entry_fill)
                 tp_price = entry_fill * (1.0 + tp_frac)
             elif fixed_tp is not None:
                 tp_price = entry_fill * (1.0 + float(fixed_tp))
@@ -394,6 +432,7 @@ def run_portfolio(days: int = 30, initial_balance: float = INITIAL_BALANCE) -> d
                 "trades": v["trades"],
                 "win_rate": round(v["wins"] / v["trades"], 3) if v["trades"] > 0 else 0.0,
                 "pnl_usd": round(v["pnl_usd"], 2),
+                "pnl_share_pct": round(v["pnl_usd"] / (balance - initial_balance) * 100, 1) if (balance - initial_balance) != 0 else 0.0,
                 "close_reasons": v["close_reasons"],
             }
             for s, v in sorted(per_sym.items(), key=lambda x: x[1]["pnl_usd"], reverse=True)
@@ -434,12 +473,12 @@ def main() -> int:
                 result["signals_total"], result["signals_executed"], result["signals_dropped_by_cap"])
     logger.info("Cap utilization: %.1f%% avg", result["capital_utilization_avg_pct"])
     logger.info("")
-    logger.info("%-12s | %-6s | %-6s | %-10s | %s", "Symbol", "Trades", "WR%", "PnL USD", "Exits")
-    logger.info("-" * 60)
+    logger.info("%-12s | %-6s | %-6s | %-10s | %-8s | %s", "Symbol", "Trades", "WR%", "PnL USD", "Share%", "Exits")
+    logger.info("-" * 70)
     for s, v in result["per_symbol"].items():
         reasons = ", ".join(f"{k}:{n}" for k, n in v["close_reasons"].items())
-        logger.info("%-12s | %-6d | %-6.1f | %+.2f      | %s",
-                    s, v["trades"], v["win_rate"] * 100, v["pnl_usd"], reasons)
+        logger.info("%-12s | %-6d | %-6.1f | %+.2f      | %+.1f%%    | %s",
+                    s, v["trades"], v["win_rate"] * 100, v["pnl_usd"], v["pnl_share_pct"], reasons)
 
     out = _REPO / "logs" / "portfolio_backtest_30d.json"
     out.parent.mkdir(exist_ok=True)

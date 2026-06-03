@@ -59,17 +59,16 @@ def _float_env(name: str, default: float) -> float:
 # Baseline snapshot (pre-2026-06-02): logs/symbol_config_baseline.json.
 SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     "BTC/USDT": {
-        # Disk sweep 2026-06-02 (60d, calibrated): pt=0.70 tp=0.040 sl=0.020
-        # → 8 trades, WR 75%, PnL +9.74%, PF 17.45. Higher threshold trades less
-        # but rejects the weak-signal losers that dragged old pt=0.60 baseline.
-        "prob_threshold": 0.70,
+        # Threshold sweep 2026-06-03 (honest calibration, no leak): pt=0.85
+        # → 13 trades, WR 61.5%, Sharpe +0.40, PnL +4.08%.
+        "prob_threshold": 0.85,
         "fixed_sl_pct": 0.020,
         "fixed_tp_pct": 0.040,
         "use_sma_filter": True,
         "risk": 0.015,
         "timeframe": "30m",
         "horizon": 36,
-        "skip_regime": True,
+        "skip_regime": False,  # E3: ADX regime gate active
         "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05},
     },
     "ETH/USDT": {
@@ -87,12 +86,8 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05},
     },
     "XRP/USDT": {
-        # DEMOTED 2026-06-02 — disk sweep across pt∈[0.50,0.80] showed every
-        # config either lost money or fired <5 trades. Model is unprofitable
-        # in current regime. Keeping entry in code but setting pt=0.95 +
-        # risk=0.005 so it essentially never trades. REMOVE from .env WATCHLIST
-        # until model is retrained from a fundamentally different feature set.
-        "prob_threshold": 0.95,
+        # Threshold sweep 2026-06-03: pt=0.65 → 26 trades, Sharpe +0.40, PnL +1.19%.
+        "prob_threshold": 0.65,
         "fixed_sl_pct": 0.025,
         "fixed_tp_pct": 0.040,
         "use_sma_filter": True,
@@ -103,9 +98,8 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05},
     },
     "SOL/USDT": {
-        # Disk sweep 2026-06-02 (60d, calibrated): pt=0.55 tp=0.035 sl=0.025
-        # → 23 trades, WR 78.3%, PnL +20.47%, PF 4.54.
-        "prob_threshold": 0.55,
+        # Threshold sweep 2026-06-03: pt=0.70 → 65 trades, Sharpe +0.04, PnL -2.86%.
+        "prob_threshold": 0.70,
         "fixed_sl_pct": 0.025,
         "fixed_tp_pct": 0.035,
         "use_sma_filter": True,
@@ -130,9 +124,8 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     },
     # ── Phase D survivors (2026-06-02): inline 70/30 OOS validated ──
     "NEAR/USDT": {
-        # Symbol scan 2026-06-02 (54d OOS): pt=0.55 tp=0.050 sl=0.030
-        # → 52 trades, WR 59.6%, PnL +10.52%, PF 2.02. Add to .env WATCHLIST.
-        "prob_threshold": 0.55,
+        # Threshold sweep 2026-06-03: pt=0.65 → 54 trades, Sharpe +0.03, PnL -1.68%.
+        "prob_threshold": 0.65,
         "fixed_sl_pct": 0.030,
         "fixed_tp_pct": 0.050,
         "use_sma_filter": True,
@@ -171,10 +164,8 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10},
     },
     "JTO/USDT": {
-        # Symbol scan 2026-06-03 (54d OOS): pt=default tp=0.040 sl=0.025
-        # → 66 trades, WR 60.6%, PnL +15.84%, PF 2.17, score 32.84. Top new survivor.
-        # Needs retrain before activation. Add to WATCHLIST after Phase F validation.
-        "prob_threshold": 0.50,
+        # Threshold sweep 2026-06-03: pt=0.70 → 54 trades, Sharpe +0.29, PnL +5.40%.
+        "prob_threshold": 0.70,
         "fixed_sl_pct": 0.025,
         "fixed_tp_pct": 0.040,
         "use_sma_filter": True,

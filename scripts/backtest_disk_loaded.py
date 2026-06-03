@@ -175,18 +175,29 @@ def _print_table(results: list[dict[str, Any]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default=None, help="Single symbol, e.g. BTC/USDT")
+    parser.add_argument("--symbols", type=str, default=None, help="Comma-separated symbols, e.g. BTC/USDT,ETH/USDT")
     parser.add_argument("--all", action="store_true", help="Run for every symbol in SYMBOL_CONFIG")
     parser.add_argument("--days", type=int, default=60, help="Recent days window for the test")
     parser.add_argument("--report", action="store_true", help="Save Phase F final_verification_report.json")
+    parser.add_argument("--prob-threshold", type=float, default=None,
+                        help="Override prob_threshold for all symbols in this run")
     args = parser.parse_args()
 
-    if args.symbol is None and not args.all and not args.report:
-        parser.error("Pass --symbol SYMBOL/USDT or --all or --report")
+    if args.symbol is None and args.symbols is None and not args.all and not args.report:
+        parser.error("Pass --symbol SYMBOL/USDT or --symbols SYM1,SYM2 or --all or --report")
 
-    if args.symbol:
+    if args.symbols:
+        symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    elif args.symbol:
         symbols = [args.symbol]
     else:
         symbols = list(SYMBOL_CONFIG.keys())
+
+    if args.prob_threshold is not None:
+        for sym in symbols:
+            if sym in SYMBOL_CONFIG:
+                SYMBOL_CONFIG[sym] = {**SYMBOL_CONFIG[sym], "prob_threshold": args.prob_threshold}
+        logger.info("prob_threshold override: %.3f for %s", args.prob_threshold, symbols)
 
     results: list[dict[str, Any]] = []
     for sym in symbols:

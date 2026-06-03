@@ -59,17 +59,17 @@ COOLDOWN_AFTER_LOSSES = 0    # 0 disabled; else pause N bars after 2 consec loss
 SYMBOL_CONFIG = {
     # Mirrors strategy/ml_predictor.py:SYMBOL_CONFIG (canonical). Tuned 2026-06-02
     # via disk-loaded backtest + post-retrain calibration refit + per-symbol param sweep.
-    "BTC/USDT":  {"prob_threshold": 0.70, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.040, "risk": 0.015, "timeframe": "30m", "horizon": 36, "regime_adx": 25.0, "max_spw": None, "skip_regime": True, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},
+    "BTC/USDT":  {"prob_threshold": 0.85, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.040, "risk": 0.015, "timeframe": "30m", "horizon": 36, "regime_adx": 25.0, "max_spw": None, "skip_regime": False, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},
     "ETH/USDT":  {"prob_threshold": 0.50, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.030, "risk": 0.015, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},
-    "XRP/USDT":  {"prob_threshold": 0.95, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.005, "timeframe": "15m", "horizon": 16, "regime_adx": 20.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},  # DEMOTED
-    "SOL/USDT":  {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.015, "timeframe": "30m", "horizon": 24, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
+    "XRP/USDT":  {"prob_threshold": 0.65, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.005, "timeframe": "15m", "horizon": 16, "regime_adx": 20.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},  # DEMOTED
+    "SOL/USDT":  {"prob_threshold": 0.70, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.015, "timeframe": "30m", "horizon": 24, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
     "DOGE/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.045, "risk": 0.010, "timeframe": "15m", "horizon": 16, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
     # Phase D survivors (2026-06-02, inline 70/30 OOS)
-    "NEAR/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
+    "NEAR/USDT": {"prob_threshold": 0.65, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
     "ATOM/USDT": {"prob_threshold": 0.50, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
     "LINK/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.008, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
     # Phase D+ survivor (scan 2026-06-03): WR 60.6%, PnL +15.84%, score 32.84. Needs retrain before live.
-    "JTO/USDT":  {"prob_threshold": 0.50, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
+    "JTO/USDT":  {"prob_threshold": 0.70, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
 }
 
 
@@ -524,7 +524,7 @@ def run_backtest(symbol: str, limit: int = 30_000) -> dict[str, Any]:
 
 def main() -> int:
     results = []
-    for symbol in ["BTC/USDT", "ETH/USDT", "XRP/USDT"]:
+    for symbol in list(SYMBOL_CONFIG.keys()):
         try:
             res = run_backtest(symbol, limit=30_000)
             results.append(res)

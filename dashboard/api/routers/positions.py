@@ -1,6 +1,7 @@
 """
-GET /api/positions/open       — open positions from Redis
-GET /api/positions/history    — closed trades from trade_journal.csv
+GET  /api/positions/open              — open positions from Redis
+GET  /api/positions/history           — closed trades from trade_journal.csv
+POST /api/positions/{sym}/close       — write close signal to Redis for the bot to pick up
 """
 
 from __future__ import annotations
@@ -33,6 +34,19 @@ async def get_open_positions() -> list[dict]:
         return positions
     except Exception:
         return []
+
+
+@router.post("/api/positions/{sym}/close")
+async def manual_close_position(sym: str) -> dict:
+    """Write a manual-close flag to Redis so the bot closes the position on next tick."""
+    symbol = sym.replace("_", "/").upper()
+    try:
+        redis = await get_redis()
+        # Bot polls clawdbot:close_signals:{symbol} and closes on next loop iteration
+        await redis.set(f"clawdbot:close_signal:{symbol}", "1", ex=300)
+        return {"ok": True, "symbol": symbol, "msg": "Close signal queued (TTL 5min)"}
+    except Exception as exc:
+        return {"ok": False, "symbol": symbol, "error": str(exc)}
 
 
 @router.get("/api/positions/history")

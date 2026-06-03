@@ -38,7 +38,27 @@ function PnlCell({ value }: { value: number }) {
   );
 }
 
-function PositionTable({ rows }: { rows: Position[] }) {
+function CloseButton({ symbol, isOpen, onClosed }: { symbol: string; isOpen: boolean; onClosed: () => void }) {
+  const [state, setState] = useState<"idle" | "sent" | "error">("idle");
+  if (!isOpen) return null;
+  async function handleClose() {
+    setState("sent");
+    const sym = symbol.replace("/", "_");
+    try {
+      const res = await fetch(`${API}/api/positions/${sym}/close`, { method: "POST" });
+      const data = await res.json();
+      if (data.ok) { onClosed(); } else { setState("error"); }
+    } catch { setState("error"); }
+  }
+  return (
+    <button onClick={handleClose} disabled={state === "sent"}
+      className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors ${state === "sent" ? "bg-[#F59E0B]/20 text-[#F59E0B]" : state === "error" ? "bg-[#EF4444]/20 text-[#EF4444]" : "bg-[#374151] text-[#9CA3AF] hover:bg-[#EF4444]/20 hover:text-[#EF4444]"}`}>
+      {state === "sent" ? "Queued" : state === "error" ? "Err" : "Close"}
+    </button>
+  );
+}
+
+function PositionTable({ rows, isOpen = false, onRefresh }: { rows: Position[]; isOpen?: boolean; onRefresh?: () => void }) {
   if (rows.length === 0) {
     return (
       <div className="text-center text-[#9CA3AF] py-10 text-sm">No positions found.</div>
@@ -49,28 +69,17 @@ function PositionTable({ rows }: { rows: Position[] }) {
       <table className="w-full text-sm text-left">
         <thead>
           <tr className="text-[10px] uppercase tracking-widest text-[#9CA3AF] border-b border-[#374151]">
-            {["Symbol", "Side", "Entry", "Current", "SL", "TP", "Size", "PnL"].map((h) => (
-              <th key={h} className="pb-2 pr-4 font-medium">
-                {h}
-              </th>
+            {["Symbol", "Side", "Entry", "Current", "SL", "TP", "Size", "PnL", ...(isOpen ? [""] : [])].map((h, i) => (
+              <th key={i} className="pb-2 pr-4 font-medium">{h}</th>
             ))}
           </tr>
         </thead>
         <tbody>
           {rows.map((p) => (
-            <tr
-              key={p.id}
-              className="border-b border-[#374151]/40 hover:bg-white/5 transition-colors"
-            >
+            <tr key={p.id} className="border-b border-[#374151]/40 hover:bg-white/5 transition-colors">
               <td className="py-2 pr-4 font-mono text-[#F3F4F6]">{p.symbol}</td>
               <td className="py-2 pr-4">
-                <span
-                  className={`px-2 py-0.5 rounded text-[11px] font-semibold ${
-                    p.side === "long"
-                      ? "bg-[#10B981]/20 text-[#10B981]"
-                      : "bg-[#EF4444]/20 text-[#EF4444]"
-                  }`}
-                >
+                <span className={`px-2 py-0.5 rounded text-[11px] font-semibold ${p.side === "long" ? "bg-[#10B981]/20 text-[#10B981]" : "bg-[#EF4444]/20 text-[#EF4444]"}`}>
                   {p.side.toUpperCase()}
                 </span>
               </td>
@@ -81,10 +90,13 @@ function PositionTable({ rows }: { rows: Position[] }) {
               <td className="py-2 pr-4 font-mono text-[#F3F4F6]">{p.size.toFixed(4)}</td>
               <td className="py-2 pr-4">
                 <PnlCell value={p.pnl_usd} />
-                <span className="text-[#9CA3AF] text-[11px] ml-1">
-                  (<PnlCell value={p.pnl_pct} />%)
-                </span>
+                <span className="text-[#9CA3AF] text-[11px] ml-1">(<PnlCell value={p.pnl_pct} />%)</span>
               </td>
+              {isOpen && (
+                <td className="py-2 pr-2">
+                  <CloseButton symbol={p.symbol} isOpen={isOpen} onClosed={() => onRefresh?.()} />
+                </td>
+              )}
             </tr>
           ))}
         </tbody>
@@ -99,6 +111,9 @@ export default function PositionsPage() {
   const [closedRows, setClosedRows] = useState<Position[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  function refresh() { setRefreshKey((k) => k + 1); }
 
   useEffect(() => {
     setLoading(true);
@@ -126,7 +141,7 @@ export default function PositionsPage() {
             });
 
     fetches.catch((e) => setError(String(e))).finally(() => setLoading(false));
-  }, [tab]);
+  }, [tab, refreshKey]);
 
   const rows =
     tab === "open" ? openRows : tab === "closed" ? closedRows : [...openRows, ...closedRows];
@@ -162,7 +177,7 @@ export default function PositionsPage() {
             Failed to load: {error}
           </div>
         )}
-        {!loading && !error && <PositionTable rows={rows} />}
+        {!loading && !error && <PositionTable rows={rows} isOpen={tab === "open"} onRefresh={refresh} />}
       </div>
     </div>
   );

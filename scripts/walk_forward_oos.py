@@ -226,6 +226,11 @@ def run_symbol(
     # test fold k starts at: total_rows - (n_folds - k) * test_size
     fold_metrics: list[dict[str, float]] = []
 
+    # López de Prado embargo: purge label-overlap zone at fold boundaries.
+    # Labels look forward `horizon` bars, so rows within horizon*2 of a
+    # boundary carry information from both sides → must be excluded.
+    embargo_bars = horizon * 2
+
     for k in range(n_folds):
         test_start = total_rows - (n_folds - k) * test_size
         test_end = test_start + test_size
@@ -235,16 +240,26 @@ def run_symbol(
             continue
 
         train_df = df.iloc[:test_start].copy()
-        test_df = df.iloc[test_start:test_end].copy()
+        # Embargo: drop last embargo_bars of train so labels don't bleed into test
+        train_df_purged = train_df.iloc[:-embargo_bars] if len(train_df) > embargo_bars else train_df
+        # Test: skip first embargo_bars to avoid train-label overlap
+        test_df = df.iloc[test_start + embargo_bars:test_end].copy()
 
-        # Val portion: last 20% of train for calibrator
-        val_split = int(len(train_df) * 0.80)
-        pure_train_df = train_df.iloc[:val_split].copy()
-        val_df = train_df.iloc[val_split:].copy()
+        if len(test_df) < 50:
+            logger.warning("  Fold %d: test too small after embargo (%d rows), skipping.", k, len(test_df))
+            continue
+
+        # Val portion: last 20% of purged train for calibrator
+        val_split = int(len(train_df_purged) * 0.80)
+        pure_train_df = train_df_purged.iloc[:val_split].copy()
+        # Embargo between pure_train and val
+        val_df = train_df_purged.iloc[val_split + embargo_bars:].copy()
+        if len(val_df) < 30:
+            val_df = train_df_purged.iloc[val_split:].copy()  # fallback: no embargo on val
 
         logger.info(
-            "  Fold %d/%d: train=%d rows, val=%d rows, test=%d rows",
-            k + 1, n_folds, len(pure_train_df), len(val_df), len(test_df),
+            "  Fold %d/%d: train=%d rows, val=%d rows, test=%d rows (embargo=%d)",
+            k + 1, n_folds, len(pure_train_df), len(val_df), len(test_df), embargo_bars,
         )
 
         model = _train_direction_model(pure_train_df, horizon, max_spw, tf_min)
