@@ -237,6 +237,20 @@ def retrain_and_validate(
         tp_pct = float(cfg.get("fixed_tp_pct", 0.040))
         feat["label"] = triple_barrier_label(feat["close"], feat["high"], feat["low"], horizon=label_horizon, fixed_sl_pct=sl_pct, fixed_tp_pct=tp_pct)
         logger.info("[LABEL] %s  triple_barrier  side=%s  horizon=%d  sl=%.3f  tp=%.3f", symbol, side, label_horizon, sl_pct, tp_pct)
+    elif label_type == "triple_barrier_atr":
+        # López de Prado-style: SL/TP scale with ATR (dynamic barriers).
+        # Wider in volatile periods, tighter in quiet — matches risk regime.
+        sl_mult = float(os.environ.get("RETRAIN_TB_SL_ATR_MULT", "1.5"))
+        tp_mult = float(os.environ.get("RETRAIN_TB_TP_ATR_MULT", "2.5"))
+        if "atr" not in feat.columns:
+            raise RuntimeError("triple_barrier_atr requires 'atr' feature column")
+        feat["label"] = triple_barrier_label(
+            feat["close"], feat["high"], feat["low"],
+            horizon=label_horizon, sl_mult=sl_mult, tp_mult=tp_mult,
+            volatility=feat["atr"],
+        )
+        logger.info("[LABEL] %s  triple_barrier_atr  side=%s  horizon=%d  sl_mult=%.2f  tp_mult=%.2f",
+                    symbol, side, label_horizon, sl_mult, tp_mult)
     elif side == "short":
         feat["label"] = forward_return_label_short(feat["close"], horizon=label_horizon, round_trip_cost=label_thr)
         logger.info("[LABEL] %s  forward_return_short  horizon=%d  threshold=%.4f", symbol, label_horizon, label_thr)
@@ -441,8 +455,8 @@ def main() -> int:
     parser.add_argument("--days", type=int, default=90, help="Lookback days for OHLCV")
     parser.add_argument("--min-auc", type=float, default=0.55, help="Minimum mean AUC to accept model")
     parser.add_argument("--vibe", action="store_true", help="Train with 28 features (24 base + 4 VIBE) and save as _v3.json")
-    parser.add_argument("--label", choices=["forward_return", "triple_barrier"], default="forward_return",
-                        help="Label type: forward_return (default) or triple_barrier (uses SYMBOL_CONFIG sl/tp)")
+    parser.add_argument("--label", choices=["forward_return", "triple_barrier", "triple_barrier_atr"], default="forward_return",
+                        help="forward_return | triple_barrier (fixed sl/tp from config) | triple_barrier_atr (ATR-scaled barriers, López de Prado-style)")
     parser.add_argument("--ensemble", action="store_true",
                         help="Train XGB+LGBM+LR ensemble; saves {SYM}_ensemble_v2.json")
     parser.add_argument("--mtf", action="store_true",
