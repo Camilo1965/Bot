@@ -66,7 +66,7 @@ SYMBOL_CONFIG = {
     "DOGE/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.045, "risk": 0.010, "timeframe": "15m", "horizon": 16, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
     # Phase D survivors (2026-06-02, inline 70/30 OOS)
     "NEAR/USDT": {"prob_threshold": 0.65, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
-    "ATOM/USDT": {"prob_threshold": 0.50, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
+    # ATOM/USDT REMOVED 2026-06-03: threshold sweep 0.30-0.95 all negative (best Sharpe -0.02, PnL -4.22%). Model unprofitable.
     "LINK/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.008, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
     # Phase D+ survivor (scan 2026-06-03): WR 60.6%, PnL +15.84%, score 32.84. Needs retrain before live.
     "JTO/USDT":  {"prob_threshold": 0.70, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},

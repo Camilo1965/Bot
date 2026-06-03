@@ -135,19 +135,9 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "skip_regime": True,
         "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15},
     },
-    "ATOM/USDT": {
-        # Symbol scan 2026-06-02 (54d OOS): pt=0.45 tp=0.035 sl=0.025
-        # WF-OOS 2026-06-03: ci_lower=-14.24% at pt=0.45 (too many trades). Raised to 0.50.
-        "prob_threshold": 0.50,
-        "fixed_sl_pct": 0.025,
-        "fixed_tp_pct": 0.035,
-        "use_sma_filter": True,
-        "risk": 0.010,
-        "timeframe": "15m",
-        "horizon": 20,
-        "skip_regime": True,
-        "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15},
-    },
+    # ATOM/USDT REMOVED 2026-06-03 — threshold sweep 0.30-0.95 all negative.
+    # Best Sharpe -0.02 at pt=0.55 (PnL -4.22%). Model unprofitable across all settings.
+    # If you want to re-enable: retrain with --vibe or --mtf and re-sweep.
     "LINK/USDT": {
         # Symbol scan 2026-06-02 (54d OOS): pt=0.55 tp=0.050 sl=0.030
         # → 31 trades, WR 48.4%, PnL +1.00%, PF 1.55. MARGINAL — included for
