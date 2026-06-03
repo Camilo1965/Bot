@@ -43,6 +43,7 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 from scripts.backtest_full_bot import SYMBOL_CONFIG
+from data.ohlcv_cache import get_cache as _get_ohlcv_cache
 from scripts.deep_strategy_audit import fetch_ohlcv_ccxt
 from strategy.prob_calibration import _calibration_cache, _calibration_path, fit_and_save_calibration
 from strategy.quant_features import (
@@ -50,6 +51,7 @@ from strategy.quant_features import (
     QUANT_FEATURE_COLS,
     add_quant_features,
     forward_return_label,
+    forward_return_label_short,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -81,7 +83,7 @@ def _load_booster(symbol: str) -> XGBClassifier | None:
     return m
 
 
-def refit_one(symbol: str, days: int = 45) -> bool:
+def refit_one(symbol: str, days: int = 45, side: str = "long") -> bool:
     cfg = SYMBOL_CONFIG.get(symbol)
     if cfg is None:
         logger.error("No SYMBOL_CONFIG entry for %s", symbol)
@@ -89,7 +91,14 @@ def refit_one(symbol: str, days: int = 45) -> bool:
     tf = cfg["timeframe"]
     horizon = int(cfg.get("horizon", 20))
 
-    booster = _load_booster(symbol)
+    if side == "short":
+        from strategy.ml_predictor import load_short_booster
+        booster = load_short_booster(symbol)
+        if booster is None:
+            logger.warning("[%s] No SHORT model found — skipping short refit", symbol)
+            return False
+    else:
+        booster = _load_booster(symbol)
     if booster is None:
         return False
     meta = _load_meta(symbol)
@@ -103,7 +112,7 @@ def refit_one(symbol: str, days: int = 45) -> bool:
     per_day = _CANDLES_PER_DAY.get(tf, 96)
     limit = days * per_day
     logger.info("[%s] Fetching %d candles (~%dd %s) ...", symbol, limit, days, tf)
-    raw = fetch_ohlcv_ccxt(symbol, timeframe=tf, limit=limit)
+    raw = _get_ohlcv_cache().fetch(symbol, tf, limit)
     if raw is None or len(raw) < 500:
         logger.error("[%s] Insufficient fetch (rows=%s)", symbol, 0 if raw is None else len(raw))
         return False
@@ -137,7 +146,10 @@ def refit_one(symbol: str, days: int = 45) -> bool:
 
     X = feat_eval[QUANT_FEATURE_COLS].to_numpy(dtype=np.float32)
     y_prob = booster.predict_proba(X)[:, 1].astype(np.float64)
-    y_true = forward_return_label(feat_eval["close"], horizon, DEFAULT_LABEL_ROUND_TRIP).to_numpy(dtype=np.int32)
+    if side == "short":
+        y_true = forward_return_label_short(feat_eval["close"], horizon, DEFAULT_LABEL_ROUND_TRIP).to_numpy(dtype=np.int32)
+    else:
+        y_true = forward_return_label(feat_eval["close"], horizon, DEFAULT_LABEL_ROUND_TRIP).to_numpy(dtype=np.int32)
 
     if len(y_true) != len(y_prob):
         logger.error("[%s] length mismatch: y_true=%d y_prob=%d", symbol, len(y_true), len(y_prob))
@@ -147,10 +159,11 @@ def refit_one(symbol: str, days: int = 45) -> bool:
         return False
 
     pos_rate = float(y_true.mean())
-    logger.info("[%s] fitting calibration: n=%d pos_rate=%.4f raw_mean=%.4f",
-                symbol, len(y_true), pos_rate, float(y_prob.mean()))
+    logger.info("[%s] fitting calibration: side=%s n=%d pos_rate=%.4f raw_mean=%.4f",
+                symbol, side, len(y_true), pos_rate, float(y_prob.mean()))
 
-    path = fit_and_save_calibration(symbol, y_true, y_prob)
+    cal_symbol = f"{symbol}_short" if side == "short" else symbol
+    path = fit_and_save_calibration(cal_symbol, y_true, y_prob)
 
     if used_fallback:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -160,10 +173,10 @@ def refit_one(symbol: str, days: int = 45) -> bool:
             "fallback_window_days": min(days, 30),
             "n_samples": int(len(y_true)),
             "pos_rate": pos_rate,
+            "side": side,
         }
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        # Invalidate cache so next load picks up the rewritten file
-        _calibration_cache.pop(symbol, None)
+        _calibration_cache.pop(cal_symbol, None)
 
     return True
 
@@ -173,23 +186,27 @@ def main() -> int:
     parser.add_argument("--symbol", type=str, default=None)
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--days", type=int, default=45)
+    parser.add_argument("--side", choices=["long", "short", "both"], default="long",
+                        help="Which side calibration to refit")
     args = parser.parse_args()
 
     if args.symbol is None and not args.all:
         parser.error("Pass --symbol SYM or --all")
 
     symbols = [args.symbol] if args.symbol else list(SYMBOL_CONFIG.keys())
+    sides = ["long", "short"] if args.side == "both" else [args.side]
     ok = 0
     fail = 0
     for sym in symbols:
-        try:
-            if refit_one(sym, days=args.days):
-                ok += 1
-            else:
+        for side in sides:
+            try:
+                if refit_one(sym, days=args.days, side=side):
+                    ok += 1
+                else:
+                    fail += 1
+            except Exception as exc:
+                logger.error("[%s/%s] refit failed: %s", sym, side, exc, exc_info=True)
                 fail += 1
-        except Exception as exc:
-            logger.error("[%s] refit failed: %s", sym, exc, exc_info=True)
-            fail += 1
 
     logger.info("=" * 60)
     logger.info("Refit summary: %d ok, %d failed (of %d)", ok, fail, len(symbols))

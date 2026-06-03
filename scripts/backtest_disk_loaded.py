@@ -40,7 +40,8 @@ from scripts.backtest_full_bot import (
     _run_simulation_loop,
     calc_metrics,
 )
-from scripts.deep_strategy_audit import fetch_ohlcv_ccxt
+from data.ohlcv_cache import get_cache as _get_ohlcv_cache
+from scripts.deep_strategy_audit import fetch_ohlcv_ccxt  # kept for direct callers outside cache
 from strategy.prob_calibration import calibrate_probability, load_calibration
 from strategy.quant_features import QUANT_FEATURE_COLS, add_quant_features
 
@@ -78,7 +79,7 @@ def _fetch_for_symbol(symbol: str, days: int, buffer_days: int = 30) -> pd.DataF
     per_day = _CANDLES_PER_DAY.get(tf, 96)
     limit = (days + buffer_days) * per_day
     logger.info("Fetching %d %s candles for %s (~%dd)...", limit, tf, symbol, days + buffer_days)
-    return fetch_ohlcv_ccxt(symbol, timeframe=tf, limit=limit)
+    return _get_ohlcv_cache().fetch(symbol, tf, limit)
 
 
 def run_symbol(symbol: str, days: int) -> dict[str, Any]:

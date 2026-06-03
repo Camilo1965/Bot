@@ -1,0 +1,156 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+const SYMBOLS = [
+  "BTC/USDT",
+  "ETH/USDT",
+  "SOL/USDT",
+  "DOGE/USDT",
+  "NEAR/USDT",
+  "ATOM/USDT",
+  "LINK/USDT",
+];
+
+interface SignalRow {
+  ts: string;
+  cal_prob: number;
+  threshold: number;
+  ml_decision: "long" | "short" | "no_trade" | string;
+  regime?: string;
+}
+
+interface SymbolSignals {
+  symbol: string;
+  rows: SignalRow[];
+  loading: boolean;
+  error: string | null;
+}
+
+function DecisionBadge({ decision }: { decision: string }) {
+  const style =
+    decision === "long"
+      ? "bg-[#10B981]/20 text-[#10B981]"
+      : decision === "short"
+      ? "bg-[#EF4444]/20 text-[#EF4444]"
+      : "bg-[#374151] text-[#9CA3AF]";
+  return (
+    <span className={`px-2 py-0.5 rounded text-[11px] font-semibold ${style}`}>
+      {decision.toUpperCase()}
+    </span>
+  );
+}
+
+function SymbolColumn({ data }: { data: SymbolSignals }) {
+  const latest = data.rows[0];
+  const slug = data.symbol.replace("/", "_");
+
+  return (
+    <div className="bg-[#10151D] border border-[#374151] rounded-lg p-3 flex flex-col gap-3">
+      {/* Header */}
+      <div className="text-xs font-semibold text-[#F3F4F6] truncate">{data.symbol}</div>
+
+      {data.loading && (
+        <div className="text-[10px] text-[#9CA3AF]">Loading…</div>
+      )}
+      {data.error && (
+        <div className="text-[10px] text-[#EF4444]">Error</div>
+      )}
+
+      {!data.loading && !data.error && latest && (
+        <>
+          <div className="space-y-1">
+            <div className="flex justify-between text-[11px]">
+              <span className="text-[#9CA3AF]">Cal prob</span>
+              <span className="font-mono text-[#F3F4F6]">{latest.cal_prob.toFixed(3)}</span>
+            </div>
+            <div className="flex justify-between text-[11px]">
+              <span className="text-[#9CA3AF]">Threshold</span>
+              <span className="font-mono text-[#F3F4F6]">{latest.threshold.toFixed(3)}</span>
+            </div>
+            <div className="flex justify-between text-[11px] items-center">
+              <span className="text-[#9CA3AF]">Decision</span>
+              <DecisionBadge decision={latest.ml_decision} />
+            </div>
+          </div>
+
+          {/* Probability bar */}
+          <div className="w-full bg-[#374151] rounded-full h-1">
+            <div
+              className="h-1 rounded-full bg-[#3B82F6] transition-all"
+              style={{ width: `${Math.min(latest.cal_prob * 100, 100)}%` }}
+            />
+          </div>
+          <div className="w-full bg-[#374151] rounded-full h-px relative">
+            <div
+              className="absolute top-[-3px] w-px h-2 bg-[#9CA3AF]"
+              style={{ left: `${Math.min(latest.threshold * 100, 100)}%` }}
+              title={`Threshold: ${latest.threshold}`}
+            />
+          </div>
+        </>
+      )}
+
+      {!data.loading && !data.error && !latest && (
+        <div className="text-[10px] text-[#9CA3AF]">No data</div>
+      )}
+
+      {/* Recent rows */}
+      {!data.loading && data.rows.length > 1 && (
+        <div className="border-t border-[#374151] pt-2 space-y-1">
+          <div className="text-[10px] text-[#9CA3AF] uppercase tracking-wider mb-1">Recent</div>
+          {data.rows.slice(1, 6).map((r, i) => (
+            <div key={i} className="flex justify-between items-center text-[10px]">
+              <span className="text-[#9CA3AF] font-mono truncate">
+                {new Date(r.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+              </span>
+              <DecisionBadge decision={r.ml_decision} />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function SignalsPage() {
+  const [columns, setColumns] = useState<SymbolSignals[]>(
+    SYMBOLS.map((s) => ({ symbol: s, rows: [], loading: true, error: null }))
+  );
+
+  useEffect(() => {
+    SYMBOLS.forEach((sym, idx) => {
+      const slug = sym.replace("/", "_");
+      fetch(`${API}/api/signals/by-symbol/${slug}?limit=10`)
+        .then((r) => r.json())
+        .then((data) => {
+          setColumns((prev) =>
+            prev.map((c, i) =>
+              i === idx ? { ...c, rows: Array.isArray(data) ? data : [], loading: false } : c
+            )
+          );
+        })
+        .catch((e) => {
+          setColumns((prev) =>
+            prev.map((c, i) =>
+              i === idx ? { ...c, loading: false, error: String(e) } : c
+            )
+          );
+        });
+    });
+  }, []);
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-xl font-semibold text-[#F3F4F6]">Signals</h1>
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7 gap-3">
+        {columns.map((col) => (
+          <SymbolColumn key={col.symbol} data={col} />
+        ))}
+      </div>
+    </div>
+  );
+}

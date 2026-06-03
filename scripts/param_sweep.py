@@ -52,6 +52,7 @@ from scripts.backtest_full_bot import (
     train_direction_model,
     train_regime_model,
 )
+from data.ohlcv_cache import get_cache as _get_ohlcv_cache
 from scripts.deep_strategy_audit import fetch_ohlcv_ccxt
 from strategy.prob_calibration import load_calibration
 from strategy.quant_features import QUANT_FEATURE_COLS, add_quant_features
@@ -156,7 +157,7 @@ def _fetch_disk_test_slice(symbol: str, days: int) -> tuple[pd.DataFrame, np.nda
     per_day = _CANDLES_PER_DAY.get(tf, 96)
     limit = (days + 30) * per_day  # warmup buffer
 
-    raw = fetch_ohlcv_ccxt(symbol, timeframe=tf, limit=limit)
+    raw = _get_ohlcv_cache().fetch(symbol, tf, limit)
     if raw is None or len(raw) < 500:
         logger.error("[%s] disk-mode fetch insufficient (%s rows)", symbol, 0 if raw is None else len(raw))
         return None
@@ -208,7 +209,7 @@ def sweep_inline(symbol: str, limit: int = 30_000) -> pd.DataFrame:
     hor = cfg["horizon"]
 
     logger.info("[%s] inline mode — fetching %d %s candles...", symbol, limit, tf)
-    raw = fetch_ohlcv_ccxt(symbol, timeframe=tf, limit=limit)
+    raw = _get_ohlcv_cache().fetch(symbol, tf, limit)
     if len(raw) < 1000:
         logger.error("[%s] insufficient data", symbol)
         return pd.DataFrame()

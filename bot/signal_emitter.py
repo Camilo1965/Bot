@@ -63,6 +63,55 @@ _SPREAD_FILTER_ENABLED: bool = os.environ.get("SPREAD_FILTER_ENABLED", "1").stri
 _MAX_SPREAD_PCT: float = float(os.environ.get("MAX_SPREAD_PCT", "0.002") or "0.002")
 _HTF_GATE_ENABLED: bool = os.environ.get("HTF_GATE_ENABLED", "0").strip() in ("1", "true")
 
+_SHADOW_SIGNALS_CSV = os.environ.get(
+    "SHADOW_SIGNALS_CSV",
+    str(__import__("pathlib").Path(__file__).resolve().parent.parent / "logs" / "shadow_run_signals.csv"),
+)
+_SHADOW_CSV_HEADER = (
+    "timestamp,symbol,raw_prob,cal_prob,threshold,regime_prob,"
+    "htf_pass,vol_pass,hour_filter,ml_decision,executed,reason_skip\n"
+)
+
+
+def _write_shadow_signal(
+    symbol: str,
+    raw_prob: float,
+    cal_prob: float,
+    threshold: float,
+    regime_prob: float | None,
+    htf_pass: bool,
+    vol_pass: bool,
+    hour_filter: bool,
+    ml_decision: str,
+    executed: bool,
+    reason_skip: str = "",
+) -> None:
+    try:
+        from pathlib import Path as _P
+        p = _P(_SHADOW_SIGNALS_CSV)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not p.exists() or p.stat().st_size == 0
+        with p.open("a", newline="", encoding="utf-8") as f:
+            if write_header:
+                f.write(_SHADOW_CSV_HEADER)
+            row = (
+                datetime.now(timezone.utc).isoformat(),
+                symbol,
+                f"{raw_prob:.6f}",
+                f"{cal_prob:.6f}",
+                f"{threshold:.4f}",
+                f"{regime_prob:.4f}" if regime_prob is not None else "",
+                str(htf_pass),
+                str(vol_pass),
+                str(hour_filter),
+                ml_decision,
+                str(executed),
+                reason_skip,
+            )
+            f.write(",".join(row) + "\n")
+    except Exception:
+        pass
+
 
 async def _fetch_vibe_mcp_decision(
     session: aiohttp.ClientSession,
@@ -502,6 +551,27 @@ async def signal_emitter(
                             logger.info("[SHORT] %s opened at %.4f (prob=%.2f%%)", symbol, short_entry, short_prob * 100)
                     except Exception as exc:
                         logger.warning("[SHORT] open failed %s: %s", symbol, exc)
+
+            # ── Shadow run telemetry (fire-and-forget, non-blocking) ──────────
+            _sym_cfg_tel = get_symbol_config(symbol)
+            _tel_threshold = float(_sym_cfg_tel.get("prob_threshold", 0.55))
+            _tel_regime_prob: float | None = None
+            if _regime_result is not None:
+                _tel_regime_prob = float(_regime_result[1])
+            _tel_executed = signal == "BUY" and symbol in paper_executor.open_positions
+            _write_shadow_signal(
+                symbol=symbol,
+                raw_prob=win_prob,
+                cal_prob=win_prob,
+                threshold=_tel_threshold,
+                regime_prob=_tel_regime_prob,
+                htf_pass=True,
+                vol_pass=True,
+                hour_filter=_TRADE_HOUR_FILTER,
+                ml_decision=signal,
+                executed=_tel_executed,
+                reason_skip="" if signal == "BUY" else "no_signal",
+            )
 
     try:
         while True:

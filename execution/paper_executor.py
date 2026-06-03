@@ -49,19 +49,30 @@ def _ttl_hours_from_env() -> float:
 POSITION_TTL_HOURS: float = _ttl_hours_from_env()
 
 # ── Journal column headers ──────────────────────────────────────────────────
+_JOURNAL_SCHEMA_VERSION = "2"
 _JOURNAL_COLUMNS: list[str] = [
+    "schema_version",
     "trade_id",
     "symbol",
+    "side",
     "entry_time",
     "exit_time",
     "entry_price",
     "exit_price",
+    "sl_price",
+    "tp_price",
     "position_size",
     "gross_pnl",
     "net_pnl",
+    "pnl_pct",
     "exit_reason",
     "ml_confidence_at_entry",
     "duration_minutes",
+    "hour_open",
+    "dow",
+    "balance_before",
+    "balance_after",
+    "killswitch_state",
 ]
 
 # ── Legacy compatibility constants ──────────────────────────────────────────
@@ -239,10 +250,48 @@ class PaperExecutor:
             return 0
 
     def _append_to_journal(self, pos: OpenPosition, exit_price: float, exit_time: datetime, reason: str) -> None:
-        gross_pnl = (exit_price - pos.entry_price) / pos.entry_price * pos.position_size
-        net_pnl = gross_pnl
+        ep = pos.entry_price if pos.entry_price and pos.entry_price > 0 else 1.0
+        gross_pnl = (exit_price - ep) / ep * pos.position_size
+        direction = getattr(pos, "direction", "long")
+        if direction == "short":
+            gross_pnl = (ep - exit_price) / ep * pos.position_size
+        net_pnl = gross_pnl - pos.position_size * _TAKER_FEE_RATE * 2
+        pnl_pct = gross_pnl / ep * 100.0 if ep > 0 else 0.0
         duration = (exit_time - pos.entry_time).total_seconds() / 60.0
-        row = [pos.trade_id, pos.symbol, pos.entry_time.isoformat(), exit_time.isoformat(), f"{pos.entry_price:.8f}", f"{exit_price:.8f}", f"{pos.position_size:.2f}", f"{gross_pnl:.4f}", f"{net_pnl:.4f}", reason, f"{pos.ml_confidence:.4f}", f"{duration:.1f}"]
+
+        balance_after = self._risk.balance if hasattr(self._risk, "balance") else 0.0
+        balance_before = balance_after - net_pnl
+
+        try:
+            from risk.kill_switch import is_halted as _ks_halted
+            ks_state = "active" if _ks_halted() else "inactive"
+        except Exception:
+            ks_state = "unknown"
+
+        row = [
+            _JOURNAL_SCHEMA_VERSION,
+            pos.trade_id,
+            pos.symbol,
+            direction,
+            pos.entry_time.isoformat(),
+            exit_time.isoformat(),
+            f"{ep:.8f}",
+            f"{exit_price:.8f}",
+            f"{getattr(pos, 'sl_price', 0.0):.8f}",
+            f"{getattr(pos, 'tp_price', 0.0) or 0.0:.8f}",
+            f"{pos.position_size:.2f}",
+            f"{gross_pnl:.4f}",
+            f"{net_pnl:.4f}",
+            f"{pnl_pct:.4f}",
+            reason,
+            f"{pos.ml_confidence:.4f}",
+            f"{duration:.1f}",
+            str(pos.entry_time.hour),
+            str(pos.entry_time.weekday()),
+            f"{balance_before:.4f}",
+            f"{balance_after:.4f}",
+            ks_state,
+        ]
         try:
             self._journal_file.parent.mkdir(exist_ok=True)
             write_header = not self._journal_file.exists()
@@ -257,6 +306,8 @@ class PaperExecutor:
     async def try_open_trade(self, entry_price: float, win_probability: float, symbol: str, sentiment_score: float = 0.0, current_atr: float | None = None, vibe_quality: float = 1.0) -> bool:
         if symbol in self.open_positions: return False
         if not self._risk.can_open_position(): return False
+        # [I-12] Defensive sync so MAX_PORTFOLIO_RISK_PCT check uses live data
+        self._risk.recalc_total_risk(self.open_positions)
         cfg = get_symbol_config(symbol)
 
         # Risk Management: Portfolio level
@@ -705,6 +756,22 @@ class PaperExecutor:
         logger.info("🏁 [CLOSE] %s exit=%.4f pnl=%.2f (%.2f%%) reason=%s", symbol, exit_price, gross_pnl, pnl_pct_display, reason)
         await send_telegram_alert(f"🏁 *CLOSE* {symbol}\nExit: {exit_price:.4f}\nPnL: {gross_pnl:+.2f} ({pnl_pct_display:+.2f}%)\nReason: {reason}")
         return gross_pnl
+
+    async def close_all_for_kill_switch(self, latest_prices: dict[str, float], reason: str = "kill_switch_close_all") -> int:
+        """Close every open position at market. Called when T3 trigger fires (dd_7d ≥ 15%)."""
+        closed = 0
+        for sym in list(self.open_positions.keys()):
+            price = latest_prices.get(sym)
+            if price is None:
+                logger.warning("[KILL] No price for %s — cannot force-close.", sym)
+                continue
+            await self._close_position(sym, price, reason)
+            closed += 1
+        if closed:
+            logger.warning("[KILL] Force-closed %d position(s) for kill-switch T3.", closed)
+        from risk.kill_switch import get_kill_switch
+        get_kill_switch().clear_close_all()
+        return closed
 
     async def sync_positions_with_exchange(self, confirmations_required: int = 1) -> int:
         return len(self.open_positions)

@@ -41,6 +41,7 @@ from scripts.backtest_full_bot import (
     train_direction_model,
     train_regime_model,
 )
+from data.ohlcv_cache import get_cache as _get_ohlcv_cache
 from scripts.deep_strategy_audit import fetch_ohlcv_ccxt
 from scripts.param_sweep import score as composite_score
 
@@ -48,6 +49,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("symbol_scan")
 
 CANDIDATES: list[str] = [
+    # Original candidates
     "ADA/USDT",
     "AVAX/USDT",
     "LINK/USDT",
@@ -55,7 +57,17 @@ CANDIDATES: list[str] = [
     "DOT/USDT",
     "NEAR/USDT",
     "ATOM/USDT",
-    "MATIC/USDT",
+    "POL/USDT",  # MATIC renamed to POL/Polygon 2023
+    # Phase D narrative-2026 expansion (I-20)
+    "ARB/USDT",
+    "OP/USDT",
+    "SUI/USDT",
+    "SEI/USDT",
+    "INJ/USDT",
+    "TIA/USDT",
+    "JTO/USDT",
+    "RUNE/USDT",
+    "KAS/USDT",
 ]
 
 # Seed config used for inline training & sweeping
@@ -89,7 +101,7 @@ def scan_one(symbol: str, limit: int = 17280) -> dict[str, Any]:
     """One candidate. limit=17280 ≈ 180d at 15m."""
     logger.info("[%s] fetching %d candles...", symbol, limit)
     try:
-        raw = fetch_ohlcv_ccxt(symbol, timeframe=SEED["timeframe"], limit=limit)
+        raw = _get_ohlcv_cache().fetch(symbol, SEED["timeframe"], limit)
     except Exception as exc:
         return {"symbol": symbol, "error": f"fetch_failed:{exc}"}
     if raw is None or len(raw) < 8000:

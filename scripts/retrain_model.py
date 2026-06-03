@@ -34,6 +34,7 @@ from strategy.quant_features import (
     VIBE_FEATURE_COLS,
     add_quant_features,
     forward_return_label,
+    forward_return_label_short,
     triple_barrier_label,
     DEFAULT_LABEL_ROUND_TRIP,
 )
@@ -179,6 +180,10 @@ def retrain_and_validate(
     lookback_days: int = 90,
     min_auc: float = 0.55,
     use_vibe: bool = False,
+    label_type: str = "forward_return",
+    use_ensemble: bool = False,
+    use_mtf: bool = False,
+    side: str = "long",
 ) -> bool:
     """Retrain XGBoost v2 with TimeSeriesSplit and full metrics quality gate.
 
@@ -220,18 +225,36 @@ def retrain_and_validate(
         return False
 
     # 3. Compute quant features with correct base_timeframe_min (affects ATR/MACD scale)
-    feat = add_quant_features(df, base_timeframe_min=tf_min)
+    _mtf_tfs = ["1h", "4h"] if use_mtf else None
+    feat = add_quant_features(df, base_timeframe_min=tf_min, multi_tf=_mtf_tfs)
     # forward_return_label: model predicts whether short-term move exceeds threshold within RETRAIN_LABEL_HORIZON bars.
     # Keep horizon=8 (proven AUC 0.71+); cfg "horizon" controls live TTL not label horizon.
     label_horizon = int(os.environ.get("RETRAIN_LABEL_HORIZON", "8") or "8")
     label_thr = float(os.environ.get("RETRAIN_LABEL_THRESHOLD", "0.015"))
-    feat["label"] = forward_return_label(feat["close"], horizon=label_horizon, round_trip_cost=label_thr)
-    logger.info("[LABEL] %s  forward_return  horizon=%d  threshold=%.4f", symbol, label_horizon, label_thr)
+    if label_type == "triple_barrier":
+        cfg = get_symbol_config(symbol)
+        sl_pct = float(cfg.get("fixed_sl_pct", 0.025))
+        tp_pct = float(cfg.get("fixed_tp_pct", 0.040))
+        feat["label"] = triple_barrier_label(feat["close"], feat["high"], feat["low"], horizon=label_horizon, fixed_sl_pct=sl_pct, fixed_tp_pct=tp_pct)
+        logger.info("[LABEL] %s  triple_barrier  side=%s  horizon=%d  sl=%.3f  tp=%.3f", symbol, side, label_horizon, sl_pct, tp_pct)
+    elif side == "short":
+        feat["label"] = forward_return_label_short(feat["close"], horizon=label_horizon, round_trip_cost=label_thr)
+        logger.info("[LABEL] %s  forward_return_short  horizon=%d  threshold=%.4f", symbol, label_horizon, label_thr)
+    else:
+        feat["label"] = forward_return_label(feat["close"], horizon=label_horizon, round_trip_cost=label_thr)
+        logger.info("[LABEL] %s  forward_return  horizon=%d  threshold=%.4f", symbol, label_horizon, label_thr)
 
     # 3. Inject VIBE features if requested
     if use_vibe:
         feat = _add_vibe_features(feat)
-        feature_cols = list(FINAL_FEATURE_ORDER)
+        if use_mtf:
+            from strategy.quant_features import MTF_FEATURE_COLS, FINAL_FEATURE_ORDER_MTF
+            feature_cols = list(FINAL_FEATURE_ORDER_MTF)
+        else:
+            feature_cols = list(FINAL_FEATURE_ORDER)
+    elif use_mtf:
+        from strategy.quant_features import MTF_FEATURE_COLS
+        feature_cols = list(QUANT_FEATURE_COLS) + list(MTF_FEATURE_COLS)
     else:
         feature_cols = list(QUANT_FEATURE_COLS)
 
@@ -259,24 +282,30 @@ def retrain_and_validate(
         x_va = X.iloc[val_idx].to_numpy(dtype=np.float32)
         y_va = y.iloc[val_idx].to_numpy(dtype=np.int32)
 
-        spw = _calc_scale_pos_weight(y_tr)
-        model = xgb.XGBClassifier(
-            n_estimators=500,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_alpha=0.1,
-            reg_lambda=1.5,
-            min_child_weight=2,
-            eval_metric="logloss",
-            random_state=42,
-            scale_pos_weight=spw,
-            early_stopping_rounds=20,
-        )
-        model.fit(x_tr, y_tr, eval_set=[(x_va, y_va)], verbose=False)
-        preds = model.predict(x_va)
-        probas = model.predict_proba(x_va)[:, 1]
+        if use_ensemble:
+            from strategy.ensemble import EnsemblePredictor
+            fold_model = EnsemblePredictor().fit(x_tr, y_tr)
+            probas = fold_model.predict_proba(x_va)[:, 1]
+            preds = (probas >= 0.5).astype(np.int32)
+        else:
+            spw = _calc_scale_pos_weight(y_tr)
+            fold_model = xgb.XGBClassifier(
+                n_estimators=500,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                reg_alpha=0.1,
+                reg_lambda=1.5,
+                min_child_weight=2,
+                eval_metric="logloss",
+                random_state=42,
+                scale_pos_weight=spw,
+                early_stopping_rounds=20,
+            )
+            fold_model.fit(x_tr, y_tr, eval_set=[(x_va, y_va)], verbose=False)
+            preds = fold_model.predict(x_va)
+            probas = fold_model.predict_proba(x_va)[:, 1]
         m = _compute_metrics(y_va, preds, probas)
         cv_scores.append(m["auc"])
         cv_metrics.append(m)
@@ -331,40 +360,50 @@ def retrain_and_validate(
     # 7. Final retrain on all data and save
     x_all = X.to_numpy(dtype=np.float32)
     y_all = y.to_numpy(dtype=np.int32)
-    spw_all = _calc_scale_pos_weight(y_all)
-    final_model = xgb.XGBClassifier(
-        n_estimators=500,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_alpha=0.1,
-        reg_lambda=1.5,
-        min_child_weight=2,
-        eval_metric="logloss",
-        random_state=42,
-        scale_pos_weight=spw_all,
-    )
-    final_model.fit(x_all, y_all)
 
     _MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    final_model.get_booster().feature_names = list(feature_cols)
-    final_model.save_model(str(model_path))
 
-    importance = final_model.feature_importances_
-    feat_imp = {
-        col: float(importance[i])
-        for i, col in enumerate(feature_cols)
-    }
+    if use_ensemble:
+        from strategy.ensemble import EnsemblePredictor
+        ens_suffix = "_v3_ensemble" if use_vibe else "_ensemble_v2"
+        final_ens = EnsemblePredictor().fit(x_all, y_all)
+        saved_meta_path = final_ens.save(_MODELS_DIR, symbol, suffix=ens_suffix)
+        # Update model_path to point at the ensemble meta JSON (for logging)
+        model_path = saved_meta_path
+        feat_imp: dict[str, float] = {}
+    else:
+        spw_all = _calc_scale_pos_weight(y_all)
+        final_model = xgb.XGBClassifier(
+            n_estimators=500,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_alpha=0.1,
+            reg_lambda=1.5,
+            min_child_weight=2,
+            eval_metric="logloss",
+            random_state=42,
+            scale_pos_weight=spw_all,
+        )
+        final_model.fit(x_all, y_all)
+        final_model.get_booster().feature_names = list(feature_cols)
+        final_model.save_model(str(model_path))
+        importance = final_model.feature_importances_
+        feat_imp = {col: float(importance[i]) for i, col in enumerate(feature_cols)}
 
     meta = {
         "metrics": mean_metrics,
         "trained_at": datetime.now(tz=timezone.utc).isoformat(),
         "symbol": symbol,
+        "side": side,
         "samples": len(y_all),
         "splits": len(cv_scores),
         "features": feature_cols,
         "vibe_enabled": use_vibe,
+        "ensemble": use_ensemble,
+        "label_type": label_type,
+        "mtf_enabled": use_mtf,
         "feature_importance": dict(sorted(feat_imp.items(), key=lambda x: x[1], reverse=True)),
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -382,6 +421,13 @@ def retrain_and_validate(
     except Exception as exc:
         logger.warning("Calibration fitting failed (non-fatal): %s", exc)
 
+    # 9. Save OOS raw probs as drift reference distribution
+    try:
+        from risk.drift_detector import save_reference_dist as _save_ref
+        _save_ref(symbol, np.concatenate(all_probas))
+    except Exception as exc:
+        logger.warning("Drift reference dist save failed (non-fatal): %s", exc)
+
     return True
 
 
@@ -395,6 +441,14 @@ def main() -> int:
     parser.add_argument("--days", type=int, default=90, help="Lookback days for OHLCV")
     parser.add_argument("--min-auc", type=float, default=0.55, help="Minimum mean AUC to accept model")
     parser.add_argument("--vibe", action="store_true", help="Train with 28 features (24 base + 4 VIBE) and save as _v3.json")
+    parser.add_argument("--label", choices=["forward_return", "triple_barrier"], default="forward_return",
+                        help="Label type: forward_return (default) or triple_barrier (uses SYMBOL_CONFIG sl/tp)")
+    parser.add_argument("--ensemble", action="store_true",
+                        help="Train XGB+LGBM+LR ensemble; saves {SYM}_ensemble_v2.json")
+    parser.add_argument("--mtf", action="store_true",
+                        help="Add 1h+4h multi-timeframe features (36 quant total)")
+    parser.add_argument("--side", choices=["long", "short", "both"], default="long",
+                        help="Train LONG model, SHORT model, or both (saves {SYM}_v2.json and {SYM}_short_v2.json)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -405,19 +459,30 @@ def main() -> int:
         return 1
 
     all_ok = True
+    sides = ["long", "short"] if args.side == "both" else [args.side]
+
     for symbol in symbols:
         safe_name = symbol.replace("/", "_")
-        suffix = "_v3" if args.vibe else "_v2"
-        model_path = _MODELS_DIR / f"{safe_name}{suffix}.json"
-        ok = retrain_and_validate(
-            symbol=symbol,
-            model_path=model_path,
-            lookback_days=args.days,
-            min_auc=args.min_auc,
-            use_vibe=args.vibe,
-        )
-        if not ok:
-            all_ok = False
+        for side in sides:
+            side_infix = "_short" if side == "short" else ""
+            if args.ensemble:
+                suffix = f"{side_infix}_v3_ensemble" if args.vibe else f"{side_infix}_ensemble_v2"
+            else:
+                suffix = f"{side_infix}_v3" if args.vibe else f"{side_infix}_v2"
+            model_path = _MODELS_DIR / f"{safe_name}{suffix}.json"
+            ok = retrain_and_validate(
+                symbol=symbol,
+                model_path=model_path,
+                lookback_days=args.days,
+                min_auc=args.min_auc,
+                use_vibe=args.vibe,
+                label_type=args.label,
+                use_ensemble=args.ensemble,
+                use_mtf=args.mtf,
+                side=side,
+            )
+            if not ok:
+                all_ok = False
 
     return 0 if all_ok else 1
 

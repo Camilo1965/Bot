@@ -1,0 +1,34 @@
+@import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap");
+
+:root {
+  --bg-base: #0A0E14;
+  --bg-surface: #10151D;
+  --bg-elevated: #1E2530;
+  --border: #374151;
+  --text-primary: #F3F4F6;
+  --text-secondary: #9CA3AF;
+  --accent-blue: #3B82F6;
+  --pnl-positive: #10B981;
+  --pnl-negative: #EF4444;
+  --accent-yellow: #F59E0B;
+  --accent-purple: #8B5CF6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+
+/* Tabular numbers for prices/PnL */
+.tabular { font-variant-numeric: tabular-nums; }

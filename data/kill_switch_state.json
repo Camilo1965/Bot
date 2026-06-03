@@ -1,0 +1,32 @@
+{
+  "active": false,
+  "since": null,
+  "until": null,
+  "reason": null,
+  "close_all": false,
+  "demoted_symbols": {},
+  "history": [
+    {
+      "event": "activated",
+      "reason": "T1:daily_pnl=-6.0%",
+      "duration_hours": 24.0,
+      "close_all": false,
+      "ts": "2026-06-03T01:18:11.674800+00:00"
+    },
+    {
+      "event": "deactivated",
+      "ts": "2026-06-03T01:18:11.674800+00:00"
+    },
+    {
+      "event": "activated",
+      "reason": "manual_test",
+      "duration_hours": 0.001,
+      "close_all": false,
+      "ts": "2026-06-03T01:18:11.674800+00:00"
+    },
+    {
+      "event": "deactivated",
+      "ts": "2026-06-03T01:18:11.689726+00:00"
+    }
+  ]
+}

@@ -60,8 +60,18 @@ VIBE_FEATURE_COLS: list[str] = [
     "vibe_backtest_sharpe",
 ]
 
+# Multi-timeframe features (5 per TF × 2 TFs = 10 extra)
+MTF_TFS: list[str] = ["1h", "4h"]
+MTF_FEATURE_COLS: list[str] = [
+    f"{feat}_{tf}"
+    for tf in MTF_TFS
+    for feat in ("rsi", "macd_hist", "atr", "bb_width", "adx")
+]
+
 # Orden final unificado para entrenamiento e inferencia (24 quant + 4 VIBE)
 FINAL_FEATURE_ORDER: list[str] = QUANT_FEATURE_COLS + VIBE_FEATURE_COLS
+# With MTF (36 quant + 4 VIBE = 40)
+FINAL_FEATURE_ORDER_MTF: list[str] = QUANT_FEATURE_COLS + MTF_FEATURE_COLS + VIBE_FEATURE_COLS
 
 # ── Parameters ───────────────────────────────────────────────────────────────
 _RSI_PERIOD = 14
@@ -223,6 +233,75 @@ def _close_vs_sma200_1h_series(
     return pd.Series(out, index=c.index)
 
 
+# ── Multi-timeframe helpers ──────────────────────────────────────────────────
+
+_TF_TO_RULE: dict[str, str] = {
+    "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "2h": "2h", "4h": "4h", "8h": "8h", "1d": "1D",
+}
+_TF_TO_MIN: dict[str, int] = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "8h": 480, "1d": 1440,
+}
+
+
+def _add_higher_tf_features(
+    df: pd.DataFrame,
+    tf_str: str,
+    base_tf_min: int,
+    volume_col: str = "volume",
+) -> pd.DataFrame:
+    """Resample base OHLCV to *tf_str*, compute 5 MTF features, merge_asof back."""
+    tf_min = _TF_TO_MIN.get(tf_str)
+    if tf_min is None or tf_min <= base_tf_min or "timestamp" not in df.columns:
+        return df
+
+    ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    cols = ["open", "high", "low", "close"] + ([volume_col] if volume_col in df.columns else [])
+    tmp = df[cols].copy()
+    tmp.index = ts
+
+    rule = _TF_TO_RULE.get(tf_str, tf_str)
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    if volume_col in tmp.columns:
+        agg[volume_col] = "sum"
+    resampled = tmp.resample(rule).agg(agg).dropna(subset=["close"])
+    if len(resampled) < 10:
+        return df
+
+    cl = resampled["close"].astype(float)
+    hi = resampled["high"].astype(float)
+    lo = resampled["low"].astype(float)
+
+    suffix = f"_{tf_str}"
+    feat_r = pd.DataFrame(index=resampled.index)
+    feat_r[f"rsi{suffix}"] = _rsi(cl)
+    _, _, mh = _macd(cl)
+    feat_r[f"macd_hist{suffix}"] = mh
+    feat_r[f"atr{suffix}"] = _atr(hi, lo, cl)
+    mid = cl.rolling(20, min_periods=5).mean()
+    std = cl.rolling(20, min_periods=5).std()
+    upper = mid + 2.0 * std
+    lower = mid - 2.0 * std
+    feat_r[f"bb_width{suffix}"] = ((upper - lower) / mid.replace(0, np.nan)).fillna(0.0)
+    feat_r[f"adx{suffix}"] = _adx(hi, lo, cl)
+
+    feat_r = feat_r.reset_index().rename(columns={"index": "timestamp"})
+    feat_r["timestamp"] = pd.to_datetime(feat_r["timestamp"], utc=True)
+
+    base_ts_df = pd.DataFrame({"timestamp": ts.values, "_orig_idx": np.arange(len(df))})
+    merged = pd.merge_asof(
+        base_ts_df.sort_values("timestamp"),
+        feat_r.sort_values("timestamp"),
+        on="timestamp",
+        direction="backward",
+    ).sort_values("_orig_idx").reset_index(drop=True)
+
+    for col in [f"rsi{suffix}", f"macd_hist{suffix}", f"atr{suffix}", f"bb_width{suffix}", f"adx{suffix}"]:
+        df[col] = merged[col].ffill().values if col in merged.columns else 0.0
+    return df
+
+
 # ── Main feature builder ─────────────────────────────────────────────────────
 
 def add_quant_features(
@@ -230,6 +309,7 @@ def add_quant_features(
     *,
     volume_col: str = "volume",
     base_timeframe_min: int = 15,
+    multi_tf: list[str] | None = None,
 ) -> pd.DataFrame:
     """Append feature columns to OHLCV frame (expects open, high, low, close)."""
     df = ohlcv.copy()
@@ -299,6 +379,17 @@ def add_quant_features(
         df["hour_cos"] = 0.0
         df["dow"] = 0.0
 
+    # Optional multi-timeframe features (resample base OHLCV to higher TFs)
+    if multi_tf:
+        for tf_str in multi_tf:
+            try:
+                df = _add_higher_tf_features(df, tf_str, base_timeframe_min, volume_col)
+            except Exception:
+                for feat in ("rsi", "macd_hist", "atr", "bb_width", "adx"):
+                    col = f"{feat}_{tf_str}"
+                    if col not in df.columns:
+                        df[col] = 0.0
+
     return df
 
 
@@ -365,6 +456,16 @@ def forward_return_label(
     """Binary label: forward simple return over *horizon* bars exceeds friction."""
     fwd = close.shift(-horizon) / close - 1.0
     return (fwd > round_trip_cost).astype(int)
+
+
+def forward_return_label_short(
+    close: pd.Series,
+    horizon: int,
+    round_trip_cost: float = DEFAULT_LABEL_ROUND_TRIP,
+) -> pd.Series:
+    """Binary label for SHORT: 1 if price fell more than *round_trip_cost* within *horizon* bars."""
+    fwd = close.shift(-horizon) / close - 1.0
+    return (fwd < -round_trip_cost).astype(int)
 
 
 def triple_barrier_label(

@@ -70,6 +70,7 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "timeframe": "30m",
         "horizon": 36,
         "skip_regime": True,
+        "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05},
     },
     "ETH/USDT": {
         # Disk sweep 2026-06-02 (60d, calibrated): pt=0.50 tp=0.030 sl=0.020
@@ -83,6 +84,7 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "timeframe": "15m",
         "horizon": 20,
         "skip_regime": True,
+        "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05},
     },
     "XRP/USDT": {
         # DEMOTED 2026-06-02 — disk sweep across pt∈[0.50,0.80] showed every
@@ -98,6 +100,7 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "timeframe": "15m",
         "horizon": 16,
         "skip_regime": True,
+        "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05},
     },
     "SOL/USDT": {
         # Disk sweep 2026-06-02 (60d, calibrated): pt=0.55 tp=0.035 sl=0.025
@@ -110,6 +113,7 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "timeframe": "30m",
         "horizon": 24,
         "skip_regime": True,
+        "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10},
     },
     "DOGE/USDT": {
         # Disk sweep 2026-06-02 (60d, calibrated): pt=0.55 tp=0.045 sl=0.025
@@ -122,6 +126,7 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "timeframe": "15m",
         "horizon": 16,
         "skip_regime": True,
+        "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10},
     },
     # ── Phase D survivors (2026-06-02): inline 70/30 OOS validated ──
     "NEAR/USDT": {
@@ -135,6 +140,7 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "timeframe": "15m",
         "horizon": 20,
         "skip_regime": True,
+        "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15},
     },
     "ATOM/USDT": {
         # Symbol scan 2026-06-02 (54d OOS): pt=0.45 tp=0.035 sl=0.025
@@ -147,6 +153,7 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "timeframe": "15m",
         "horizon": 20,
         "skip_regime": True,
+        "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15},
     },
     "LINK/USDT": {
         # Symbol scan 2026-06-02 (54d OOS): pt=0.55 tp=0.050 sl=0.030
@@ -161,6 +168,7 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "timeframe": "15m",
         "horizon": 20,
         "skip_regime": True,
+        "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10},
     },
 }
 
@@ -200,7 +208,7 @@ def short_model_json_path_for_symbol(symbol: str) -> Path | None:
 _short_booster_cache: dict[str, XGBClassifier] = {}
 
 
-def load_short_booster(symbol: str) -> XGBClassifier | None:
+def load_short_booster(symbol: str):
     """Load SHORT model for symbol. Returns None if no model file exists."""
     if symbol in _short_booster_cache:
         return _short_booster_cache[symbol]
@@ -208,8 +216,12 @@ def load_short_booster(symbol: str) -> XGBClassifier | None:
     if path is None:
         return None
     try:
-        m = XGBClassifier()
-        m.load_model(str(path))
+        if _is_ensemble_meta(path):
+            from strategy.ensemble import EnsemblePredictor
+            m = EnsemblePredictor.load(path)
+        else:
+            m = XGBClassifier()
+            m.load_model(str(path))
         _short_booster_cache[symbol] = m
         logger.info("SHORT model loaded: %s (%s)", symbol, path.name)
         return m
@@ -231,18 +243,34 @@ def get_symbol_config(symbol: str) -> dict[str, Any]:
     return base
 
 
-def load_booster_from_disk(path: Path | None = None) -> XGBClassifier:
-    """Load XGB JSON from *path* or default ``_XGB_MODEL_PATH`` (cached per resolved path)."""
+def _is_ensemble_meta(path: Path) -> bool:
+    try:
+        import json
+        d = json.loads(path.read_text(encoding="utf-8"))
+        return d.get("type") == "EnsemblePredictor"
+    except Exception:
+        return False
+
+
+def load_booster_from_disk(path: Path | None = None):
+    """Load model from *path* or default ``_XGB_MODEL_PATH`` (cached per resolved path).
+
+    Returns either an XGBClassifier or an EnsemblePredictor depending on the JSON.
+    """
     p = (path or _XGB_MODEL_PATH).resolve()
     key = str(p)
     if key in _booster_cache:
         return _booster_cache[key]
     if not p.is_file():
         raise FileNotFoundError(str(p))
-    booster = XGBClassifier()
-    booster.load_model(str(p))
-    _booster_cache[key] = booster
-    return booster
+    if _is_ensemble_meta(p):
+        from strategy.ensemble import EnsemblePredictor
+        model = EnsemblePredictor.load(p)
+    else:
+        model = XGBClassifier()
+        model.load_model(str(p))
+    _booster_cache[key] = model
+    return model
 
 # Default prediction horizon (price-tick steps)
 _PREDICTION_HORIZON = 5

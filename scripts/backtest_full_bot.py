@@ -59,15 +59,15 @@ COOLDOWN_AFTER_LOSSES = 0    # 0 disabled; else pause N bars after 2 consec loss
 SYMBOL_CONFIG = {
     # Mirrors strategy/ml_predictor.py:SYMBOL_CONFIG (canonical). Tuned 2026-06-02
     # via disk-loaded backtest + post-retrain calibration refit + per-symbol param sweep.
-    "BTC/USDT": {"prob_threshold": 0.70, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.040, "risk": 0.015, "timeframe": "30m", "horizon": 36, "regime_adx": 25.0, "max_spw": None, "skip_regime": True},
-    "ETH/USDT": {"prob_threshold": 0.50, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.030, "risk": 0.015, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
-    "XRP/USDT": {"prob_threshold": 0.95, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.005, "timeframe": "15m", "horizon": 16, "regime_adx": 20.0, "max_spw": 8.0, "skip_regime": True},  # DEMOTED
-    "SOL/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.015, "timeframe": "30m", "horizon": 24, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
-    "DOGE/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.045, "risk": 0.010, "timeframe": "15m", "horizon": 16, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
+    "BTC/USDT":  {"prob_threshold": 0.70, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.040, "risk": 0.015, "timeframe": "30m", "horizon": 36, "regime_adx": 25.0, "max_spw": None, "skip_regime": True, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},
+    "ETH/USDT":  {"prob_threshold": 0.50, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.030, "risk": 0.015, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},
+    "XRP/USDT":  {"prob_threshold": 0.95, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.005, "timeframe": "15m", "horizon": 16, "regime_adx": 20.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},  # DEMOTED
+    "SOL/USDT":  {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.015, "timeframe": "30m", "horizon": 24, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
+    "DOGE/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.045, "risk": 0.010, "timeframe": "15m", "horizon": 16, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
     # Phase D survivors (2026-06-02, inline 70/30 OOS)
-    "NEAR/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
-    "ATOM/USDT": {"prob_threshold": 0.45, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
-    "LINK/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.008, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0, "skip_regime": True},
+    "NEAR/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
+    "ATOM/USDT": {"prob_threshold": 0.45, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
+    "LINK/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.008, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
 }
 
 
@@ -206,6 +206,13 @@ def _run_simulation_loop(
     horizon_bars = int(cfg.get("horizon", 20))
     ttl_hours = max(TTL_HOURS, horizon_bars * tf_min / 60.0)
 
+    # Execution costs (slippage + spread) — see roadmap [I-3].
+    # Defaults sized for mid-cap USDT pair on Binance spot.
+    _ec = cfg.get("exec_costs", {})
+    spread_bps = float(_ec.get("spread_bps", 3.0))
+    slip_atr_mult = float(_ec.get("slippage_atr_mult", 0.07))
+    spread_frac = spread_bps / 10000.0
+
     if len(feat) < 10 or len(direction_probs) != len(feat) or len(regime_probs) != len(feat):
         return state
 
@@ -249,14 +256,18 @@ def _run_simulation_loop(
             hours_held = (pd.Timestamp(ts) - pos.entry_time).total_seconds() / 3600.0
             hit_ttl = hours_held >= ttl_hours
 
+            atr_pct_cur = (current_atr / current_price) if current_price > 0 else 0.0
             if hit_sl:
-                exit_p = pos.current_stop
+                # SL fill: adverse slippage + spread (stop sweep takes liquidity)
+                exit_p = pos.current_stop * (1.0 - spread_frac - slip_atr_mult * atr_pct_cur * 0.5)
                 reason = "SL"
             elif hit_tp:
-                exit_p = pos.tp_price
+                # TP fill: better fill in a limit; just pay spread
+                exit_p = pos.tp_price * (1.0 - spread_frac)
                 reason = "TP"
             elif hit_ttl:
-                exit_p = current_price
+                # TTL: market close
+                exit_p = current_price * (1.0 - spread_frac)
                 reason = "TTL"
             else:
                 continue
@@ -367,28 +378,31 @@ def _run_simulation_loop(
             continue
 
         # ── Open position ──
-        sl_price = current_price * (1.0 - sl_frac)
+        # Entry fill: adverse slippage + spread on a market buy
+        atr_pct_entry = (current_atr / current_price) if current_price > 0 else 0.0
+        entry_fill = current_price * (1.0 + spread_frac + slip_atr_mult * atr_pct_entry)
+        sl_price = entry_fill * (1.0 - sl_frac)
         # Match production: TP = max(fixed_tp_pct, ATR_TP_MULT * atr_pct)
         fixed_tp = cfg.get("fixed_tp_pct")
         if fixed_tp is not None and current_atr > 0:
-            atr_tp_frac = (current_atr * TP_ATR_MULT) / current_price
+            atr_tp_frac = (current_atr * TP_ATR_MULT) / entry_fill
             tp_frac = max(float(fixed_tp), atr_tp_frac)
-            tp_price = current_price * (1.0 + tp_frac)
+            tp_price = entry_fill * (1.0 + tp_frac)
         elif fixed_tp is not None:
-            tp_price = current_price * (1.0 + float(fixed_tp))
+            tp_price = entry_fill * (1.0 + float(fixed_tp))
         elif current_atr > 0:
-            tp_price = current_price + (current_atr * TP_ATR_MULT)
+            tp_price = entry_fill + (current_atr * TP_ATR_MULT)
         else:
             tp_price = None
 
         pos = OpenPosition(
             symbol=symbol,
             entry_time=pd.Timestamp(ts),
-            entry_price=current_price,
+            entry_price=entry_fill,
             position_size=position_size,
             sl_price=sl_price,
             tp_price=tp_price,
-            peak_price=current_price,
+            peak_price=entry_fill,
             current_stop=sl_price,
             ml_confidence=direction_prob,
             regime_prob=regime_prob,
@@ -400,9 +414,9 @@ def _run_simulation_loop(
         state.balance -= commission_open
         state.total_pnl -= commission_open
 
-    # Close any remaining positions at last price
+    # Close any remaining positions at last price (market close + spread)
     for sym, pos in list(state.open_positions.items()):
-        exit_p = float(closes[-1])
+        exit_p = float(closes[-1]) * (1.0 - spread_frac)
         pnl_pct = (exit_p - pos.entry_price) / pos.entry_price
         pnl_usd = pnl_pct * pos.position_size
         state.total_pnl += pnl_usd
