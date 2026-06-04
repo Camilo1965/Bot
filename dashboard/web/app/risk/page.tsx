@@ -1,6 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { KpiCard } from "@/components/ui/KpiCard";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { SkeletonKpi } from "@/components/ui/Skeleton";
+import { useToast } from "@/components/ui/Toast";
+import { fmtPct, fmtDateTime, pnlColor, TABULAR } from "@/lib/format";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -12,7 +17,6 @@ interface RiskState {
   demoted_symbols: string[];
   reason?: string;
 }
-
 interface KillSwitchEvent {
   ts: string;
   action: "triggered" | "reset";
@@ -25,8 +29,9 @@ export default function RiskPage() {
   const [history, setHistory] = useState<KillSwitchEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [resetLoading, setResetLoading] = useState(false);
-  const [resetMsg, setResetMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const toast = useToast();
 
   useEffect(() => {
     Promise.all([
@@ -45,183 +50,161 @@ export default function RiskPage() {
   }, []);
 
   async function handleReset() {
+    setConfirmOpen(false);
     setResetLoading(true);
-    setResetMsg(null);
     try {
       const r = await fetch(`${API}/api/risk/killswitch/reset`, { method: "POST" });
-      const body = await r.json();
-      setResetMsg(r.ok ? "Kill switch reset successfully." : body?.detail ?? "Reset failed.");
-      if (r.ok) setState((prev) => prev ? { ...prev, kill_switch_active: false } : prev);
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) {
+        toast.push({ type: "success", title: "Kill switch reset" });
+        setState((prev) => (prev ? { ...prev, kill_switch_active: false } : prev));
+      } else {
+        toast.push({ type: "error", title: "Reset failed", body: body?.detail });
+      }
     } catch (e) {
-      setResetMsg(`Error: ${e}`);
+      toast.push({ type: "error", title: "Reset error", body: String(e) });
     } finally {
       setResetLoading(false);
     }
   }
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-[#F3F4F6]">Risk</h1>
+    <div className="space-y-5">
+      <div>
+        <h1 className="text-xl font-semibold text-[#F3F4F6]">Risk</h1>
+        <p className="text-xs text-[#9CA3AF] mt-0.5">Kill switch state, exposure, and demoted symbols.</p>
+      </div>
 
-      {loading && (
-        <div className="text-[#9CA3AF] text-sm py-8 text-center">Loading risk state…</div>
+      {error && <div className="text-[#EF4444] text-sm py-4 text-center">Failed to load: {error}</div>}
+
+      {/* Kill switch hero card */}
+      {loading || !state ? (
+        <SkeletonKpi />
+      ) : (
+        <div
+          className={`rounded-xl border p-5 flex items-center justify-between flex-wrap gap-4 ${
+            state.kill_switch_active
+              ? "bg-[#EF4444]/10 border-[#EF4444]/40"
+              : "bg-[#10B981]/10 border-[#10B981]/40"
+          }`}
+        >
+          <div className="flex items-center gap-4">
+            <div
+              className={`w-12 h-12 rounded-full flex items-center justify-center text-xl font-bold ${
+                state.kill_switch_active ? "bg-[#EF4444]/20 text-[#EF4444]" : "bg-[#10B981]/20 text-[#10B981]"
+              }`}
+            >
+              {state.kill_switch_active ? "!" : "✓"}
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-widest text-[#9CA3AF]">Kill Switch</div>
+              <div className={`text-2xl font-bold font-mono ${TABULAR} ${state.kill_switch_active ? "text-[#EF4444]" : "text-[#10B981]"}`}>
+                {state.kill_switch_active ? "ACTIVE" : "OFF"}
+              </div>
+              {state.kill_switch_active && state.reason && (
+                <div className="text-xs text-[#F3F4F6] mt-1">{state.reason}</div>
+              )}
+            </div>
+          </div>
+          {state.kill_switch_active && (
+            <button
+              onClick={() => setConfirmOpen(true)}
+              disabled={resetLoading}
+              className="px-4 py-2 rounded bg-[#3B82F6] text-white text-sm font-medium hover:bg-[#2563EB] disabled:opacity-50 transition-colors"
+            >
+              {resetLoading ? "Resetting…" : "Reset Kill Switch"}
+            </button>
+          )}
+        </div>
       )}
-      {error && (
-        <div className="text-[#EF4444] text-sm py-4 text-center">Failed to load: {error}</div>
+
+      {/* Risk metrics */}
+      {loading || !state ? (
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {Array.from({ length: 3 }).map((_, i) => <SkeletonKpi key={i} />)}
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <KpiCard
+            label="Consecutive Losses"
+            value={String(state.consecutive_losses)}
+            valueClass={state.consecutive_losses >= 3 ? "text-[#EF4444]" : "text-[#F3F4F6]"}
+            hint="Kill switch triggers at MAX_CONSECUTIVE_LOSSES"
+          />
+          <KpiCard
+            label="Daily PnL"
+            value={fmtPct(state.daily_pnl_pct)}
+            valueClass={pnlColor(state.daily_pnl_pct)}
+            hint="Kill switch triggers at MAX_DAILY_LOSS_PCT"
+          />
+          <KpiCard
+            label="Drawdown 7d"
+            value={`-${state.drawdown_7d_pct.toFixed(2)}%`}
+            valueClass="text-[#EF4444]"
+            hint="Kill switch triggers at MAX_DRAWDOWN_7D_PCT"
+          />
+        </div>
       )}
 
-      {!loading && !error && state && (
-        <>
-          {/* Kill switch status */}
-          <div
-            className={`rounded-lg border p-4 ${
-              state.kill_switch_active
-                ? "bg-[#EF4444]/10 border-[#EF4444]"
-                : "bg-[#10B981]/10 border-[#10B981]"
-            }`}
-          >
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-xs uppercase tracking-widest text-[#9CA3AF] mb-1">
-                  Kill Switch
-                </div>
-                <div
-                  className={`text-2xl font-bold font-mono ${
-                    state.kill_switch_active ? "text-[#EF4444]" : "text-[#10B981]"
-                  }`}
-                >
-                  {state.kill_switch_active ? "ACTIVE" : "OFF"}
-                </div>
-                {state.kill_switch_active && state.reason && (
-                  <div className="text-sm text-[#9CA3AF] mt-1">Reason: {state.reason}</div>
-                )}
-              </div>
-              <div className="flex flex-col gap-2 items-end">
-                <div className="relative group">
-                  <button
-                    disabled
-                    className="px-3 py-1.5 rounded bg-[#374151] text-[#9CA3AF] text-sm cursor-not-allowed"
-                  >
-                    Trigger Kill Switch
-                  </button>
-                  <div className="absolute right-0 top-full mt-1 hidden group-hover:block bg-[#374151] text-[#9CA3AF] text-xs rounded px-2 py-1 whitespace-nowrap z-10">
-                    Use API directly
-                  </div>
-                </div>
-                <button
-                  onClick={handleReset}
-                  disabled={resetLoading || !state.kill_switch_active}
-                  className="px-3 py-1.5 rounded bg-[#3B82F6] text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-[#2563EB] transition-colors"
-                >
-                  {resetLoading ? "Resetting…" : "Reset"}
-                </button>
-              </div>
-            </div>
-            {resetMsg && (
-              <div className="mt-2 text-sm text-[#F3F4F6] border-t border-[#374151]/50 pt-2">
-                {resetMsg}
-              </div>
-            )}
+      {/* Demoted symbols */}
+      <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
+        <div className="text-[10px] uppercase tracking-widest text-[#9CA3AF] mb-3 font-semibold">Demoted Symbols</div>
+        {!state || state.demoted_symbols.length === 0 ? (
+          <div className="text-[#9CA3AF] text-sm">None — all symbols active.</div>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {state.demoted_symbols.map((sym) => (
+              <span key={sym} className="px-2.5 py-1 rounded bg-[#EF4444]/15 text-[#EF4444] text-xs font-mono font-semibold border border-[#EF4444]/30">
+                {sym}
+              </span>
+            ))}
           </div>
+        )}
+      </div>
 
-          {/* Risk metrics */}
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
-              <div className="text-[11px] text-[#9CA3AF] uppercase tracking-wider mb-1">
-                Consecutive Losses
-              </div>
-              <div
-                className={`font-mono text-xl font-bold ${
-                  state.consecutive_losses >= 3 ? "text-[#EF4444]" : "text-[#F3F4F6]"
-                }`}
-              >
-                {state.consecutive_losses}
-              </div>
-            </div>
-            <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
-              <div className="text-[11px] text-[#9CA3AF] uppercase tracking-wider mb-1">
-                Daily PnL
-              </div>
-              <div
-                className={`font-mono text-xl font-bold ${
-                  state.daily_pnl_pct >= 0 ? "text-[#10B981]" : "text-[#EF4444]"
-                }`}
-              >
-                {state.daily_pnl_pct >= 0 ? "+" : ""}
-                {state.daily_pnl_pct.toFixed(2)}%
-              </div>
-            </div>
-            <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
-              <div className="text-[11px] text-[#9CA3AF] uppercase tracking-wider mb-1">
-                Drawdown 7d
-              </div>
-              <div className="font-mono text-xl font-bold text-[#EF4444]">
-                -{state.drawdown_7d_pct.toFixed(2)}%
-              </div>
-            </div>
-          </div>
+      {/* History */}
+      <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
+        <div className="text-[10px] uppercase tracking-widest text-[#9CA3AF] mb-3 font-semibold">Kill Switch History</div>
+        {history.length === 0 ? (
+          <EmptyState icon="≣" title="No kill switch events" body="Triggers and resets will appear here." />
+        ) : (
+          <ul className="space-y-2">
+            {history.map((ev, i) => (
+              <li key={i} className="flex items-start gap-3 text-sm border-b border-[#374151]/40 pb-2 last:border-0">
+                <span className={`mt-0.5 px-2 py-0.5 rounded text-[10px] font-semibold shrink-0 ${
+                  ev.action === "triggered" ? "bg-[#EF4444]/15 text-[#EF4444]" : "bg-[#10B981]/15 text-[#10B981]"
+                }`}>
+                  {ev.action.toUpperCase()}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className={`font-mono ${TABULAR} text-[#9CA3AF] text-xs`}>{fmtDateTime(ev.ts)}</div>
+                  {ev.reason && <div className="text-[#F3F4F6] text-xs mt-0.5">{ev.reason}</div>}
+                  {ev.triggered_by && <div className="text-[#6B7280] text-[10px] mt-0.5">via {ev.triggered_by}</div>}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
 
-          {/* Demoted symbols */}
-          <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
-            <div className="text-xs uppercase tracking-widest text-[#9CA3AF] mb-3">
-              Demoted Symbols
+      {/* Confirm dialog */}
+      {confirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setConfirmOpen(false)}>
+          <div className="bg-[#10151D] border border-[#EF4444]/40 rounded-xl shadow-2xl p-5 w-full max-w-sm mx-4" onClick={(e) => e.stopPropagation()}>
+            <div className="text-[#F3F4F6] font-semibold mb-2">Reset Kill Switch?</div>
+            <div className="text-xs text-[#9CA3AF] mb-4">
+              This re-enables new entries. Make sure you've reviewed the trigger reason before resetting.
             </div>
-            {state.demoted_symbols.length === 0 ? (
-              <div className="text-[#9CA3AF] text-sm">None — all symbols active.</div>
-            ) : (
-              <div className="flex flex-wrap gap-2">
-                {state.demoted_symbols.map((sym) => (
-                  <span
-                    key={sym}
-                    className="px-2 py-1 rounded bg-[#EF4444]/20 text-[#EF4444] text-xs font-mono font-semibold"
-                  >
-                    {sym}
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Kill switch history */}
-          <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
-            <div className="text-xs uppercase tracking-widest text-[#9CA3AF] mb-3">
-              Kill Switch History
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => setConfirmOpen(false)} className="px-3 py-1.5 rounded border border-[#374151] text-[#9CA3AF] text-xs hover:text-[#F3F4F6]">
+                Cancel
+              </button>
+              <button onClick={handleReset} className="px-3 py-1.5 rounded bg-[#EF4444] text-white text-xs font-medium hover:bg-[#DC2626]">
+                Yes, reset
+              </button>
             </div>
-            {history.length === 0 ? (
-              <div className="text-[#9CA3AF] text-sm">No history recorded.</div>
-            ) : (
-              <ul className="space-y-2">
-                {history.map((ev, i) => (
-                  <li
-                    key={i}
-                    className="flex items-start gap-3 text-sm border-b border-[#374151]/40 pb-2"
-                  >
-                    <span
-                      className={`mt-0.5 px-2 py-0.5 rounded text-[11px] font-semibold shrink-0 ${
-                        ev.action === "triggered"
-                          ? "bg-[#EF4444]/20 text-[#EF4444]"
-                          : "bg-[#10B981]/20 text-[#10B981]"
-                      }`}
-                    >
-                      {ev.action.toUpperCase()}
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <span className="font-mono text-[#9CA3AF] text-xs">
-                        {new Date(ev.ts).toLocaleString()}
-                      </span>
-                      {ev.reason && (
-                        <span className="ml-2 text-[#F3F4F6] text-xs">{ev.reason}</span>
-                      )}
-                      {ev.triggered_by && (
-                        <span className="ml-2 text-[#9CA3AF] text-xs">({ev.triggered_by})</span>
-                      )}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
           </div>
-        </>
+        </div>
       )}
     </div>
   );

@@ -276,10 +276,12 @@ export default function SettingsPage() {
   const [tab, setTab] = useState<Tab>("symbols");
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-[#F3F4F6]">Settings</h1>
+    <div className="space-y-5">
+      <div>
+        <h1 className="text-xl font-semibold text-[#F3F4F6]">Settings</h1>
+        <p className="text-xs text-[#9CA3AF] mt-0.5">Symbol configs, risk params, notifications, and API keys.</p>
+      </div>
 
-      {/* Tab bar */}
       <div className="flex gap-1 border-b border-[#374151] overflow-x-auto">
         {TABS.map((t) => (
           <button
