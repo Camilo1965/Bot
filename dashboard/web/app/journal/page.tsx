@@ -1,6 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { SortableTable, Column } from "@/components/ui/SortableTable";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { Skeleton, SkeletonTable } from "@/components/ui/Skeleton";
+import { fmtMoney, fmtPct, fmtDateTime, pnlColor, TABULAR } from "@/lib/format";
+import { useToast } from "@/components/ui/Toast";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -23,27 +28,17 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "notes", label: "Notes" },
 ];
 
-function PnlCell({ usd, pct }: { usd: number; pct: number }) {
-  const color = usd >= 0 ? "text-[#10B981]" : "text-[#EF4444]";
-  return (
-    <span className={`font-mono ${color}`}>
-      {usd >= 0 ? "+" : ""}
-      {usd.toFixed(2)}
-      <span className="text-[10px] ml-1 opacity-70">
-        ({pct >= 0 ? "+" : ""}
-        {pct.toFixed(2)}%)
-      </span>
-    </span>
-  );
-}
-
 function TradesTab() {
   const [trades, setTrades] = useState<JournalTrade[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [symbolFilter, setSymbolFilter] = useState<string>("all");
+  const [sideFilter, setSideFilter] = useState<"all" | "long" | "short">("all");
+  const [winFilter, setWinFilter] = useState<"all" | "win" | "loss">("all");
+  const toast = useToast();
 
   useEffect(() => {
-    fetch(`${API}/api/journal/trades`)
+    fetch(`${API}/api/journal/trades?limit=500`)
       .then((r) => r.json())
       .then((data) => {
         setTrades(Array.isArray(data) ? data : []);
@@ -55,92 +50,204 @@ function TradesTab() {
       });
   }, []);
 
-  if (loading) return <div className="text-[#9CA3AF] text-sm text-center py-8">Loading trades…</div>;
+  const symbols = useMemo(() => {
+    const s = new Set(trades.map((t) => t.symbol));
+    return ["all", ...Array.from(s).sort()];
+  }, [trades]);
+
+  const filtered = useMemo(() => {
+    return trades.filter((t) => {
+      if (symbolFilter !== "all" && t.symbol !== symbolFilter) return false;
+      if (sideFilter !== "all" && t.side !== sideFilter) return false;
+      if (winFilter === "win" && !(t.pnl_usd > 0)) return false;
+      if (winFilter === "loss" && !(t.pnl_usd < 0)) return false;
+      return true;
+    });
+  }, [trades, symbolFilter, sideFilter, winFilter]);
+
+  const stats = useMemo(() => {
+    const n = filtered.length;
+    const wins = filtered.filter((t) => t.pnl_usd > 0).length;
+    const losses = filtered.filter((t) => t.pnl_usd < 0).length;
+    const totalPnl = filtered.reduce((acc, t) => acc + t.pnl_usd, 0);
+    const wr = n > 0 ? (wins / n) * 100 : 0;
+    return { n, wins, losses, totalPnl, wr };
+  }, [filtered]);
+
+  async function exportCsv() {
+    try {
+      const res = await fetch(`${API}/api/journal/trades/csv?limit=5000`);
+      const text = await res.text();
+      const blob = new Blob([text], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `clawdbot-journal-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.push({ type: "success", title: "Journal exported." });
+    } catch {
+      toast.push({ type: "error", title: "Export failed." });
+    }
+  }
+
+  if (loading) return <SkeletonTable rows={6} cols={6} />;
   if (error) return <div className="text-[#EF4444] text-sm text-center py-4">Failed to load: {error}</div>;
-  if (trades.length === 0) return <div className="text-[#9CA3AF] text-sm text-center py-8">No trades recorded yet.</div>;
+
+  const columns: Column<JournalTrade>[] = [
+    {
+      key: "timestamp_close", label: "Closed At", sortable: true,
+      render: (t) => <span className={`font-mono ${TABULAR} text-[#9CA3AF] text-xs whitespace-nowrap`}>{fmtDateTime(t.timestamp_close)}</span>,
+    },
+    {
+      key: "symbol", label: "Symbol", sortable: true,
+      render: (t) => <span className="font-mono text-[#F3F4F6]">{t.symbol}</span>,
+    },
+    {
+      key: "side", label: "Side", sortable: true,
+      render: (t) => (
+        <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${t.side === "long" ? "bg-[#10B981]/15 text-[#10B981]" : "bg-[#EF4444]/15 text-[#EF4444]"}`}>
+          {t.side.toUpperCase()}
+        </span>
+      ),
+    },
+    {
+      key: "pnl_usd", label: "PnL", align: "right", sortable: true, sortBy: (t) => t.pnl_usd,
+      render: (t) => (
+        <div className="flex flex-col items-end leading-tight">
+          <span className={`font-mono ${TABULAR} ${pnlColor(t.pnl_usd)}`}>{fmtMoney(t.pnl_usd)}</span>
+          <span className={`font-mono ${TABULAR} text-[10px] ${pnlColor(t.pnl_pct)} opacity-80`}>{fmtPct(t.pnl_pct)}</span>
+        </div>
+      ),
+    },
+    {
+      key: "close_reason", label: "Reason",
+      render: (t) => <span className="text-[10px] text-[#9CA3AF] uppercase tracking-wide">{t.close_reason || "—"}</span>,
+    },
+    {
+      key: "ml_confidence", label: "ML Conf", align: "right", sortable: true,
+      render: (t) => <span className={`font-mono ${TABULAR} text-[#F3F4F6]`}>{(t.ml_confidence * 100).toFixed(1)}%</span>,
+    },
+  ];
 
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm text-left">
-        <thead>
-          <tr className="text-[10px] uppercase tracking-widest text-[#9CA3AF] border-b border-[#374151]">
-            {["Closed At", "Symbol", "Side", "PnL", "Close Reason", "ML Conf"].map((h) => (
-              <th key={h} className="pb-2 pr-4 font-medium">
-                {h}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {trades.map((t) => (
-            <tr
-              key={t.id}
-              className="border-b border-[#374151]/40 hover:bg-white/5 transition-colors"
-            >
-              <td className="py-2 pr-4 font-mono text-[#9CA3AF] text-xs whitespace-nowrap">
-                {new Date(t.timestamp_close).toLocaleString()}
-              </td>
-              <td className="py-2 pr-4 font-mono text-[#F3F4F6]">{t.symbol}</td>
-              <td className="py-2 pr-4">
-                <span
-                  className={`px-2 py-0.5 rounded text-[11px] font-semibold ${
-                    t.side === "long"
-                      ? "bg-[#10B981]/20 text-[#10B981]"
-                      : "bg-[#EF4444]/20 text-[#EF4444]"
-                  }`}
-                >
-                  {t.side.toUpperCase()}
-                </span>
-              </td>
-              <td className="py-2 pr-4">
-                <PnlCell usd={t.pnl_usd} pct={t.pnl_pct} />
-              </td>
-              <td className="py-2 pr-4 text-[#9CA3AF] text-xs">{t.close_reason}</td>
-              <td className="py-2 pr-4 font-mono text-[#F3F4F6]">
-                {(t.ml_confidence * 100).toFixed(1)}%
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="space-y-4">
+      {/* Filter strip + stats */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <select
+            value={symbolFilter}
+            onChange={(e) => setSymbolFilter(e.target.value)}
+            className="bg-[#0a0e15] border border-[#374151] rounded px-2 py-1 text-xs text-[#F3F4F6] font-mono focus:outline-none focus:border-[#3B82F6]"
+          >
+            {symbols.map((s) => <option key={s} value={s}>{s === "all" ? "All symbols" : s}</option>)}
+          </select>
+          <select
+            value={sideFilter}
+            onChange={(e) => setSideFilter(e.target.value as any)}
+            className="bg-[#0a0e15] border border-[#374151] rounded px-2 py-1 text-xs text-[#F3F4F6] focus:outline-none focus:border-[#3B82F6]"
+          >
+            <option value="all">Both sides</option>
+            <option value="long">Long</option>
+            <option value="short">Short</option>
+          </select>
+          <select
+            value={winFilter}
+            onChange={(e) => setWinFilter(e.target.value as any)}
+            className="bg-[#0a0e15] border border-[#374151] rounded px-2 py-1 text-xs text-[#F3F4F6] focus:outline-none focus:border-[#3B82F6]"
+          >
+            <option value="all">Wins & losses</option>
+            <option value="win">Wins only</option>
+            <option value="loss">Losses only</option>
+          </select>
+        </div>
+        <button
+          onClick={exportCsv}
+          className="px-3 py-1 rounded border border-[#374151] bg-[#0a0e15] text-[#9CA3AF] text-xs hover:text-[#F3F4F6] hover:border-[#4B5563] transition-colors"
+        >
+          ↓ Export CSV
+        </button>
+      </div>
+
+      {/* Stat row */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <Stat label="Trades" value={String(stats.n)} />
+        <Stat label="Win Rate" value={`${stats.wr.toFixed(1)}%`} valueClass={stats.wr >= 50 ? "text-[#10B981]" : "text-[#EF4444]"} />
+        <Stat label="Wins · Losses" value={`${stats.wins} · ${stats.losses}`} />
+        <Stat label="Net PnL" value={fmtMoney(stats.totalPnl)} valueClass={pnlColor(stats.totalPnl)} />
+      </div>
+
+      {filtered.length === 0 ? (
+        <EmptyState icon="≣" title="No trades match filters" body="Adjust the filters above or wait for new trades to close." />
+      ) : (
+        <SortableTable
+          rows={filtered}
+          columns={columns}
+          rowKey={(t, i) => t.id || String(i)}
+          initialSort={{ col: "timestamp_close", dir: "desc" }}
+          compact
+        />
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value, valueClass = "text-[#F3F4F6]" }: { label: string; value: string; valueClass?: string }) {
+  return (
+    <div className="bg-[#0a0e15] border border-[#374151] rounded p-2.5">
+      <div className="text-[10px] uppercase tracking-widest text-[#9CA3AF] mb-1">{label}</div>
+      <div className={`font-mono ${TABULAR} text-sm ${valueClass}`}>{value}</div>
     </div>
   );
 }
 
 function VibeTab() {
   return (
-    <div className="space-y-4">
-      <div className="bg-[#374151]/30 border border-[#374151] rounded-lg p-5 text-sm text-[#9CA3AF]">
-        <div className="font-semibold text-[#F3F4F6] mb-2">VIBE Insights not generated yet</div>
-        <p>Run the VIBE journal analyzer to generate behavioral insights from your trade history:</p>
-        <pre className="mt-3 bg-[#0a0e15] border border-[#374151] rounded px-3 py-2 text-xs font-mono text-[#10B981] overflow-x-auto">
-          python vibe/journal_analyzer.py
-        </pre>
-        <p className="mt-3 text-xs text-[#9CA3AF]">
-          Results will be stored in the database and displayed here automatically on next page load.
-        </p>
-      </div>
-    </div>
+    <EmptyState
+      icon="∿"
+      title="VIBE Insights not generated"
+      body="Run python vibe/journal_analyzer.py to generate behavioral analysis. Results will appear here automatically."
+    />
   );
 }
 
 function NotesTab() {
   const [notes, setNotes] = useState("");
 
+  useEffect(() => {
+    const saved = typeof window !== "undefined" ? localStorage.getItem("clawdbot:journal:notes") : null;
+    if (saved) setNotes(saved);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const t = setTimeout(() => localStorage.setItem("clawdbot:journal:notes", notes), 300);
+      return () => clearTimeout(t);
+    }
+  }, [notes]);
+
   return (
     <div className="space-y-3">
-      <div className="text-xs text-[#9CA3AF]">
-        Local scratch pad — not persisted to the server yet.
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-[#9CA3AF]">Local scratch pad — autosaved to browser.</span>
+        <button
+          onClick={() => setNotes("")}
+          className="text-[10px] text-[#9CA3AF] hover:text-[#F3F4F6]"
+        >
+          Clear
+        </button>
       </div>
       <textarea
         value={notes}
         onChange={(e) => setNotes(e.target.value)}
-        placeholder="Write your trading notes here…"
+        placeholder="Write your trading notes here…&#10;Saved automatically."
         rows={14}
-        className="w-full bg-[#10151D] border border-[#374151] rounded-lg px-4 py-3 text-sm text-[#F3F4F6] font-mono focus:outline-none focus:border-[#3B82F6] resize-y"
+        className="w-full bg-[#0a0e15] border border-[#374151] rounded-lg px-4 py-3 text-sm text-[#F3F4F6] font-mono focus:outline-none focus:border-[#3B82F6] resize-y"
       />
-      <div className="text-[10px] text-[#9CA3AF]">
-        {notes.length} characters — persistence coming in a future release.
+      <div className="text-[10px] text-[#9CA3AF] font-mono">
+        {notes.length} chars · {notes.split(/\s+/).filter(Boolean).length} words
       </div>
     </div>
   );
@@ -150,10 +257,12 @@ export default function JournalPage() {
   const [tab, setTab] = useState<Tab>("trades");
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-[#F3F4F6]">Journal</h1>
+    <div className="space-y-5">
+      <div>
+        <h1 className="text-xl font-semibold text-[#F3F4F6]">Journal</h1>
+        <p className="text-xs text-[#9CA3AF] mt-0.5">Closed trades, VIBE behavioral insights, and notes.</p>
+      </div>
 
-      {/* Tab bar */}
       <div className="flex gap-1 border-b border-[#374151]">
         {TABS.map((t) => (
           <button

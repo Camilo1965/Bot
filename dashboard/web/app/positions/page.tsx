@@ -1,6 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { SortableTable, Column } from "@/components/ui/SortableTable";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { Skeleton } from "@/components/ui/Skeleton";
+import { useToast } from "@/components/ui/Toast";
+import { fmtMoney, fmtPct, fmtTime, pnlColor, TABULAR } from "@/lib/format";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -28,79 +33,54 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "all", label: "All" },
 ];
 
-function PnlCell({ value }: { value: number }) {
-  const color = value >= 0 ? "text-[#10B981]" : "text-[#EF4444]";
-  return (
-    <span className={`font-mono ${color}`}>
-      {value >= 0 ? "+" : ""}
-      {value.toFixed(2)}
-    </span>
-  );
+function SideBadge({ side }: { side: "long" | "short" }) {
+  const c = side === "long" ? "bg-[#10B981]/15 text-[#10B981]" : "bg-[#EF4444]/15 text-[#EF4444]";
+  return <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${c}`}>{side.toUpperCase()}</span>;
 }
 
-function CloseButton({ symbol, isOpen, onClosed }: { symbol: string; isOpen: boolean; onClosed: () => void }) {
+function CloseButton({ symbol, onClosed }: { symbol: string; onClosed: () => void }) {
   const [state, setState] = useState<"idle" | "sent" | "error">("idle");
-  if (!isOpen) return null;
+  const toast = useToast();
   async function handleClose() {
     setState("sent");
     const sym = symbol.replace("/", "_");
     try {
       const res = await fetch(`${API}/api/positions/${sym}/close`, { method: "POST" });
       const data = await res.json();
-      if (data.ok) { onClosed(); } else { setState("error"); }
-    } catch { setState("error"); }
+      if (data.ok) {
+        toast.push({ type: "success", title: `Close queued: ${symbol}`, body: "Signal sent to bot." });
+        onClosed();
+      } else {
+        setState("error");
+        toast.push({ type: "error", title: `Close failed: ${symbol}` });
+      }
+    } catch {
+      setState("error");
+      toast.push({ type: "error", title: `Close failed: ${symbol}` });
+    }
   }
   return (
-    <button onClick={handleClose} disabled={state === "sent"}
-      className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors ${state === "sent" ? "bg-[#F59E0B]/20 text-[#F59E0B]" : state === "error" ? "bg-[#EF4444]/20 text-[#EF4444]" : "bg-[#374151] text-[#9CA3AF] hover:bg-[#EF4444]/20 hover:text-[#EF4444]"}`}>
-      {state === "sent" ? "Queued" : state === "error" ? "Err" : "Close"}
+    <button
+      onClick={handleClose}
+      disabled={state === "sent"}
+      className={`px-2 py-0.5 rounded text-[10px] font-semibold transition-colors ${
+        state === "sent"
+          ? "bg-[#F59E0B]/15 text-[#F59E0B]"
+          : state === "error"
+          ? "bg-[#EF4444]/15 text-[#EF4444]"
+          : "bg-[#374151] text-[#9CA3AF] hover:bg-[#EF4444]/15 hover:text-[#EF4444]"
+      }`}
+    >
+      {state === "sent" ? "QUEUED" : state === "error" ? "ERR" : "CLOSE"}
     </button>
   );
 }
 
-function PositionTable({ rows, isOpen = false, onRefresh }: { rows: Position[]; isOpen?: boolean; onRefresh?: () => void }) {
-  if (rows.length === 0) {
-    return (
-      <div className="text-center text-[#9CA3AF] py-10 text-sm">No positions found.</div>
-    );
-  }
+function PnlCell({ usd, pct }: { usd: number; pct: number }) {
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm text-left">
-        <thead>
-          <tr className="text-[10px] uppercase tracking-widest text-[#9CA3AF] border-b border-[#374151]">
-            {["Symbol", "Side", "Entry", "Current", "SL", "TP", "Size", "PnL", ...(isOpen ? [""] : [])].map((h, i) => (
-              <th key={i} className="pb-2 pr-4 font-medium">{h}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((p) => (
-            <tr key={p.id} className="border-b border-[#374151]/40 hover:bg-white/5 transition-colors">
-              <td className="py-2 pr-4 font-mono text-[#F3F4F6]">{p.symbol}</td>
-              <td className="py-2 pr-4">
-                <span className={`px-2 py-0.5 rounded text-[11px] font-semibold ${p.side === "long" ? "bg-[#10B981]/20 text-[#10B981]" : "bg-[#EF4444]/20 text-[#EF4444]"}`}>
-                  {p.side.toUpperCase()}
-                </span>
-              </td>
-              <td className="py-2 pr-4 font-mono text-[#F3F4F6]">{p.entry_price.toFixed(4)}</td>
-              <td className="py-2 pr-4 font-mono text-[#F3F4F6]">{p.current_price.toFixed(4)}</td>
-              <td className="py-2 pr-4 font-mono text-[#9CA3AF]">{p.sl_price.toFixed(4)}</td>
-              <td className="py-2 pr-4 font-mono text-[#9CA3AF]">{p.tp_price.toFixed(4)}</td>
-              <td className="py-2 pr-4 font-mono text-[#F3F4F6]">{p.size.toFixed(4)}</td>
-              <td className="py-2 pr-4">
-                <PnlCell value={p.pnl_usd} />
-                <span className="text-[#9CA3AF] text-[11px] ml-1">(<PnlCell value={p.pnl_pct} />%)</span>
-              </td>
-              {isOpen && (
-                <td className="py-2 pr-2">
-                  <CloseButton symbol={p.symbol} isOpen={isOpen} onClosed={() => onRefresh?.()} />
-                </td>
-              )}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="flex flex-col items-end leading-tight">
+      <span className={`font-mono ${TABULAR} ${pnlColor(usd)}`}>{fmtMoney(usd)}</span>
+      <span className={`text-[10px] font-mono ${TABULAR} ${pnlColor(pct)} opacity-80`}>{fmtPct(pct)}</span>
     </div>
   );
 }
@@ -113,44 +93,104 @@ export default function PositionsPage() {
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
-  function refresh() { setRefreshKey((k) => k + 1); }
+  const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
 
   useEffect(() => {
     setLoading(true);
     setError(null);
-    const endpoints: Record<Tab, string> = {
-      open: `${API}/api/positions/open`,
-      closed: `${API}/api/positions/history`,
-      all: `${API}/api/positions/open`,
-    };
-
-    const fetches =
+    const fetchOpen = () => fetch(`${API}/api/positions/open`).then((r) => r.json());
+    const fetchClosed = () => fetch(`${API}/api/positions/history`).then((r) => r.json());
+    const job =
       tab === "all"
-        ? Promise.all([
-            fetch(`${API}/api/positions/open`).then((r) => r.json()),
-            fetch(`${API}/api/positions/history`).then((r) => r.json()),
-          ]).then(([o, c]) => {
+        ? Promise.all([fetchOpen(), fetchClosed()]).then(([o, c]) => {
             setOpenRows(Array.isArray(o) ? o : []);
             setClosedRows(Array.isArray(c) ? c : []);
           })
-        : fetch(endpoints[tab])
-            .then((r) => r.json())
-            .then((data) => {
-              if (tab === "open") setOpenRows(Array.isArray(data) ? data : []);
-              else setClosedRows(Array.isArray(data) ? data : []);
-            });
-
-    fetches.catch((e) => setError(String(e))).finally(() => setLoading(false));
+        : tab === "open"
+        ? fetchOpen().then((o) => setOpenRows(Array.isArray(o) ? o : []))
+        : fetchClosed().then((c) => setClosedRows(Array.isArray(c) ? c : []));
+    job.catch((e) => setError(String(e))).finally(() => setLoading(false));
   }, [tab, refreshKey]);
 
-  const rows =
-    tab === "open" ? openRows : tab === "closed" ? closedRows : [...openRows, ...closedRows];
+  const rows = tab === "open" ? openRows : tab === "closed" ? closedRows : [...openRows, ...closedRows];
+  const isOpenTab = tab === "open";
+
+  const columns: Column<Position>[] = [
+    {
+      key: "symbol", label: "Symbol", sortable: true,
+      render: (r) => <span className="font-mono text-[#F3F4F6]">{r.symbol}</span>,
+    },
+    {
+      key: "side", label: "Side", sortable: true,
+      render: (r) => <SideBadge side={r.side} />,
+    },
+    {
+      key: "entry_price", label: "Entry", align: "right", sortable: true,
+      render: (r) => <span className={`font-mono ${TABULAR} text-[#F3F4F6]`}>{r.entry_price.toFixed(4)}</span>,
+    },
+    {
+      key: "current_price", label: "Current", align: "right", sortable: true,
+      render: (r) => <span className={`font-mono ${TABULAR} text-[#F3F4F6]`}>{r.current_price.toFixed(4)}</span>,
+    },
+    {
+      key: "sl_price", label: "SL", align: "right",
+      render: (r) => <span className={`font-mono ${TABULAR} text-[#EF4444]/70`}>{r.sl_price.toFixed(4)}</span>,
+    },
+    {
+      key: "tp_price", label: "TP", align: "right",
+      render: (r) => <span className={`font-mono ${TABULAR} text-[#10B981]/70`}>{r.tp_price.toFixed(4)}</span>,
+    },
+    {
+      key: "size", label: "Size", align: "right", sortable: true,
+      render: (r) => <span className={`font-mono ${TABULAR} text-[#9CA3AF]`}>{r.size.toFixed(4)}</span>,
+    },
+    {
+      key: "pnl_usd", label: "PnL", align: "right", sortable: true,
+      sortBy: (r) => r.pnl_usd,
+      render: (r) => <PnlCell usd={r.pnl_usd} pct={r.pnl_pct} />,
+    },
+    ...(tab === "closed" || tab === "all"
+      ? [{
+          key: "closed_at" as keyof Position, label: "Closed", sortable: true,
+          render: (r: Position) => <span className={`font-mono ${TABULAR} text-[10px] text-[#9CA3AF]`}>{fmtTime(r.closed_at)}</span>,
+        }]
+      : []),
+    ...(tab === "closed" || tab === "all"
+      ? [{
+          key: "close_reason" as keyof Position, label: "Reason",
+          render: (r: Position) => <span className="text-[10px] text-[#9CA3AF] uppercase tracking-wide">{r.close_reason ?? "—"}</span>,
+        }]
+      : []),
+    ...(isOpenTab
+      ? [{
+          key: "_actions" as keyof Position, label: "", align: "right" as const,
+          render: (r: Position) => <CloseButton symbol={r.symbol} onClosed={refresh} />,
+        }]
+      : []),
+  ];
+
+  const totalPnl = openRows.reduce((acc, p) => acc + p.pnl_usd, 0);
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-[#F3F4F6]">Positions</h1>
+    <div className="space-y-5">
+      {/* Header */}
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <h1 className="text-xl font-semibold text-[#F3F4F6]">Positions</h1>
+          <p className="text-xs text-[#9CA3AF] mt-0.5">
+            {openRows.length} open · unrealized PnL{" "}
+            <span className={`font-mono ${TABULAR} ${pnlColor(totalPnl)}`}>{fmtMoney(totalPnl)}</span>
+          </p>
+        </div>
+        <button
+          onClick={refresh}
+          className="px-3 py-1.5 rounded border border-[#374151] bg-[#0a0e15] text-[#9CA3AF] text-xs hover:text-[#F3F4F6] hover:border-[#4B5563] transition-colors"
+        >
+          ↻ Refresh
+        </button>
+      </div>
 
-      {/* Tab bar */}
+      {/* Tabs */}
       <div className="flex gap-1 border-b border-[#374151]">
         {TABS.map((t) => (
           <button
@@ -163,6 +203,11 @@ export default function PositionsPage() {
             }`}
           >
             {t.label}
+            {t.key === "open" && openRows.length > 0 && (
+              <span className="ml-1.5 px-1.5 py-0.5 text-[9px] font-mono bg-[#374151] text-[#9CA3AF] rounded">
+                {openRows.length}
+              </span>
+            )}
           </button>
         ))}
       </div>
@@ -170,14 +215,31 @@ export default function PositionsPage() {
       {/* Content */}
       <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
         {loading && (
-          <div className="text-[#9CA3AF] text-sm text-center py-8">Loading positions…</div>
-        )}
-        {error && (
-          <div className="text-[#EF4444] text-sm text-center py-4">
-            Failed to load: {error}
+          <div className="space-y-2">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <Skeleton key={i} className="h-8" />
+            ))}
           </div>
         )}
-        {!loading && !error && <PositionTable rows={rows} isOpen={tab === "open"} onRefresh={refresh} />}
+        {error && (
+          <div className="text-[#EF4444] text-sm text-center py-4">Failed to load: {error}</div>
+        )}
+        {!loading && !error && rows.length === 0 && (
+          <EmptyState
+            icon={tab === "open" ? "○" : "≣"}
+            title={tab === "open" ? "No open positions" : "No closed positions yet"}
+            body={tab === "open" ? "Bot will open positions when signals exceed threshold." : "Trade history will appear here once positions close."}
+          />
+        )}
+        {!loading && !error && rows.length > 0 && (
+          <SortableTable
+            rows={rows}
+            columns={columns}
+            rowKey={(r) => r.id}
+            initialSort={isOpenTab ? { col: "pnl_usd", dir: "desc" } : { col: "closed_at", dir: "desc" }}
+            compact
+          />
+        )}
       </div>
     </div>
   );
