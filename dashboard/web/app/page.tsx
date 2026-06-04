@@ -8,6 +8,7 @@ import { RecentSignalsTable } from "@/components/RecentSignalsTable";
 import { SymbolHealthStrip } from "@/components/SymbolHealthStrip";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { useWebSocket } from "@/hooks/useWebSocket";
+import { useRefreshKey } from "@/hooks/useRefreshKey";
 import { fmtMoney, fmtPct, fmtTimeAgo, pnlColor, TABULAR } from "@/lib/format";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -28,10 +29,12 @@ export default function OverviewPage() {
   const [state, setState] = useState<BotState | null>(null);
   const [equityHistory, setEquityHistory] = useState<EquityPoint[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [refreshKey] = useRefreshKey();
 
   const { lastMessage } = useWebSocket(`${API.replace("http", "ws")}/ws/stream`);
 
   useEffect(() => {
+    setLoaded(false);
     Promise.all([
       fetch(`${API}/api/state`).then((r) => r.json()),
       fetch(`${API}/api/equity?days=30`).then((r) => r.json()),
@@ -41,7 +44,7 @@ export default function OverviewPage() {
         setEquityHistory(Array.isArray(eq) ? eq : []);
       })
       .finally(() => setLoaded(true));
-  }, []);
+  }, [refreshKey]);
 
   useEffect(() => {
     if (!lastMessage) return;
@@ -85,12 +88,16 @@ export default function OverviewPage() {
         <KpiCard
           label="Balance"
           value={fmtMoney(state?.balance ?? null)}
+          numericValue={state?.balance ?? null}
+          numericFormat={(n) => fmtMoney(n)}
           loading={!loaded}
           hint="Cash + open margin"
         />
         <KpiCard
           label="Equity"
           value={fmtMoney(state?.equity ?? null)}
+          numericValue={state?.equity ?? null}
+          numericFormat={(n) => fmtMoney(n)}
           loading={!loaded}
           delta={periodDelta}
           deltaLabel="30d"
@@ -100,12 +107,16 @@ export default function OverviewPage() {
         <KpiCard
           label="Daily PnL"
           value={fmtPct(state?.daily_pnl_pct ?? null)}
+          numericValue={state?.daily_pnl_pct ?? null}
+          numericFormat={(n) => fmtPct(n)}
           valueClass={pnlColor(state?.daily_pnl_pct ?? 0)}
           loading={!loaded}
         />
         <KpiCard
           label="Open Positions"
           value={String(state?.open_positions_count ?? 0)}
+          numericValue={state?.open_positions_count ?? null}
+          numericFormat={(n) => String(Math.round(n))}
           loading={!loaded}
           hint="Concurrent live positions"
         />

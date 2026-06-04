@@ -6,6 +6,8 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { Skeleton, SkeletonTable } from "@/components/ui/Skeleton";
 import { fmtMoney, fmtPct, fmtDateTime, pnlColor, TABULAR } from "@/lib/format";
 import { useToast } from "@/components/ui/Toast";
+import { useLocalStorage } from "@/hooks/useLocalStorage";
+import { useRefreshKey } from "@/hooks/useRefreshKey";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -32,12 +34,14 @@ function TradesTab() {
   const [trades, setTrades] = useState<JournalTrade[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [symbolFilter, setSymbolFilter] = useState<string>("all");
-  const [sideFilter, setSideFilter] = useState<"all" | "long" | "short">("all");
-  const [winFilter, setWinFilter] = useState<"all" | "win" | "loss">("all");
+  const [symbolFilter, setSymbolFilter] = useLocalStorage<string>("clawdbot:journal:symbol", "all");
+  const [sideFilter, setSideFilter] = useLocalStorage<"all" | "long" | "short">("clawdbot:journal:side", "all");
+  const [winFilter, setWinFilter] = useLocalStorage<"all" | "win" | "loss">("clawdbot:journal:win", "all");
+  const [refreshKey] = useRefreshKey();
   const toast = useToast();
 
   useEffect(() => {
+    setLoading(true);
     fetch(`${API}/api/journal/trades?limit=500`)
       .then((r) => r.json())
       .then((data) => {
@@ -48,7 +52,7 @@ function TradesTab() {
         setError(String(e));
         setLoading(false);
       });
-  }, []);
+  }, [refreshKey]);
 
   const symbols = useMemo(() => {
     const s = new Set(trades.map((t) => t.symbol));
@@ -254,7 +258,7 @@ function NotesTab() {
 }
 
 export default function JournalPage() {
-  const [tab, setTab] = useState<Tab>("trades");
+  const [tab, setTab] = useLocalStorage<Tab>("clawdbot:journal:tab", "trades");
 
   return (
     <div className="space-y-5">

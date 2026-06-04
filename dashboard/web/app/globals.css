@@ -32,3 +32,71 @@ body {
 
 /* Tabular numbers for prices/PnL */
 .tabular { font-variant-numeric: tabular-nums; }
+
+/* Page transition fade */
+.page-fade {
+  animation: pageFade 200ms ease-out both;
+}
+@keyframes pageFade {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Focus rings — accessibility */
+*:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
+  outline-color: var(--accent-blue);
+}
+
+/* Reduced motion respect */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Print stylesheet — clean tables/text for PDF capture */
+@media print {
+  body { background: white !important; color: black !important; }
+  aside, header, button, .no-print { display: none !important; }
+  main { padding: 0 !important; overflow: visible !important; }
+  .bg-\[\#10151D\], .bg-\[\#0a0e15\] { background: white !important; }
+  .text-\[\#F3F4F6\] { color: black !important; }
+  .text-\[\#9CA3AF\] { color: #555 !important; }
+  .border-\[\#374151\] { border-color: #ccc !important; }
+}
+
+/* Smooth scroll */
+html { scroll-behavior: smooth; }
+
+/* Selection */
+::selection {
+  background-color: var(--accent-blue);
+  color: white;
+}
+
+/* Number transitions */
+@keyframes numberPulse {
+  0%   { opacity: 0.4; transform: scale(1); }
+  50%  { opacity: 1;   transform: scale(1.02); }
+  100% { opacity: 1;   transform: scale(1); }
+}
+.number-pulse { animation: numberPulse 300ms ease-out; }
+
+/* Skeleton shimmer */
+@keyframes shimmer {
+  0%   { background-position: -200px 0; }
+  100% { background-position: calc(200px + 100%) 0; }
+}
+.animate-pulse {
+  background: linear-gradient(90deg, #1E2530 0%, #2A3140 50%, #1E2530 100%);
+  background-size: 200px 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}

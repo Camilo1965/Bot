@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { KpiCard } from "@/components/ui/KpiCard";
+import { useLocalStorage } from "@/hooks/useLocalStorage";
+import { useRefreshKey } from "@/hooks/useRefreshKey";
 import { SortableTable, Column } from "@/components/ui/SortableTable";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { SkeletonKpi, SkeletonTable } from "@/components/ui/Skeleton";
@@ -181,7 +183,8 @@ export default function PerformancePage() {
   const [sharpe, setSharpe]     = useState<SharpePt[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [range, setRange] = useState<"7d" | "30d" | "90d">("30d");
+  const [range, setRange] = useLocalStorage<"7d" | "30d" | "90d">("clawdbot:perf:range", "30d");
+  const [refreshKey] = useRefreshKey();
 
   useEffect(() => {
     setLoading(true);
@@ -202,7 +205,7 @@ export default function PerformancePage() {
         setLoading(false);
       })
       .catch((e) => { setError(String(e)); setLoading(false); });
-  }, [range]);
+  }, [range, refreshKey]);
 
   const s = data?.summary;
 

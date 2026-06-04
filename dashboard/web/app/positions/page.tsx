@@ -5,6 +5,8 @@ import { SortableTable, Column } from "@/components/ui/SortableTable";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { useToast } from "@/components/ui/Toast";
+import { useLocalStorage } from "@/hooks/useLocalStorage";
+import { useRefreshKey } from "@/hooks/useRefreshKey";
 import { fmtMoney, fmtPct, fmtTime, pnlColor, TABULAR } from "@/lib/format";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -86,14 +88,12 @@ function PnlCell({ usd, pct }: { usd: number; pct: number }) {
 }
 
 export default function PositionsPage() {
-  const [tab, setTab] = useState<Tab>("open");
+  const [tab, setTab] = useLocalStorage<Tab>("clawdbot:positions:tab", "open");
   const [openRows, setOpenRows] = useState<Position[]>([]);
   const [closedRows, setClosedRows] = useState<Position[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
-
-  const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
+  const [refreshKey, refresh] = useRefreshKey();
 
   useEffect(() => {
     setLoading(true);

@@ -79,5 +79,8 @@ export const SHORTCUT_HELP = [
   { keys: "g j", label: "Journal" },
   { keys: "g ,", label: "Settings" },
   { keys: "g a", label: "Alerts" },
+  { keys: "⌘ K", label: "Command palette" },
+  { keys: "/",   label: "Focus search / palette" },
+  { keys: "r",   label: "Refresh current page" },
   { keys: "?",   label: "Show this help" },
 ];
