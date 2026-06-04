@@ -5,6 +5,7 @@ import { KpiCard } from "@/components/ui/KpiCard";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { SkeletonKpi } from "@/components/ui/Skeleton";
 import { useToast } from "@/components/ui/Toast";
+import { useWsEvent } from "@/hooks/WsProvider";
 import { fmtPct, fmtDateTime, pnlColor, TABULAR } from "@/lib/format";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -48,6 +49,16 @@ export default function RiskPage() {
         setLoading(false);
       });
   }, []);
+
+  // Push: kill switch state changes
+  useWsEvent("kill_switch.changed", (msg) => {
+    setState((prev) => prev ? { ...prev, kill_switch_active: msg.active, reason: msg.reason } : prev);
+    setHistory((prev) => [{
+      ts: msg.ts,
+      action: msg.active ? "triggered" : "reset",
+      reason: msg.reason,
+    }, ...prev]);
+  });
 
   async function handleReset() {
     setConfirmOpen(false);

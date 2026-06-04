@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { useToast } from "@/components/ui/Toast";
+import { useWsEvent } from "@/hooks/WsProvider";
 import { WebPushPrompt, pushNotify } from "@/components/WebPushPrompt";
 import { fmtTimeAgo, severityColor, TABULAR } from "@/lib/format";
 
@@ -38,6 +39,21 @@ export default function AlertsPage() {
       })
       .catch((e) => { setError(String(e)); setLoading(false); });
   }, []);
+
+  // Push: new alert events appear instantly
+  useWsEvent("alert.new", (msg) => {
+    const newAlert: Alert = {
+      id: msg.id ?? String(Date.now()),
+      ts: msg.ts,
+      source: (msg as any).source ?? "bot",
+      message: msg.message ?? "",
+      severity: ((msg.severity as Severity) ?? "info"),
+      acked: false,
+    };
+    setAlerts((prev) => [newAlert, ...prev]);
+    pushNotify(`ClawdBot · ${newAlert.severity}`, newAlert.message, newAlert.id);
+    toast.push({ type: newAlert.severity === "critical" ? "error" : newAlert.severity === "warn" ? "warn" : "info", title: newAlert.message, duration: 6000 });
+  });
 
   async function ackOne(id: string) {
     try {

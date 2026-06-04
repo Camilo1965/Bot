@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useConnectionState } from "@/hooks/useConnectionState";
+import { useWs } from "@/hooks/WsProvider";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { fmtTimeAgo, TABULAR } from "@/lib/format";
 
@@ -13,6 +14,7 @@ interface Props {
 
 export function TopBar({ onOpenPalette, onOpenShortcuts, mode = "PAPER" }: Props) {
   const { state, lastOk, latencyMs } = useConnectionState();
+  const ws = useWs();
   const [now, setNow] = useState(() => new Date());
 
   useEffect(() => {
@@ -45,6 +47,15 @@ export function TopBar({ onOpenPalette, onOpenShortcuts, mode = "PAPER" }: Props
         <span className="flex-1 text-left">Search…</span>
         <kbd className="text-[10px] font-mono bg-[#1E2530] border border-[#374151] rounded px-1">⌘K</kbd>
       </button>
+
+      {/* WS state */}
+      <div
+        className="hidden md:flex items-center gap-1.5 text-[10px] text-[#9CA3AF] font-mono border border-[#374151] rounded px-2 py-1"
+        title={`WebSocket: ${ws.state}`}
+      >
+        <StatusDot state={ws.state === "open" ? "live" : ws.state === "connecting" ? "warn" : "down"} pulse />
+        <span className="uppercase tracking-wider">WS</span>
+      </div>
 
       {/* Connection + latency */}
       <div

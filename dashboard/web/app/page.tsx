@@ -7,8 +7,9 @@ import { OpenPositionsList } from "@/components/OpenPositionsList";
 import { RecentSignalsTable } from "@/components/RecentSignalsTable";
 import { SymbolHealthStrip } from "@/components/SymbolHealthStrip";
 import { EmptyState } from "@/components/ui/EmptyState";
-import { useWebSocket } from "@/hooks/useWebSocket";
+import { useWs, useWsEvent } from "@/hooks/WsProvider";
 import { useRefreshKey } from "@/hooks/useRefreshKey";
+import { useToast } from "@/components/ui/Toast";
 import { fmtMoney, fmtPct, fmtTimeAgo, pnlColor, TABULAR } from "@/lib/format";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -30,8 +31,7 @@ export default function OverviewPage() {
   const [equityHistory, setEquityHistory] = useState<EquityPoint[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [refreshKey] = useRefreshKey();
-
-  const { lastMessage } = useWebSocket(`${API.replace("http", "ws")}/ws/stream`);
+  const toast = useToast();
 
   useEffect(() => {
     setLoaded(false);
@@ -46,18 +46,41 @@ export default function OverviewPage() {
       .finally(() => setLoaded(true));
   }, [refreshKey]);
 
-  useEffect(() => {
-    if (!lastMessage) return;
-    try {
-      const msg = JSON.parse(lastMessage);
-      if (msg.event === "equity.tick") {
-        setState((prev) =>
-          prev ? { ...prev, equity: msg.equity, daily_pnl_pct: msg.daily_pnl_pct } : prev
-        );
-        setEquityHistory((prev) => [...prev.slice(-500), { ts: msg.ts, equity: msg.equity }]);
-      }
-    } catch {}
-  }, [lastMessage]);
+  // Live updates via shared WS — equity ticks
+  useWsEvent("equity.tick", (msg) => {
+    setState((prev) => prev ? {
+      ...prev,
+      equity: msg.equity,
+      balance: msg.balance,
+      daily_pnl_pct: msg.daily_pnl_pct,
+      open_positions_count: msg.open_positions_count,
+      kill_switch_active: msg.kill_switch_active ?? prev.kill_switch_active,
+      last_updated: msg.ts,
+    } : prev);
+    setEquityHistory((prev) => [...prev.slice(-500), { ts: msg.ts, equity: msg.equity }]);
+  });
+
+  // Trade events → toast notifications
+  useWsEvent("position.opened", (msg) => {
+    toast.push({ type: "info", title: `Position opened: ${msg.symbol}`, duration: 4000 });
+  });
+  useWsEvent("position.closed", (msg) => {
+    const won = (msg.pnl_usd ?? 0) > 0;
+    toast.push({
+      type: won ? "success" : "warn",
+      title: `Position closed${won ? " · win" : " · loss"}`,
+      body: `PnL ${fmtMoney(msg.pnl_usd ?? 0)} · ${msg.reason ?? ""}`,
+      duration: 5000,
+    });
+  });
+  useWsEvent("kill_switch.changed", (msg) => {
+    toast.push({
+      type: msg.active ? "error" : "success",
+      title: msg.active ? "Kill switch TRIGGERED" : "Kill switch reset",
+      body: msg.reason,
+      duration: 8000,
+    });
+  });
 
   const equitySpark = equityHistory.slice(-30).map((p) => p.equity);
   const startEquity = equityHistory[0]?.equity ?? state?.balance ?? 0;

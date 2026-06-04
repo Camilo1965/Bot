@@ -9,6 +9,7 @@ import { ToastHost } from "@/components/ui/Toast";
 import { NavProgressBar } from "@/components/ui/NavProgressBar";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { usePathname } from "next/navigation";
+import { WsProvider } from "@/hooks/WsProvider";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -55,6 +56,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <ToastHost>
+    <WsProvider>
       <NavProgressBar />
 
       {/* Desktop sidebar */}
@@ -100,6 +102,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
       <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+    </WsProvider>
     </ToastHost>
   );
 }

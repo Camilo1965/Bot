@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { fmtMoney, fmtPct, pnlColor, TABULAR } from "@/lib/format";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
+import { useWs } from "@/hooks/WsProvider";
 
 interface Position {
   trade_id: string;
@@ -31,17 +32,23 @@ function progress(entry: number, current: number, sl: number, tp: number, side: 
 export function OpenPositionsList({ apiBase }: { apiBase: string }) {
   const [positions, setPositions] = useState<Position[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const ws = useWs();
 
+  // Initial load via REST
   useEffect(() => {
-    const load = () =>
-      fetch(`${apiBase}/api/positions/open`)
-        .then((r) => r.json())
-        .then((d) => { setPositions(Array.isArray(d) ? d : []); setLoaded(true); })
-        .catch(() => setLoaded(true));
-    load();
-    const t = setInterval(load, 5000);
-    return () => clearInterval(t);
+    fetch(`${apiBase}/api/positions/open`)
+      .then((r) => r.json())
+      .then((d) => { setPositions(Array.isArray(d) ? d : []); setLoaded(true); })
+      .catch(() => setLoaded(true));
   }, [apiBase]);
+
+  // Live snapshot from WS — overrides
+  useEffect(() => {
+    if (ws.lastPositionsSnapshot !== null) {
+      setPositions(ws.lastPositionsSnapshot as Position[]);
+      setLoaded(true);
+    }
+  }, [ws.lastPositionsSnapshot]);
 
   if (!loaded) {
     return (
@@ -82,10 +89,9 @@ export function OpenPositionsList({ apiBase }: { apiBase: string }) {
                 </div>
               </div>
             </div>
-            {/* Visual price ladder SL → entry → current → TP */}
             <div className="relative h-1 bg-[#374151] rounded-full overflow-visible mb-1.5">
               <div
-                className="absolute h-1 rounded-full"
+                className="absolute h-1 rounded-full transition-all duration-300"
                 style={{
                   left: `${Math.min(entryPos, pos)}%`,
                   width: `${Math.abs(pos - entryPos)}%`,
@@ -93,15 +99,13 @@ export function OpenPositionsList({ apiBase }: { apiBase: string }) {
                   opacity: 0.6,
                 }}
               />
-              {/* Entry marker */}
               <div
                 className="absolute top-[-3px] w-px h-3 bg-[#9CA3AF]"
                 style={{ left: `${entryPos}%` }}
                 title={`Entry ${p.entry_price.toFixed(4)}`}
               />
-              {/* Current marker */}
               <div
-                className="absolute top-[-4px] w-1.5 h-2 rounded-sm"
+                className="absolute top-[-4px] w-1.5 h-2 rounded-sm transition-all duration-300"
                 style={{ left: `calc(${pos}% - 3px)`, backgroundColor: sideColor }}
                 title={`Current ${p.current_price.toFixed(4)}`}
               />

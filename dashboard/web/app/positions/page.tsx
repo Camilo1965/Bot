@@ -7,6 +7,7 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { useToast } from "@/components/ui/Toast";
 import { useLocalStorage } from "@/hooks/useLocalStorage";
 import { useRefreshKey } from "@/hooks/useRefreshKey";
+import { useWs, useWsEvent } from "@/hooks/WsProvider";
 import { fmtMoney, fmtPct, fmtTime, pnlColor, TABULAR } from "@/lib/format";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -94,6 +95,17 @@ export default function PositionsPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, refresh] = useRefreshKey();
+  const ws = useWs();
+
+  // Live push: WS snapshot replaces open rows in real-time
+  useEffect(() => {
+    if (tab === "open" && ws.lastPositionsSnapshot !== null) {
+      setOpenRows(ws.lastPositionsSnapshot as Position[]);
+    }
+  }, [ws.lastPositionsSnapshot, tab]);
+
+  // On position close → bounce refresh to fetch updated history
+  useWsEvent("position.closed", () => refresh());
 
   useEffect(() => {
     setLoading(true);

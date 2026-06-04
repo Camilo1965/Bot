@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { TradingViewChart } from "@/components/TradingViewChart";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Skeleton } from "@/components/ui/Skeleton";
+import { useWs } from "@/hooks/WsProvider";
 import { fmtTime, TABULAR } from "@/lib/format";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -110,6 +111,28 @@ function SymbolColumn({ data }: { data: SymbolSignals }) {
 export default function SignalsPage() {
   const [columns, setColumns] = useState<SymbolSignals[]>([]);
   const [selectedSymbol, setSelectedSymbol] = useState<string>("BTC/USDT");
+  const ws = useWs();
+
+  // Live push from WS — merge into existing columns
+  useEffect(() => {
+    const updates = ws.signals;
+    if (Object.keys(updates).length === 0) return;
+    setColumns((prev) =>
+      prev.map((col) => {
+        const u = updates[col.symbol];
+        if (!u) return col;
+        const newRow: SignalRow = {
+          ts: u.ts,
+          cal_prob: u.cal_prob,
+          threshold: u.threshold,
+          ml_decision: (u.decision as any) ?? "no_trade",
+        };
+        // Avoid duplicates with existing first row
+        if (col.rows[0]?.ts === newRow.ts) return col;
+        return { ...col, rows: [newRow, ...col.rows].slice(0, 10) };
+      })
+    );
+  }, [ws.signals]);
 
   useEffect(() => {
     fetch(`${API}/api/symbols/config`)
