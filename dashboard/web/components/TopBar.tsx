@@ -79,13 +79,13 @@ export function TopBar({ onOpenPalette, onOpenShortcuts }: Props) {
           </span>
         )}
         {meta?.balance != null && (
-          <span className={`hidden xl:inline text-[10px] font-mono ${TABULAR} text-[#9CA3AF]`} title="Account balance">
+          <span className={`text-[11px] font-mono font-semibold ${TABULAR} text-[#F3F4F6]`} title="Account balance">
             {fmtMoney(meta.balance)}
           </span>
         )}
         {meta?.daily_pnl_pct != null && (
           <span
-            className={`hidden xl:inline text-[10px] font-mono font-semibold ${TABULAR} ${pnlColor(meta.daily_pnl_pct)}`}
+            className={`text-[11px] font-mono font-semibold ${TABULAR} ${pnlColor(meta.daily_pnl_pct)}`}
             title="Daily PnL %"
           >
             {meta.daily_pnl_pct >= 0 ? "+" : ""}{fmtPct(meta.daily_pnl_pct)}

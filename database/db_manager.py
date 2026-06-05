@@ -485,6 +485,40 @@ class DatabaseManager:
             exit_reason=reason
         )
 
+    async def save_trade(
+        self,
+        *,
+        trade_id: Any,
+        symbol: str,
+        entry_price: float,
+        position_size: float,
+        sl_price: float,
+        tp_price: float,
+        direction: str,
+        timeframe: str | None = None,
+        win_probability: float | None = None,
+        atr: float | None = None,
+    ) -> None:
+        """Compat shim used by paper_executor. Persists trade opening via insert_trade_open."""
+        if timeframe is None:
+            try:
+                from strategy.ml_predictor import get_symbol_config
+                timeframe = get_symbol_config(symbol).get("timeframe", "15m")
+            except Exception:
+                timeframe = "15m"
+        lots = (position_size / entry_price) if entry_price > 0 else 0.0
+        await self.insert_trade_open(
+            trade_id=trade_id,
+            timestamp_open=datetime.now(timezone.utc),
+            symbol=symbol,
+            timeframe=timeframe,
+            side=direction.upper(),
+            entry_price=float(entry_price),
+            lots=float(lots),
+            win_probability=win_probability,
+            atr=atr,
+        )
+
     # ── CEO / Telegram: closed-trade analytics (expects ``trades_history``) ─────────
 
     @staticmethod
