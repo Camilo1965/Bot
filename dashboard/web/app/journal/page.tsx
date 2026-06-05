@@ -9,7 +9,7 @@ import { useToast } from "@/components/ui/Toast";
 import { useLocalStorage } from "@/hooks/useLocalStorage";
 import { useRefreshKey } from "@/hooks/useRefreshKey";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
 type Tab = "trades" | "vibe" | "notes";
 
@@ -207,13 +207,112 @@ function Stat({ label, value, valueClass = "text-[#F3F4F6]" }: { label: string; 
   );
 }
 
+interface VibeInsights {
+  available: boolean;
+  generated_at: string | null;
+  analysis: any;
+}
+
+interface VibePatternsPayload {
+  available: boolean;
+  generated_at: string | null;
+  patterns: Record<string, any>;
+}
+
+function extractText(node: any): string {
+  if (!node) return "";
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(extractText).filter(Boolean).join("\n\n");
+  if (typeof node === "object") {
+    if (typeof node.text === "string") return node.text;
+    if (Array.isArray(node.content)) return extractText(node.content);
+    return JSON.stringify(node, null, 2);
+  }
+  return String(node);
+}
+
 function VibeTab() {
+  const [insights, setInsights] = useState<VibeInsights | null>(null);
+  const [patterns, setPatterns] = useState<VibePatternsPayload | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshKey] = useRefreshKey();
+
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([
+      fetch(`${API}/api/journal/vibe-insights`).then((r) => r.json()).catch(() => null),
+      fetch(`${API}/api/journal/vibe-patterns`).then((r) => r.json()).catch(() => null),
+    ])
+      .then(([ins, pat]) => {
+        setInsights(ins);
+        setPatterns(pat);
+        setLoading(false);
+      });
+    const t = setInterval(() => {
+      fetch(`${API}/api/journal/vibe-insights`).then((r) => r.json()).then(setInsights).catch(() => {});
+      fetch(`${API}/api/journal/vibe-patterns`).then((r) => r.json()).then(setPatterns).catch(() => {});
+    }, 60000);
+    return () => clearInterval(t);
+  }, [refreshKey]);
+
+  if (loading) return <SkeletonTable rows={4} cols={1} />;
+
+  const insightsAvailable = insights?.available;
+  const patternsAvailable = patterns?.available && Object.keys(patterns.patterns || {}).length > 0;
+
+  if (!insightsAvailable && !patternsAvailable) {
+    return (
+      <EmptyState
+        icon="∿"
+        title="VIBE insights not generated yet"
+        body="Bot's VIBE journal loop runs every 24h after the first trade closes. Pattern loop runs every 15min once symbols have ≥60 bars. Results stream here automatically."
+      />
+    );
+  }
+
   return (
-    <EmptyState
-      icon="∿"
-      title="VIBE Insights not generated"
-      body="Run python vibe/journal_analyzer.py to generate behavioral analysis. Results will appear here automatically."
-    />
+    <div className="space-y-5">
+      {insightsAvailable && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-[10px] uppercase tracking-widest text-[#9CA3AF] font-semibold">Behavioral analysis</div>
+            <span className={`text-[10px] font-mono ${TABULAR} text-[#6B7280]`}>
+              generated {insights?.generated_at ? fmtDateTime(insights.generated_at) : "?"}
+            </span>
+          </div>
+          <div className="bg-[#0a0e15] border border-[#374151] rounded-lg p-4 max-h-96 overflow-auto">
+            <pre className="text-xs text-[#F3F4F6] whitespace-pre-wrap break-words font-mono leading-relaxed">
+              {extractText(insights?.analysis) || "No analysis content."}
+            </pre>
+          </div>
+        </div>
+      )}
+
+      {patternsAvailable && patterns && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-[10px] uppercase tracking-widest text-[#9CA3AF] font-semibold">Pattern detection</div>
+            <span className={`text-[10px] font-mono ${TABULAR} text-[#6B7280]`}>
+              generated {patterns.generated_at ? fmtDateTime(patterns.generated_at) : "?"}
+            </span>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {Object.entries(patterns.patterns).map(([sym, payload]) => {
+              const text = extractText(payload);
+              if (!text) return null;
+              return (
+                <div key={sym} className="bg-[#0a0e15] border border-[#374151] rounded-lg p-3 space-y-1.5">
+                  <div className="font-mono text-[#F3F4F6] text-xs font-semibold">{sym}</div>
+                  <div className="text-[11px] text-[#D1D5DB] leading-relaxed line-clamp-6 whitespace-pre-wrap">
+                    {text}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

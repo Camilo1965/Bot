@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 const WS_URL = `${API.replace("http", "ws")}/ws/stream`;
 
 export type WsMessage =

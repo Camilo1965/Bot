@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 
 export type ConnState = "connecting" | "live" | "stale" | "down";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
 export function useConnectionState(pollMs = 10000) {
   const [state, setState] = useState<ConnState>("connecting");

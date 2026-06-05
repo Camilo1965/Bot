@@ -1,18 +1,22 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { TradingViewChart } from "@/components/TradingViewChart";
+import { TradeLifecycleExplainer } from "@/components/TradeLifecycleExplainer";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { useWs } from "@/hooks/WsProvider";
+import { useLocalStorage } from "@/hooks/useLocalStorage";
 import { fmtTime, TABULAR } from "@/lib/format";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
 const SYMBOLS_FALLBACK = [
-  "BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT", "DOGE/USDT",
-  "NEAR/USDT", "LINK/USDT", "JTO/USDT", "INJ/USDT",
+  "BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT", "NEAR/USDT",
 ];
+
+const INTERVALS = ["5m", "15m", "30m", "1h", "4h", "1d"] as const;
+type IntervalKey = (typeof INTERVALS)[number];
 
 interface SignalRow {
   ts: string;
@@ -108,10 +112,25 @@ function SymbolColumn({ data }: { data: SymbolSignals }) {
   );
 }
 
+type ChartSize = "S" | "M" | "L" | "XL";
+
+const SIZE_TO_CSS: Record<ChartSize, string> = {
+  S: "560px",
+  M: "calc(100vh - 220px)",
+  L: "calc(100vh - 80px)",
+  XL: "calc(100vh - 80px)",
+};
+
 export default function SignalsPage() {
   const [columns, setColumns] = useState<SymbolSignals[]>([]);
-  const [selectedSymbol, setSelectedSymbol] = useState<string>("BTC/USDT");
+  const [selectedSymbol, setSelectedSymbol] = useLocalStorage<string>("clawdbot:signals:symbol", "BTC/USDT");
+  const [chartInterval, setChartInterval] = useLocalStorage<IntervalKey>("clawdbot:signals:interval", "15m");
+  const [chartSize, setChartSize] = useLocalStorage<ChartSize>("clawdbot:signals:size", "M");
   const ws = useWs();
+
+  const latestForSelected = useMemo(() => {
+    return columns.find((c) => c.symbol === selectedSymbol)?.rows[0];
+  }, [columns, selectedSymbol]);
 
   // Live push from WS — merge into existing columns
   useEffect(() => {
@@ -174,39 +193,128 @@ export default function SignalsPage() {
   }, []);
 
   return (
-    <div className="space-y-5">
-      <div className="flex items-center justify-between flex-wrap gap-2">
+    <div className="space-y-4">
+      <div className="flex items-end justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-xl font-semibold text-[#F3F4F6]">Signals</h1>
-          <p className="text-xs text-[#9CA3AF] mt-0.5">Live ML probabilities per symbol with TradingView chart.</p>
+          <p className="text-xs text-[#9CA3AF] mt-0.5">
+            Live ML probabilities per symbol with TradingView chart.
+          </p>
+          <details className="mt-1 text-xs">
+            <summary className="cursor-pointer text-[#3B82F6] hover:text-[#60A5FA] inline-block">How does the bot decide?</summary>
+            <div className="mt-3">
+              <TradeLifecycleExplainer />
+            </div>
+          </details>
         </div>
-        <div className="flex items-center gap-2">
-          <label className="text-xs text-[#9CA3AF]">Chart:</label>
+        <div className="flex items-center gap-3 flex-wrap">
+          {latestForSelected && (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-[#10151D] border border-[#374151]">
+              <span className="text-[10px] text-[#9CA3AF] uppercase tracking-wider">Prob</span>
+              <span className={`font-mono ${TABULAR} text-sm font-semibold ${
+                latestForSelected.cal_prob >= latestForSelected.threshold ? "text-[#10B981]" : "text-[#F3F4F6]"
+              }`}>
+                {(latestForSelected.cal_prob * 100).toFixed(1)}%
+              </span>
+              <span className="text-[10px] text-[#6B7280]">/</span>
+              <span className={`font-mono ${TABULAR} text-xs text-[#F59E0B]`}>
+                th {(latestForSelected.threshold * 100).toFixed(0)}%
+              </span>
+              <DecisionBadge decision={latestForSelected.ml_decision} />
+            </div>
+          )}
           <select
             value={selectedSymbol}
             onChange={(e) => setSelectedSymbol(e.target.value)}
-            className="bg-[#0a0e15] border border-[#374151] rounded px-2 py-1 text-xs text-[#F3F4F6] font-mono focus:outline-none focus:border-[#3B82F6]"
+            aria-label="Chart symbol"
+            className="bg-[#0a0e15] border border-[#374151] rounded px-3 py-1.5 text-sm text-[#F3F4F6] font-mono focus:outline-none focus:border-[#3B82F6]"
           >
             {columns.map((c) => (
               <option key={c.symbol} value={c.symbol}>{c.symbol}</option>
             ))}
           </select>
+          <div className="flex gap-0.5 bg-[#10151D] border border-[#374151] rounded-md p-0.5">
+            {INTERVALS.map((tf) => (
+              <button
+                key={tf}
+                onClick={() => setChartInterval(tf)}
+                className={`px-2 py-1 text-[11px] rounded transition-colors font-mono ${TABULAR} ${
+                  chartInterval === tf
+                    ? "bg-[#3B82F6]/20 text-[#3B82F6]"
+                    : "text-[#9CA3AF] hover:text-[#F3F4F6]"
+                }`}
+              >
+                {tf}
+              </button>
+            ))}
+          </div>
+          <div className="flex gap-0.5 bg-[#10151D] border border-[#374151] rounded-md p-0.5" title="Chart size">
+            {(["S", "M", "L", "XL"] as ChartSize[]).map((s) => (
+              <button
+                key={s}
+                onClick={() => setChartSize(s)}
+                className={`w-8 py-1 text-[11px] rounded transition-colors font-mono ${
+                  chartSize === s
+                    ? "bg-[#3B82F6]/20 text-[#3B82F6]"
+                    : "text-[#9CA3AF] hover:text-[#F3F4F6]"
+                }`}
+                title={`${s} = ${SIZE_TO_CSS[s]}`}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
       {selectedSymbol && (
-        <div className="bg-[#10151D] border border-[#374151] rounded-lg p-2 overflow-hidden">
-          <TradingViewChart symbol={selectedSymbol} interval="15m" height={460} />
+        <div className="bg-[#10151D] border border-[#374151] rounded-lg overflow-hidden">
+          <TradingViewChart
+            key={`${selectedSymbol}-${chartInterval}-${chartSize}`}
+            symbol={selectedSymbol}
+            interval={chartInterval}
+            height={SIZE_TO_CSS[chartSize]}
+          />
         </div>
       )}
 
-      {columns.length === 0 ? (
-        <EmptyState icon="↯" title="No symbol configs available" />
-      ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
-          {columns.map((col) => (
-            <SymbolColumn key={col.symbol} data={col} />
-          ))}
+      {chartSize !== "XL" && (
+        <div>
+          <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+            <h2 className="text-[10px] uppercase tracking-widest text-[#9CA3AF] font-semibold">Per-symbol decisions</h2>
+            <div className="flex items-center gap-3 text-[10px] text-[#9CA3AF] font-mono flex-wrap">
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-sm bg-[#10B981]/40" /> BUY <span className="text-[#6B7280]">prob ≥ threshold</span>
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-sm bg-[#F59E0B]/40" /> SKIP_SPREAD <span className="text-[#6B7280]">spread &gt; 0.8%</span>
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-sm bg-[#F59E0B]/40" /> SKIP_VOL <span className="text-[#6B7280]">vol &lt; 0.5×sma</span>
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-sm bg-[#F59E0B]/40" /> SKIP_HOUR <span className="text-[#6B7280]">UTC 22–08</span>
+              </span>
+              <span className="text-[#6B7280]">· {columns.length} symbols</span>
+            </div>
+          </div>
+          {columns.length === 0 ? (
+            <EmptyState icon="↯" title="No symbol configs available" />
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-2">
+              {columns.map((col) => (
+                <button
+                  key={col.symbol}
+                  onClick={() => setSelectedSymbol(col.symbol)}
+                  className={`text-left transition-colors ${
+                    col.symbol === selectedSymbol ? "ring-1 ring-[#3B82F6]/60 rounded-lg" : ""
+                  }`}
+                >
+                  <SymbolColumn data={col} />
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>

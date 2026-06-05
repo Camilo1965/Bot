@@ -8,7 +8,7 @@ import { useWsEvent } from "@/hooks/WsProvider";
 import { WebPushPrompt, pushNotify } from "@/components/WebPushPrompt";
 import { fmtTimeAgo, severityColor, TABULAR } from "@/lib/format";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
 type Severity = "info" | "warn" | "critical";
 
@@ -32,7 +32,14 @@ export default function AlertsPage() {
     fetch(`${API}/api/alerts?status=unread`)
       .then((r) => r.json())
       .then((data) => {
-        const arr = Array.isArray(data) ? data : [];
+        const arr = (Array.isArray(data) ? data : []).map((a: any, idx: number): Alert => ({
+          id: String(a?.id ? `${a.id}:${idx}` : `${a?.source ?? "alert"}:${a?.ts ?? Date.now()}:${idx}`),
+          ts: String(a?.ts ?? ""),
+          source: String(a?.source ?? "bot"),
+          message: String(a?.message ?? a?.event ?? "alert"),
+          severity: (["info", "warn", "critical"].includes(a?.severity) ? a.severity : "info") as Severity,
+          acked: Boolean(a?.acked ?? false),
+        }));
         setAlerts(arr);
         setLoading(false);
         arr.slice(0, 3).forEach((a) => pushNotify(`ClawdBot · ${a.severity}`, a.message, a.id));
@@ -57,7 +64,11 @@ export default function AlertsPage() {
 
   async function ackOne(id: string) {
     try {
-      await fetch(`${API}/api/alerts/${id}/ack`, { method: "POST" });
+      await fetch(`${API}/api/alerts/ack`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: [id] }),
+      });
       setAlerts((prev) => prev.filter((a) => a.id !== id));
     } catch {
       toast.push({ type: "error", title: "Ack failed" });
@@ -67,7 +78,11 @@ export default function AlertsPage() {
   async function ackAll() {
     const ids = alerts.map((a) => a.id);
     try {
-      await Promise.all(ids.map((id) => fetch(`${API}/api/alerts/${id}/ack`, { method: "POST" })));
+      await fetch(`${API}/api/alerts/ack`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
       setAlerts([]);
       toast.push({ type: "success", title: `Acked ${ids.length} alert${ids.length === 1 ? "" : "s"}` });
     } catch {

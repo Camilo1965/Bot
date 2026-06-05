@@ -8,9 +8,13 @@ import { useToast } from "@/components/ui/Toast";
 import { useLocalStorage } from "@/hooks/useLocalStorage";
 import { useRefreshKey } from "@/hooks/useRefreshKey";
 import { useWs, useWsEvent } from "@/hooks/WsProvider";
+import { usePositionPriceBuffers } from "@/hooks/useSessionEquity";
+import { LivePositionCard, type LivePosition } from "@/components/LivePositionCard";
+import { PositionExitConditions } from "@/components/PositionExitConditions";
+import { SymbolReadinessGrid } from "@/components/SymbolReadinessGrid";
 import { fmtMoney, fmtPct, fmtTime, pnlColor, TABULAR } from "@/lib/format";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
 type Tab = "open" | "closed" | "all";
 
@@ -224,7 +228,15 @@ export default function PositionsPage() {
         ))}
       </div>
 
-      {/* Content */}
+      {/* Live cards + Exit conditions (open tab only) */}
+      {isOpenTab && openRows.length > 0 && <OpenPositionsLiveBlock openRows={openRows} refresh={refresh} />}
+
+      {/* Readiness grid when open tab is empty — shows how close each symbol is to triggering */}
+      {isOpenTab && !loading && !error && openRows.length === 0 && (
+        <SymbolReadinessGrid apiBase={API} title="What's blocking each symbol from opening" />
+      )}
+
+      {/* Content table */}
       <div className="bg-[#10151D] border border-[#374151] rounded-lg p-4">
         {loading && (
           <div className="space-y-2">
@@ -236,11 +248,11 @@ export default function PositionsPage() {
         {error && (
           <div className="text-[#EF4444] text-sm text-center py-4">Failed to load: {error}</div>
         )}
-        {!loading && !error && rows.length === 0 && (
+        {!loading && !error && rows.length === 0 && !isOpenTab && (
           <EmptyState
-            icon={tab === "open" ? "○" : "≣"}
-            title={tab === "open" ? "No open positions" : "No closed positions yet"}
-            body={tab === "open" ? "Bot will open positions when signals exceed threshold." : "Trade history will appear here once positions close."}
+            icon="≣"
+            title="No closed positions yet"
+            body="Trade history will appear here once positions close."
           />
         )}
         {!loading && !error && rows.length > 0 && (
@@ -253,6 +265,60 @@ export default function PositionsPage() {
           />
         )}
       </div>
+    </div>
+  );
+}
+
+function OpenPositionsLiveBlock({
+  openRows,
+  refresh,
+}: {
+  openRows: Position[];
+  refresh: () => void;
+}) {
+  const toast = useToast();
+  const priceBuffers = usePositionPriceBuffers();
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  async function closePos(symbol: string) {
+    const sym = symbol.replace("/", "_");
+    try {
+      const res = await fetch(`${API}/api/positions/${sym}/close`, { method: "POST" });
+      const data = await res.json();
+      if (data.ok) {
+        toast.push({ type: "success", title: `Close queued: ${symbol}`, body: "Signal sent to bot." });
+        refresh();
+      } else {
+        toast.push({ type: "error", title: `Close failed: ${symbol}` });
+      }
+    } catch {
+      toast.push({ type: "error", title: `Close failed: ${symbol}` });
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+        {openRows.map((p) => {
+          const lp = p as unknown as LivePosition;
+          const id = String(lp.trade_id || p.symbol);
+          return (
+            <div key={id} className={`transition-all ${expanded === id ? "ring-1 ring-[#3B82F6]/40 rounded-lg" : ""}`}>
+              <LivePositionCard
+                position={lp}
+                priceHistory={priceBuffers[id] || []}
+                onClickChart={() => setExpanded((cur) => (cur === id ? null : id))}
+                onClickClose={() => closePos(p.symbol)}
+              />
+            </div>
+          );
+        })}
+      </div>
+      {expanded && (() => {
+        const p = openRows.find((x) => String((x as any).trade_id || x.symbol) === expanded);
+        if (!p) return null;
+        return <PositionExitConditions position={p as unknown as LivePosition} />;
+      })()}
     </div>
   );
 }

@@ -9,7 +9,7 @@ import { useRefreshKey } from "@/hooks/useRefreshKey";
 import { useToast } from "@/components/ui/Toast";
 import { fmtMoney, fmtPct, fmtTimeAgo, pnlColor, TABULAR } from "@/lib/format";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
 interface BotState {
   balance: number;

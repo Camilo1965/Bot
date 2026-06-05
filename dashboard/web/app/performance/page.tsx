@@ -9,7 +9,7 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { SkeletonKpi, SkeletonTable } from "@/components/ui/Skeleton";
 import { fmtMoney, fmtPct, fmtNum, fmtDate, pnlColor, TABULAR } from "@/lib/format";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
 interface PerformanceSummary {
   total_trades: number; win_rate: number; pnl_pct: number;

@@ -7,7 +7,7 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { useToast } from "@/components/ui/Toast";
 import { fmtAbbrev, fmtDateTime, TABULAR } from "@/lib/format";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
 type Mode = "disk" | "inline";
 type RunState = "idle" | "running" | "done" | "error";

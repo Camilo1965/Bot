@@ -1,16 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { TABULAR } from "@/lib/format";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
-type Tab = "symbols" | "risk" | "notifications" | "apikeys";
+type Tab = "symbols" | "config" | "access";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "symbols", label: "Symbols" },
-  { key: "risk", label: "Risk" },
-  { key: "notifications", label: "Notifications" },
-  { key: "apikeys", label: "API Keys" },
+  { key: "config", label: "Config" },
+  { key: "access", label: "Acceso" },
 ];
 
 interface SymbolConfig {
@@ -35,10 +35,7 @@ function SymbolsTab() {
   useEffect(() => {
     fetch(`${API}/api/symbols/config`)
       .then((r) => r.json())
-      .then((data) => {
-        setConfigs(Array.isArray(data) ? data : []);
-        setLoading(false);
-      })
+      .then((data) => { setConfigs(Array.isArray(data) ? data : []); setLoading(false); })
       .catch((e) => { setError(String(e)); setLoading(false); });
   }, []);
 
@@ -152,9 +149,7 @@ function SymbolsTab() {
             {bt.logs.map((line, i) => (
               <div key={i} className="leading-5 whitespace-pre-wrap break-all">{line}</div>
             ))}
-            {bt.logs.length === 0 && bt.running && (
-              <div className="text-[#9CA3AF]">Connecting…</div>
-            )}
+            {bt.logs.length === 0 && bt.running && <div className="text-[#9CA3AF]">Connecting…</div>}
           </div>
         </div>
       )}
@@ -162,112 +157,132 @@ function SymbolsTab() {
   );
 }
 
-function RiskTab() {
+interface ConfigRow { group: string; label: string; value: string | number; hint?: string }
+
+function ConfigTab() {
+  const [rows, setRows] = useState<ConfigRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch(`${API}/api/risk/state`)
+      .then((r) => r.json())
+      .then((s) => {
+        const lim = s.limits ?? {};
+        const fil = s.filters ?? {};
+        const built: ConfigRow[] = [
+          // Risk limits
+          { group: "Risk Limits", label: "Max daily loss", value: `${lim.max_daily_loss_pct ?? "—"}%`, hint: "Kill switch fires if exceeded" },
+          { group: "Risk Limits", label: "Max 7d drawdown", value: `${lim.max_drawdown_7d_pct ?? "—"}%`, hint: "Kill switch fires if exceeded" },
+          { group: "Risk Limits", label: "Max consecutive losses", value: lim.max_consecutive_losses ?? "—", hint: "Kill switch fires if exceeded" },
+          { group: "Risk Limits", label: "Max open positions", value: lim.max_positions ?? "—" },
+          { group: "Risk Limits", label: "Risk per trade", value: `${lim.risk_per_trade_pct ?? "—"}%`, hint: "Of account balance" },
+          // Entry filters
+          { group: "Entry Filters", label: "Hour filter", value: fil.trade_hour_filter ? `ON — UTC ${fil.trade_hour_start_utc}:00–${fil.trade_hour_end_utc}:00` : "OFF" },
+          { group: "Entry Filters", label: "SMA200 (1H)", value: fil.sma200_filter ? "ON" : "OFF", hint: "Blocks LONG when price < 1H SMA200" },
+          { group: "Entry Filters", label: "Regime filter", value: fil.regime_filter_enabled ? `ON — threshold ${((fil.regime_trending_threshold ?? 0.65) * 100).toFixed(0)}%` : "OFF", hint: "Blocks entry in RANGING regime" },
+          { group: "Entry Filters", label: "Max spread", value: `${fil.max_spread_pct ?? "—"}%`, hint: "Skip if spread wider" },
+          // Execution
+          { group: "Execution", label: "ATR SL multiplier", value: `${fil.atr_sl_mult ?? "—"}×` },
+          { group: "Execution", label: "ATR TP multiplier", value: `${fil.atr_tp_mult ?? "—"}×` },
+          { group: "Execution", label: "Base SL", value: `${fil.base_sl_pct ?? "—"}%` },
+        ];
+        setRows(built);
+        setLoading(false);
+      })
+      .catch((e) => { setError(String(e)); setLoading(false); });
+  }, []);
+
+  if (loading) return <div className="text-[#9CA3AF] text-sm text-center py-6">Loading…</div>;
+  if (error) return <div className="text-[#EF4444] text-sm py-4 text-center">Failed: {error}</div>;
+
+  const groups = [...new Set(rows.map((r) => r.group))];
+
   return (
-    <div className="space-y-4">
-      <div className="text-xs text-[#9CA3AF] mb-2">
-        Risk parameters are set via environment variables. Restart the bot after changing them.
+    <div className="space-y-5">
+      <div className="text-xs text-[#9CA3AF]">
+        Live values read from running bot. Change via <code className="text-[#F3F4F6]">.env</code> and restart.
       </div>
-      <div className="space-y-2">
-        {[
-          { label: "MAX_DAILY_LOSS_PCT", desc: "Kill switch triggers when daily PnL falls below this percentage" },
-          { label: "MAX_CONSECUTIVE_LOSSES", desc: "Kill switch triggers after this many consecutive losses" },
-          { label: "MAX_DRAWDOWN_7D_PCT", desc: "Kill switch triggers when 7d drawdown exceeds this" },
-          { label: "MAX_OPEN_POSITIONS", desc: "Maximum number of simultaneously open positions" },
-          { label: "POSITION_SIZE_PCT", desc: "Default position size as % of available balance" },
-        ].map((item) => (
-          <div
-            key={item.label}
-            className="flex items-start gap-3 border border-[#374151] rounded-lg px-4 py-3"
-          >
-            <code className="text-[#3B82F6] text-xs font-mono shrink-0 mt-0.5">{item.label}</code>
-            <span className="text-[#9CA3AF] text-xs">{item.desc}</span>
+      {groups.map((group) => (
+        <div key={group}>
+          <div className="text-[10px] uppercase tracking-widest text-[#9CA3AF] font-semibold mb-2">{group}</div>
+          <div className="bg-[#0a0e15] border border-[#374151] rounded-lg divide-y divide-[#374151]/60">
+            {rows.filter((r) => r.group === group).map((row) => (
+              <div key={row.label} className="flex items-center justify-between px-4 py-3">
+                <div>
+                  <span className="text-xs text-[#F3F4F6]">{row.label}</span>
+                  {row.hint && <span className="text-[10px] text-[#6B7280] ml-2">{row.hint}</span>}
+                </div>
+                <span className={`font-mono ${TABULAR} text-sm text-[#10B981] font-semibold`}>
+                  {row.value}
+                </span>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-      <p className="text-xs text-[#9CA3AF] mt-2">
-        Current values are read from <code className="text-[#F3F4F6]">.env</code> at startup.
-        Live editing via dashboard is not yet supported.
-      </p>
+        </div>
+      ))}
     </div>
   );
 }
 
-function NotificationsTab() {
-  return (
-    <div className="space-y-4">
-      <div className="text-xs text-[#9CA3AF] mb-2">
-        Notification settings are configured via environment variables.
-      </div>
-      <div className="border border-[#374151] rounded-lg px-4 py-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-sm text-[#F3F4F6] font-medium">Telegram</div>
-            <div className="text-xs text-[#9CA3AF] mt-0.5">
-              Set <code>TELEGRAM_ENABLED=true</code>, <code>TELEGRAM_BOT_TOKEN</code>, and{" "}
-              <code>TELEGRAM_CHAT_ID</code> in your <code>.env</code> file.
-            </div>
-          </div>
-          <div className="text-xs text-[#9CA3AF] font-mono bg-[#374151] px-2 py-1 rounded">
-            TELEGRAM_ENABLED
-          </div>
-        </div>
-        <div className="border-t border-[#374151] pt-3 flex items-center justify-between">
-          <div>
-            <div className="text-sm text-[#F3F4F6] font-medium">Alert Levels</div>
-            <div className="text-xs text-[#9CA3AF] mt-0.5">
-              Set <code>NOTIFY_ON_SIGNAL</code>, <code>NOTIFY_ON_TRADE</code>, and{" "}
-              <code>NOTIFY_ON_KILL_SWITCH</code>.
-            </div>
-          </div>
-        </div>
-      </div>
-      <p className="text-xs text-[#9CA3AF]">
-        Toggle controls coming in a future release once the settings API is wired up.
-      </p>
-    </div>
-  );
-}
+function AccessTab() {
+  const [info, setInfo] = useState<{ lan_ip?: string; dashboard_url?: string; api_url?: string; hostname?: string } | null>(null);
+  const [loading, setLoading] = useState(true);
 
-function ApiKeysTab() {
-  function masked(key: string | undefined) {
-    if (!key) return "not set";
-    if (key.length <= 8) return "••••••••";
-    return key.slice(0, 4) + "••••••••" + key.slice(-4);
-  }
+  useEffect(() => {
+    fetch(`${API}/api/system/info`)
+      .then((r) => r.json())
+      .then((d) => { setInfo(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, []);
 
-  const exchangeKey = process.env.NEXT_PUBLIC_EXCHANGE_API_KEY;
+  const rows = info ? [
+    { label: "Dashboard (browser)", value: info.dashboard_url, copy: true, highlight: true },
+    { label: "API", value: info.api_url, copy: true, highlight: false },
+    { label: "IP local (LAN)", value: info.lan_ip, copy: false, highlight: false },
+    { label: "Hostname", value: info.hostname, copy: false, highlight: false },
+  ] : [];
 
   return (
     <div className="space-y-4">
-      <div className="text-xs text-[#9CA3AF] mb-2">
-        API keys are loaded from <code className="text-[#F3F4F6]">.env</code> and never exposed in
-        the browser. Only masked previews are shown here.
-      </div>
-      <div className="space-y-2">
-        {[
-          { label: "Exchange API Key", env: "EXCHANGE_API_KEY", value: exchangeKey },
-          { label: "Exchange API Secret", env: "EXCHANGE_API_SECRET", value: undefined },
-          { label: "Telegram Bot Token", env: "TELEGRAM_BOT_TOKEN", value: undefined },
-          { label: "Database URL", env: "DATABASE_URL", value: undefined },
-        ].map((item) => (
-          <div
-            key={item.env}
-            className="flex items-center justify-between border border-[#374151] rounded-lg px-4 py-3"
-          >
-            <div>
-              <div className="text-sm text-[#F3F4F6]">{item.label}</div>
-              <code className="text-[10px] text-[#9CA3AF]">{item.env}</code>
-            </div>
-            <code className="text-xs font-mono text-[#9CA3AF] bg-[#374151] px-2 py-1 rounded">
-              {masked(item.value)}
-            </code>
-          </div>
-        ))}
-      </div>
       <p className="text-xs text-[#9CA3AF]">
-        To rotate keys, update <code className="text-[#F3F4F6]">.env</code> and restart the bot.
+        URLs para acceder al dashboard desde cualquier dispositivo en la misma red.
+        Para acceso desde internet cambia <code className="text-[#F3F4F6]">DASHBOARD_API_URL</code> en <code className="text-[#F3F4F6]">.env</code> a tu IP pública y abre los puertos 3000/8000 en el firewall.
       </p>
+
+      {loading ? (
+        <div className="text-[#9CA3AF] text-xs text-center py-6">Detectando IPs…</div>
+      ) : !info ? (
+        <div className="text-[#EF4444] text-xs py-4">No se pudo conectar al API.</div>
+      ) : (
+        <div className="space-y-2">
+          {rows.map((r) => (
+            <div key={r.label} className={`flex items-center justify-between border rounded-lg px-4 py-3 ${r.highlight ? "border-[#3B82F6]/40 bg-[#3B82F6]/5" : "border-[#374151]"}`}>
+              <div>
+                <div className={`text-xs font-medium ${r.highlight ? "text-[#F3F4F6]" : "text-[#9CA3AF]"}`}>{r.label}</div>
+                <code className={`text-sm font-mono ${r.highlight ? "text-[#3B82F6]" : "text-[#F3F4F6]"}`}>{r.value ?? "—"}</code>
+              </div>
+              {r.copy && r.value && (
+                <button
+                  onClick={() => navigator.clipboard.writeText(r.value!)}
+                  className="text-[10px] px-2 py-1 rounded bg-[#374151] text-[#9CA3AF] hover:text-[#F3F4F6] transition-colors ml-3 shrink-0"
+                >
+                  Copiar
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="border border-[#374151] rounded-lg px-4 py-3 space-y-1">
+        <div className="text-xs font-medium text-[#F3F4F6]">Para VPS / acceso global</div>
+        <div className="text-[11px] text-[#9CA3AF] space-y-1">
+          <p>1. En <code className="text-[#F3F4F6]">.env</code> establece: <code className="text-[#F59E0B]">DASHBOARD_API_URL=http://&lt;TU_IP_PUBLICA&gt;:8000</code></p>
+          <p>2. Abre puertos <code className="text-[#F3F4F6]">3000</code> y <code className="text-[#F3F4F6]">8000</code> en el firewall del servidor.</p>
+          <p>3. Reinicia el bot — los servidores arrancan solos con la nueva IP.</p>
+        </div>
+      </div>
     </div>
   );
 }
@@ -279,7 +294,7 @@ export default function SettingsPage() {
     <div className="space-y-5">
       <div>
         <h1 className="text-xl font-semibold text-[#F3F4F6]">Settings</h1>
-        <p className="text-xs text-[#9CA3AF] mt-0.5">Symbol configs, risk params, notifications, and API keys.</p>
+        <p className="text-xs text-[#9CA3AF] mt-0.5">Symbol configs, live bot config, and access URLs.</p>
       </div>
 
       <div className="flex gap-1 border-b border-[#374151] overflow-x-auto">
@@ -300,9 +315,8 @@ export default function SettingsPage() {
 
       <div className="bg-[#10151D] border border-[#374151] rounded-lg p-5">
         {tab === "symbols" && <SymbolsTab />}
-        {tab === "risk" && <RiskTab />}
-        {tab === "notifications" && <NotificationsTab />}
-        {tab === "apikeys" && <ApiKeysTab />}
+        {tab === "config" && <ConfigTab />}
+        {tab === "access" && <AccessTab />}
       </div>
     </div>
   );

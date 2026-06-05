@@ -6,7 +6,7 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { useToast } from "@/components/ui/Toast";
 import { fmtDate, TABULAR } from "@/lib/format";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE as API } from "@/lib/api";
 
 interface ModelMeta {
   trained_at: string;
@@ -21,6 +21,7 @@ interface SymbolModels {
   has_short_model: boolean;
   long_meta?: ModelMeta;
   short_meta?: ModelMeta;
+  is_active?: boolean;
 }
 
 function Badge({ active, label }: { active: boolean; label: string }) {
@@ -156,16 +157,19 @@ export default function ModelsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
+  const [activeOnly, setActiveOnly] = useState(true);
 
   useEffect(() => {
-    fetch(`${API}/api/models`)
+    setLoading(true);
+    fetch(`${API}/api/models?active_only=${activeOnly ? "true" : "false"}`)
       .then((r) => r.json())
       .then((data) => { setModels(Array.isArray(data) ? data : []); setLoading(false); })
       .catch((e) => { setError(String(e)); setLoading(false); });
-  }, [tick]);
+  }, [tick, activeOnly]);
 
   const summary = {
     total: models.length,
+    active: models.filter((m) => m.is_active).length,
     withLong: models.filter((m) => m.has_long_model).length,
     withShort: models.filter((m) => m.has_short_model).length,
   };
@@ -176,15 +180,35 @@ export default function ModelsPage() {
         <div>
           <h1 className="text-xl font-semibold text-[#F3F4F6]">Models</h1>
           <p className="text-xs text-[#9CA3AF] mt-0.5">
-            {summary.total} symbols · {summary.withLong} long · {summary.withShort} short
+            {summary.total} symbols · {summary.active} active · {summary.withLong} long · {summary.withShort} short
           </p>
         </div>
-        <button
-          onClick={() => setTick((t) => t + 1)}
-          className="px-3 py-1.5 rounded border border-[#374151] bg-[#0a0e15] text-[#9CA3AF] text-xs hover:text-[#F3F4F6] hover:border-[#4B5563] transition-colors"
-        >
-          ↻ Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <div className="flex gap-1 bg-[#10151D] border border-[#374151] rounded-md p-0.5">
+            <button
+              onClick={() => setActiveOnly(true)}
+              className={`px-3 py-1 text-xs rounded transition-colors ${
+                activeOnly ? "bg-[#3B82F6]/20 text-[#3B82F6]" : "text-[#9CA3AF] hover:text-[#F3F4F6]"
+              }`}
+            >
+              Active only
+            </button>
+            <button
+              onClick={() => setActiveOnly(false)}
+              className={`px-3 py-1 text-xs rounded transition-colors ${
+                !activeOnly ? "bg-[#3B82F6]/20 text-[#3B82F6]" : "text-[#9CA3AF] hover:text-[#F3F4F6]"
+              }`}
+            >
+              All on disk
+            </button>
+          </div>
+          <button
+            onClick={() => setTick((t) => t + 1)}
+            className="px-3 py-1.5 rounded border border-[#374151] bg-[#0a0e15] text-[#9CA3AF] text-xs hover:text-[#F3F4F6] hover:border-[#4B5563] transition-colors"
+          >
+            ↻ Refresh
+          </button>
+        </div>
       </div>
 
       {error && <div className="text-[#EF4444] text-sm py-4 text-center">Failed to load: {error}</div>}
@@ -199,9 +223,18 @@ export default function ModelsPage() {
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
           {models.map((m) => (
-            <div key={m.symbol} className="bg-[#10151D] border border-[#374151] rounded-lg p-4 space-y-3 hover:border-[#4B5563] transition-colors">
+            <div key={m.symbol} className={`bg-[#10151D] border rounded-lg p-4 space-y-3 transition-colors ${
+              m.is_active ? "border-[#374151] hover:border-[#4B5563]" : "border-[#374151]/40 opacity-60 hover:opacity-100"
+            }`}>
               <div className="flex items-center justify-between">
-                <span className="font-mono text-[#F3F4F6] font-semibold">{m.symbol}</span>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-[#F3F4F6] font-semibold">{m.symbol}</span>
+                  {!m.is_active && (
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-[#374151] text-[#9CA3AF] border border-[#374151]">
+                      INACTIVE
+                    </span>
+                  )}
+                </div>
                 <div className="flex gap-1">
                   <Badge active={m.has_long_model} label="LONG" />
                   <Badge active={m.has_short_model} label="SHORT" />
