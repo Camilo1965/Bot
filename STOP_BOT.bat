@@ -2,23 +2,31 @@
 setlocal
 cd /d "%~dp0"
 
-REM === Para ClawdBot (proceso en segundo plano) ===
+REM === Para ClawdBot y cierra el tunel Cloudflare ===
 
+REM ── Para el bot ──────────────────────────────────────────────────────────────
 if not exist "logs\bot.pid" (
-    echo No hay bot.pid — el bot no fue iniciado con START_BOT.bat o ya fue parado.
-    pause
-    exit /b 0
+    echo No hay bot.pid — bot no iniciado con START_BOT.bat o ya parado.
+) else (
+    set /p PID=<"logs\bot.pid"
+    echo Parando bot (PID=!PID!)...
+    powershell -NoProfile -Command ^
+        "$p = Get-Process -Id !PID! -EA SilentlyContinue; if ($p) { $p.Kill(); $p.WaitForExit(5000); Write-Host 'Bot detenido.' } else { Write-Host 'Bot ya estaba parado.' }"
+    del "logs\bot.pid" 2>nul
 )
 
-set /p PID=<"logs\bot.pid"
-echo Parando bot (PID=%PID%)...
+REM ── Cierra el tunel Cloudflare ────────────────────────────────────────────────
+if exist "logs\cloudflared.pid" (
+    set /p CFPID=<"logs\cloudflared.pid"
+    echo Cerrando tunel Cloudflare (PID=!CFPID!)...
+    powershell -NoProfile -Command ^
+        "$p = Get-Process -Id !CFPID! -EA SilentlyContinue; if ($p) { $p.Kill(); Write-Host 'Tunel cerrado.' } else { Write-Host 'Tunel ya estaba cerrado.' }"
+    del "logs\cloudflared.pid" 2>nul
+    del "logs\tunnel_url.txt" 2>nul
+)
 
-powershell -NoProfile -Command ^
-    "$p = Get-Process -Id %PID% -ErrorAction SilentlyContinue; if ($p) { $p.Kill(); $p.WaitForExit(5000); Write-Host 'Bot detenido.' } else { Write-Host 'Proceso no encontrado (ya parado).' }"
-
-del "logs\bot.pid" 2>nul
 echo.
-echo Listo. Para exportar el log del dia: doble clic en EXPORT_DAY_REVIEW.bat
+echo Todo detenido. Para exportar logs: doble clic en EXPORT_DAY_REVIEW.bat
 echo.
 pause
 endlocal

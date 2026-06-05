@@ -1,10 +1,10 @@
 /**
- * Runtime API base URL — derives from the browser's hostname so the dashboard
- * works from localhost, LAN IP, Tailscale IP, or any tunnel without rebuilding.
- *
- * FastAPI runs on port 8000; Next.js on 3000. Both are on the same host.
+ * API base URL — always same origin as the frontend (Next.js proxies
+ * /api/* and /ws/* to FastAPI on port 8000 via next.config.ts rewrites).
+ * Works from localhost, LAN IP, Tailscale, or any public tunnel without
+ * rebuilding or changing config.
  */
 export const API_BASE =
   typeof window !== "undefined"
-    ? `${window.location.protocol}//${window.location.hostname}:8000`
-    : "http://localhost:8000";
+    ? `${window.location.protocol}//${window.location.host}`
+    : "http://localhost:3000";
