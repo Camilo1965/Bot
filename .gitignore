@@ -42,3 +42,6 @@ data/cache/
 # Plan/patch files (working docs, not source)
 plan_final.md
 profitabilityfixes.patch
+cloudflared.exe
+logs/cloudflared.log
+logs/tunnel_url.txt

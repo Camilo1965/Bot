@@ -3,7 +3,8 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 REM === Arranca ClawdBot en segundo plano (sin ventana) ===
-REM Acceso remoto via Tailscale — URL permanente, funciona desde cualquier red.
+REM Cloudflare Quick Tunnel: URL publica para acceder desde cualquier lugar.
+REM Sin cuenta, sin instalacion extra. URL cambia al reiniciar.
 
 if not exist "logs" mkdir logs
 
@@ -29,36 +30,20 @@ for /f "tokens=*" %%i in ('powershell -NoProfile -Command ^
     "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.)' } | Sort-Object PrefixLength -Desc | Select-Object -First 1).IPAddress"') do set "LOCAL_IP=%%i"
 if not defined LOCAL_IP set "LOCAL_IP=localhost"
 
-REM ── IP Tailscale ─────────────────────────────────────────────────────────────
-set "TS_IP="
-set "TS_EXE="
-if exist "C:\Program Files\Tailscale\tailscale.exe" set "TS_EXE=C:\Program Files\Tailscale\tailscale.exe"
-if not defined TS_EXE (
-    for /f "tokens=*" %%i in ('where tailscale 2^>nul') do set "TS_EXE=%%i"
-)
-
-if defined TS_EXE (
-    for /f "tokens=*" %%i in ('"%TS_EXE%" ip -4 2^>nul') do set "TS_IP=%%i"
-    if not defined TS_IP (
-        echo AVISO: Tailscale instalado pero no conectado. Ejecuta Tailscale y conectate primero.
-        echo        Descarga: https://tailscale.com/download
-        echo.
-    )
-) else (
-    echo.
-    echo  Tailscale NO esta instalado.
-    echo  Para acceso remoto desde cualquier lugar ^(celular, trabajo, etc^):
-    echo    1. Descarga e instala: https://tailscale.com/download
-    echo    2. Instala tambien en tu celular y conecta con la misma cuenta.
-    echo    3. Vuelve a abrir este bat.
-    echo.
-    echo  Por ahora solo funciona en red local.
-    echo.
-)
-
-REM ── Firewall (puertos 3000 y 8000) ───────────────────────────────────────────
+REM ── Firewall ─────────────────────────────────────────────────────────────────
 powershell -NoProfile -Command ^
-    "if (-not (Get-NetFirewallRule -DisplayName 'ClawdBot-Dashboard' -EA SilentlyContinue)) { New-NetFirewallRule -DisplayName 'ClawdBot-Dashboard' -Direction Inbound -Protocol TCP -LocalPort 3000,8000 -Action Allow | Out-Null; Write-Host 'Firewall: reglas creadas.' } else { Write-Host 'Firewall: ya configurado.' }"
+    "if (-not (Get-NetFirewallRule -DisplayName 'ClawdBot-Dashboard' -EA SilentlyContinue)) { New-NetFirewallRule -DisplayName 'ClawdBot-Dashboard' -Direction Inbound -Protocol TCP -LocalPort 3000,8000 -Action Allow | Out-Null; Write-Host 'Firewall: reglas creadas.' } else { Write-Host 'Firewall: OK.' }"
+
+REM ── Descarga cloudflared si no existe (~30MB, una sola vez) ──────────────────
+if not exist "cloudflared.exe" (
+    echo Descargando cloudflared.exe (primera vez, ~30MB)...
+    powershell -NoProfile -Command ^
+        "Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile 'cloudflared.exe' -UseBasicParsing; Write-Host 'OK.'"
+    if not exist "cloudflared.exe" (
+        echo ERROR: No se pudo descargar cloudflared.exe. Revisa la conexion.
+        pause & exit /b 1
+    )
+)
 
 REM ── Lanza bot oculto ─────────────────────────────────────────────────────────
 echo Iniciando ClawdBot...
@@ -70,28 +55,44 @@ echo Esperando dashboard...
 powershell -NoProfile -Command ^
     "$i=0; Write-Host 'Esperando' -NoNewline; while($i -lt 30){ try{ Invoke-WebRequest -Uri 'http://localhost:3000' -UseBasicParsing -TimeoutSec 2 -EA Stop | Out-Null; Write-Host ' listo.'; break }catch{ Write-Host '.' -NoNewline; Start-Sleep 2; $i++ } }"
 
-REM ── Abre navegador con mejor URL disponible ───────────────────────────────────
-if defined TS_IP (
-    start "" "http://%TS_IP%:3000"
+REM ── Lanza tunel Cloudflare (oculto) ──────────────────────────────────────────
+echo Iniciando tunel publico...
+if exist "logs\cloudflared.log" del "logs\cloudflared.log"
+if exist "logs\tunnel_url.txt"  del "logs\tunnel_url.txt"
+powershell -NoProfile -Command ^
+    "$p = Start-Process -FilePath 'cloudflared.exe' -ArgumentList 'tunnel','--url','http://localhost:3000','--logfile','logs\cloudflared.log' -WindowStyle Hidden -PassThru; $p.Id | Out-File 'logs\cloudflared.pid' -Encoding ascii -NoNewline"
+
+REM ── Extrae URL publica del log (espera hasta 40s) ─────────────────────────────
+set "PUBLIC_URL="
+powershell -NoProfile -Command ^
+    "$i=0; Write-Host 'Obteniendo URL publica' -NoNewline; while($i -lt 20){ Start-Sleep 2; if(Test-Path 'logs\cloudflared.log'){ $m=Select-String 'logs\cloudflared.log' -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' | Select -First 1; if($m){ $url=([regex]'https://[a-z0-9-]+\.trycloudflare\.com').Match($m.Line).Value; $url | Out-File 'logs\tunnel_url.txt' -Encoding ascii -NoNewline; Write-Host ('  ' + $url); exit 0 } }; Write-Host '.' -NoNewline; $i++ }; Write-Host '  timeout.'"
+if exist "logs\tunnel_url.txt" set /p PUBLIC_URL=<"logs\tunnel_url.txt"
+
+REM ── Abre navegador ───────────────────────────────────────────────────────────
+if defined PUBLIC_URL (
+    start "" "%PUBLIC_URL%"
 ) else (
     start "" "http://localhost:3000"
 )
 
 echo.
 echo ================================================================
-echo   LOCAL:     http://localhost:3000
-echo   RED LAN:   http://%LOCAL_IP%:3000
-if defined TS_IP (
-echo   TAILSCALE: http://%TS_IP%:3000   ^<-- usa esta en tu celular
+echo   LOCAL:    http://localhost:3000
+echo   LAN:      http://%LOCAL_IP%:3000
+if defined PUBLIC_URL (
 echo.
-echo   La URL de Tailscale es PERMANENTE. Siempre la misma.
+echo   INTERNET: %PUBLIC_URL%
+echo.
+echo   Comparte esa URL — cualquiera puede abrirla desde cualquier red.
+echo   AVISO: La URL cambia cada vez que reinicias el bot.
+echo          Para URL fija permanente: cuenta gratis en ngrok.com
 ) else (
-echo   TAILSCALE: no disponible ^(instala en https://tailscale.com/download^)
+echo   INTERNET: no disponible - revisa logs\cloudflared.log
 )
 echo ================================================================
 echo.
 echo Para parar: doble clic en STOP_BOT.bat
-echo Para revisar logs: doble clic en EXPORT_DAY_REVIEW.bat
+echo Para logs:  doble clic en EXPORT_DAY_REVIEW.bat
 echo.
 pause
 endlocal
