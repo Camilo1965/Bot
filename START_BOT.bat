@@ -35,6 +35,11 @@ echo Iniciando ClawdBot en segundo plano...
 powershell -NoProfile -Command ^
     "$p = Start-Process -FilePath '%PYEXE%' -ArgumentList 'main.py' -WorkingDirectory '%~dp0' -WindowStyle Hidden -RedirectStandardOutput 'logs\bot_stdout.log' -RedirectStandardError 'logs\bot_stderr.log' -PassThru; $p.Id | Out-File -FilePath 'logs\bot.pid' -Encoding ascii -NoNewline; Write-Host ('Bot iniciado. PID=' + $p.Id)"
 
+REM Espera a que el dashboard este listo y abre el navegador
+echo Esperando que el dashboard arranque...
+powershell -NoProfile -Command ^
+    "$url = 'http://localhost:3000'; $max = 30; $i = 0; Write-Host 'Esperando dashboard' -NoNewline; while ($i -lt $max) { try { $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop; Write-Host ''; Write-Host 'Dashboard listo.'; Start-Process $url; exit 0 } catch { Write-Host '.' -NoNewline; Start-Sleep 2; $i++ } }; Write-Host ''; Write-Host 'Timeout — abriendo igual...'; Start-Process $url"
+
 echo.
 echo Logs en:
 echo   logs\bot_stdout.log  (stdout)
