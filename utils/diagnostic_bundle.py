@@ -454,7 +454,7 @@ def write_diagnostic_bundle(
         parts.append(f"\n## 8) `audit.log` ({au_note or 'contenido'})\n")
         parts.append("```text\n" + au_text + "```\n")
 
-        jpath = logs_dir / "trade_journal.csv"
+        jpath = logs_dir / "trade_journal_clean.csv"
         tj_text, tj_note = _read_full_or_tail(
             jpath,
             whole_max_bytes=1_000_000,
@@ -464,7 +464,7 @@ def write_diagnostic_bundle(
         parts.append(f"\n## 9) `logs/trade_journal.csv` ({tj_note or 'contenido'})\n")
         parts.append("```text\n" + tj_text + "```\n")
 
-        st_path = repo_root / "state.json"
+        st_path = logs_dir / "state.json"
         if st_path.is_file():
             st_text, st_note = _read_full_or_tail(
                 st_path,
@@ -520,8 +520,8 @@ def write_diagnostic_bundle(
         parts.append("\n## 8) `audit.log` (últimas 120 líneas)\n")
         parts.append("```text\n" + _tail_text(repo_root / "audit.log", 120) + "```\n")
 
-        parts.append("\n## 9) `logs/trade_journal.csv` (últimas 80 líneas)\n")
-        parts.append("```text\n" + _tail_text(logs_dir / "trade_journal.csv", 80) + "```\n")
+        parts.append("\n## 9) `logs/trade_journal_clean.csv` (últimas 80 líneas)\n")
+        parts.append("```text\n" + _tail_text(logs_dir / "trade_journal_clean.csv", 80) + "```\n")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("".join(parts), encoding="utf-8")

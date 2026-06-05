@@ -72,6 +72,7 @@ from bot.market_consumer import market_consumer
 from bot.mt5_preload import preload_historical_data_mt5
 from bot.signal_emitter import signal_emitter
 from bot.web_server import start_web_dashboard
+from bot.dashboard_launcher import start_dashboard_servers
 from bot.biweekly_retrainer import biweekly_retrainer
 from data_ingestion.mt5_market_client import MT5MarketDataClient
 from database.db_manager import close_db, db, init_db
@@ -389,10 +390,11 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
     audit_logger.propagate = False  # never reaches console or bot_debug.log
     audit_logger.addHandler(audit_file_handler)
 
-    # Write a column header once per session so the file is self-describing.
-    audit_logger.info(
-        "# [HORA]    | [MONEDA]   | PRECIO_ACTUAL | PICO_MÁX    | ATR_VAL  | STOP_CALCULADO | XGB_CONF | DISTANCIA_%"
-    )
+    # Write header only when file is new/empty — avoids duplicate headers on restart.
+    if not audit_log_file.exists() or audit_log_file.stat().st_size == 0:
+        audit_logger.info(
+            "# [HORA]    | [MONEDA]   | PRECIO_ACTUAL | PICO_MÁX    | ATR_VAL  | STOP_CALCULADO | XGB_CONF | DISTANCIA_%"
+        )
 
     boot = logging.getLogger("clawdbot")
     boot.info(
@@ -464,6 +466,8 @@ async def main() -> None:
 
     market_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     shared_state: dict[str, Any] = {
+        "session_id": _LOG_SESSION_ID,
+        "session_started_at": datetime.now(tz=timezone.utc).isoformat(),
         "prices": {symbol: deque(maxlen=1000) for symbol in WATCHLIST},
         # Homogeneous closes for dashboard RSI (single TF; see DASHBOARD_RSI_TF, default 15m).
         "dashboard_rsi_closes": {symbol: deque(maxlen=500) for symbol in WATCHLIST},
@@ -964,6 +968,12 @@ async def main() -> None:
         critical=False,
         restart=True,
         restart_delay_s=10.0,
+    )
+    supervisor.spawn(
+        "dashboard_servers",
+        start_dashboard_servers,
+        critical=False,
+        restart=False,
     )
 
     # ── Vibe-Trading hybrid client integration (optional) ───────────────────
