@@ -59,7 +59,7 @@ COOLDOWN_AFTER_LOSSES = 0    # 0 disabled; else pause N bars after 2 consec loss
 SYMBOL_CONFIG = {
     # Mirrors strategy/ml_predictor.py:SYMBOL_CONFIG (canonical). Tuned 2026-06-02
     # via disk-loaded backtest + post-retrain calibration refit + per-symbol param sweep.
-    "BTC/USDT":  {"prob_threshold": 0.85, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.040, "risk": 0.015, "timeframe": "30m", "horizon": 36, "regime_adx": 25.0, "max_spw": None, "skip_regime": False, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},
+    "BTC/USDT":  {"prob_threshold": 0.05, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.040, "risk": 0.015, "timeframe": "30m", "horizon": 36, "regime_adx": 25.0, "max_spw": None, "skip_regime": False, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},
     "ETH/USDT":  {"prob_threshold": 0.75, "fixed_sl_pct": 0.020, "fixed_tp_pct": 0.030, "risk": 0.015, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},  # PT raised 2026-06-03 (backtest WR 32%)
     "XRP/USDT":  {"prob_threshold": 0.65, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.005, "timeframe": "15m", "horizon": 16, "regime_adx": 20.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05}},  # DEMOTED
     "SOL/USDT":  {"prob_threshold": 0.70, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.035, "risk": 0.015, "timeframe": "30m", "horizon": 24, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
@@ -69,9 +69,9 @@ SYMBOL_CONFIG = {
     # ATOM/USDT REMOVED 2026-06-03: threshold sweep 0.30-0.95 all negative (best Sharpe -0.02, PnL -4.22%). Model unprofitable.
     "LINK/USDT": {"prob_threshold": 0.55, "fixed_sl_pct": 0.030, "fixed_tp_pct": 0.050, "risk": 0.008, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10}},
     # Phase D+ survivor (scan 2026-06-03): WR 60.6%, PnL +15.84%, score 32.84. Needs retrain before live.
-    "JTO/USDT":  {"prob_threshold": 0.70, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
+    "JTO/USDT":  {"prob_threshold": 0.99, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
     # Phase E survivor (scan 2026-06-03): WR 53.0%, PnL +9.82%, PF 1.50, score 15.63. Best of 7 new candidates.
-    "INJ/USDT":  {"prob_threshold": 0.55, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
+    "INJ/USDT":  {"prob_threshold": 0.20, "risk": 0.005, "fixed_sl_pct": 0.025, "fixed_tp_pct": 0.040, "risk": 0.010, "timeframe": "15m", "horizon": 20, "regime_adx": 25.0, "max_spw": 8.0,   "skip_regime": True, "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15}},
 }
 
 
@@ -224,7 +224,14 @@ def _run_simulation_loop(
     highs = feat["high"].to_numpy()
     lows = feat["low"].to_numpy()
     atrs = feat["atr"].fillna(0.0).to_numpy()
-    htf_sma_slow = feat["close"].rolling(HTF_SLOW_PERIOD, min_periods=HTF_SLOW_PERIOD).mean().to_numpy()
+    # Use the exact same SMA200-1h gate as the live signal emitter (close_vs_sma200_1h >= 0).
+    # Falls back to the entry-TF SMA proxy only when the column is absent (e.g. legacy callers).
+    if USE_HTF_FILTER and "close_vs_sma200_1h" in feat.columns:
+        htf_sma200_1h = feat["close_vs_sma200_1h"].to_numpy(dtype=np.float64)
+        _use_exact_sma200 = True
+    else:
+        htf_sma_slow = feat["close"].rolling(HTF_SLOW_PERIOD, min_periods=HTF_SLOW_PERIOD).mean().to_numpy()
+        _use_exact_sma200 = False
     cooldown_until = -1  # bar index; -1 = no cooldown
     last_losses_streak = 0
     timestamps = feat["timestamp"] if "timestamp" in feat.columns else pd.RangeIndex(len(feat))
@@ -338,10 +345,15 @@ def _run_simulation_loop(
         if cooldown_until > 0 and i < cooldown_until:
             continue
 
-        # ── HTF trend filter (price > SMA slow on entry TF as trend proxy) ──
-        if USE_HTF_FILTER and not np.isnan(htf_sma_slow[i]):
-            if current_price < float(htf_sma_slow[i]):
-                continue
+        # ── HTF trend filter — exact SMA200 1h gate matching live signal emitter ──
+        if USE_HTF_FILTER:
+            if _use_exact_sma200:
+                val = float(htf_sma200_1h[i])
+                if np.isnan(val) or val < 0.0:
+                    continue
+            elif not np.isnan(htf_sma_slow[i]):
+                if current_price < float(htf_sma_slow[i]):
+                    continue
 
         # ── Regime filter ──
         regime_prob = float(regime_probs[i])

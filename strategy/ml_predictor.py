@@ -59,9 +59,10 @@ def _float_env(name: str, default: float) -> float:
 # Baseline snapshot (pre-2026-06-02): logs/symbol_config_baseline.json.
 SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     "BTC/USDT": {
-        # Threshold sweep 2026-06-03 (honest calibration, no leak): pt=0.85
-        # → 13 trades, WR 61.5%, Sharpe +0.40, PnL +4.08%.
-        "prob_threshold": 0.85,
+        # 2026-06-06 retrain: AUC 0.7148, but calibrated probs max at 0.069 — class imbalance
+        # (1.5% move in 4h is rare for BTC@100k). Threshold lowered to match calibrated range.
+        # 60d backtest pt=0.05: 9 trades, WR 55.6%, PnL +4.62%, Sharpe 0.89. Marginal, monitor.
+        "prob_threshold": 0.05,
         "fixed_sl_pct": 0.020,
         "fixed_tp_pct": 0.040,
         "use_sma_filter": True,
@@ -154,26 +155,29 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "skip_regime": True,
         "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10},
     },
+    # JTO/USDT DISABLED 2026-06-06 — retrain AUC 0.5339 below min 0.55, model rejected.
+    # No predictive signal found across any threshold. Remove from WATCHLIST.
     "JTO/USDT": {
-        # Threshold sweep 2026-06-03: pt=0.70 → 54 trades, Sharpe +0.29, PnL +5.40%.
-        "prob_threshold": 0.70,
+        "prob_threshold": 0.99,
         "fixed_sl_pct": 0.025,
         "fixed_tp_pct": 0.040,
         "use_sma_filter": True,
-        "risk": 0.010,
+        "risk": 0.001,
         "timeframe": "15m",
         "horizon": 20,
         "skip_regime": True,
         "exec_costs": {"spread_bps": 8.0, "slippage_atr_mult": 0.15},
     },
+    # INJ/USDT WATCH-ONLY 2026-06-06 — retrain AUC 0.5642, barely above random.
+    # 60d backtest pt=0.20 shows +151% but model is partially in-sample (just retrained).
+    # Threshold=0.20 matches calibrated range. Risk minimal until 30d live OOS confirms.
+    # NOT in active WATCHLIST — add after validated performance.
     "INJ/USDT": {
-        # Phase E survivor (scan 2026-06-03): WR 53%, PnL +9.82%, PF 1.50.
-        # Best of 7 new candidates (RUNE/ARB/OP/SUI/SEI/INJ/TIA).
-        "prob_threshold": 0.55,
+        "prob_threshold": 0.20,
         "fixed_sl_pct": 0.025,
         "fixed_tp_pct": 0.040,
         "use_sma_filter": True,
-        "risk": 0.010,
+        "risk": 0.005,
         "timeframe": "15m",
         "horizon": 20,
         "skip_regime": True,
