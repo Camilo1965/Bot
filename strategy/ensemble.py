@@ -63,7 +63,7 @@ class EnsemblePredictor:
             )
             self._lgbm.fit(X, y)
         except ImportError:
-            logger.warning("lightgbm not installed — ensemble uses XGB+LR only (2-model average)")
+            logger.info("lightgbm not installed — ensemble uses XGB+LR only (2-model average)")
             self._lgbm = None
             # rebalance weights to XGB + LR
             w = np.array([self._w[0] + self._w[1] / 2, 0.0, self._w[2] + self._w[1] / 2])

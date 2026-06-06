@@ -38,7 +38,7 @@ try:
 except ImportError:
     _sm_coint = None  # type: ignore[assignment]
     _STATSMODELS_AVAILABLE = False
-    logger.warning(
+    logger.info(
         "statsmodels not installed — cointegration test will be skipped. "
         "Install with: pip install statsmodels"
     )

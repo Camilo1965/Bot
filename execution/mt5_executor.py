@@ -71,6 +71,10 @@ except ImportError:
     pd = None  # type: ignore[assignment]
     _PANDAS_AVAILABLE = False
 
+from dashboard.api.bot_writer import (
+    write_position_opened as _dash_pos_opened,
+    write_position_closed as _dash_pos_closed,
+)
 from execution.journal_symbols import journal_symbol
 from risk import risk_manager as _risk_cap_mod
 from execution.paper_executor import (
@@ -147,19 +151,22 @@ SYMBOL_MAP: dict[str, str] = {
     "DOT/USDT":    "DOTUSD-T",
     "BCH/USDT":    "BCHUSD-T",
     "BNB/USDT":    "BNBUSD-T",
-    "LINK/USDT":   "LINKUSD-T",
+    "LINK/USDT":   "LNKUSD-T",
     "INJ/USDT":    "INJUSD-T",
     "FET/USDT":    "FETUSD-T",
     "RENDER/USDT": "RENDERUSD-T",
     "DOGE/USDT":   "DGEUSD-T",
     "PEPE/USDT":   "PEPEUSD-T",
     "PAXG/USDT":   "XAUUSD-T",
+    "NEAR/USDT":   "NEARUSD-T",
+    "JTO/USDT":    "JTOUSD-T",
+    "ATOM/USDT":   "ATOMUSD-T",
     # Raw MT5 base names (pass-through for code that already normalises)
     "BTCUSD":      "BTCUSD-T",
     "ETHUSD":      "ETHUSD-T",
     "SOLUSD":      "SOLUSD-T",
     "BNBUSD":      "BNBUSD-T",
-    "LINKUSD":     "LINKUSD-T",
+    "LINKUSD":     "LNKUSD-T",
     "INJUSD":      "INJUSD-T",
     "FETUSD":      "FETUSD-T",
     "RENDERUSD":   "RENDERUSD-T",
@@ -958,8 +965,6 @@ class MT5Executor(PaperExecutor):
                 mapped.replace("-T", "m"),
                 f"{mapped}.r",
                 mapped + "m",
-                "ETHUSD-T",
-                "DGEUSD-T",
             ]
             # Dedupe while preserving order
             variants = list(dict.fromkeys(variants))
@@ -974,7 +979,7 @@ class MT5Executor(PaperExecutor):
             SYMBOL_MAP[internal] = fixed
             base = internal.replace("/USDT", "USD")
             SYMBOL_MAP[base] = fixed
-            logger.warning(
+            logger.info(
                 "[MT5] Auto-remapped %s from %s to broker symbol %s",
                 internal,
                 mapped,
@@ -1886,6 +1891,23 @@ class MT5Executor(PaperExecutor):
                 f"SL fijo (~{thresholds.sl_pct * 100:.2f}%): {self.open_positions[sym].stop_loss_price:.2f}"
             )
         )
+        try:
+            await _dash_pos_opened(
+                trade_id=str(trade_id),
+                symbol=sym,
+                side="long",
+                entry=float(entry_price),
+                sl=float(stop_loss_price),
+                tp=0.0,
+                size=float(position_size),
+                ml_confidence=float(win_probability),
+                sl_pct=float(thresholds.sl_pct),
+                activation_pct=float(thresholds.activation_pct),
+                atr_at_entry=float(atr_trailing_distance) if atr_trailing_distance else None,
+                entry_time=ts.isoformat() if hasattr(ts, "isoformat") else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("dashboard mirror pos_opened (mt5) failed: %s", exc)
         if self._live and isinstance(mt5_ticket, int):
             await self._verify_initial_sl_synced(sym, pos_ref, mt5_ticket)
         return True
@@ -1970,17 +1992,26 @@ class MT5Executor(PaperExecutor):
 
         async with self._positions_lock:
             self._risk.credit(gross_pnl)
-            
+
             # [PRO] Portfolio risk accounting
             risk_usd = pos.position_size * pos.sl_pct
             self._risk.register_close(risk_usd=risk_usd)
-            
+
             if gross_pnl < 0.0:
                 self._risk.record_daily_loss(-gross_pnl)
             self.total_pnl += gross_pnl
             sym_ref = pos.symbol
             if symbol in self.open_positions:
                 del self.open_positions[symbol]
+
+        try:
+            await _dash_pos_closed(
+                trade_id=str(pos.trade_id),
+                pnl_usd=float(gross_pnl),
+                reason=str(exit_reason_code or "unknown"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("dashboard mirror pos_closed (mt5) failed: %s", exc)
 
         margin_used = pos.position_size / LEVERAGE
         pnl_pct = (pnl_net / margin_used * 100) if margin_used > 0 else 0.0
@@ -2609,7 +2640,7 @@ class MT5Executor(PaperExecutor):
                 if self._ghost_mark_missing(gk, confirmations_required=needed_confirmations):
                     ghost_symbols.append(sym)
                 else:
-                    logger.warning(
+                    logger.info(
                         "[MT5 SYNC] Ghost candidate %s (%d/%d) - waiting confirmation.",
                         sym,
                         self._ghost_missing_counts.get(gk, 0),
@@ -2638,7 +2669,7 @@ class MT5Executor(PaperExecutor):
         async with self._positions_lock:
             actual = len(self.open_positions)
             if self._risk.open_count != actual:
-                logger.warning(
+                logger.info(
                     "[MT5 SYNC] Counter drift detected: risk.open_count=%d actual=%d - correcting.",
                     self._risk.open_count,
                     actual,

@@ -113,6 +113,7 @@ _LAST_ALERT_SENT_AT: dict[str, float] = {}
 _TELEGRAM_LOG_HANDLER_SKIP_PREFIXES: tuple[str, ...] = (
     "utils.telegram_notifier",
     "aiohttp.access",
+    "bot.dashboard_launcher",
 )
 
 

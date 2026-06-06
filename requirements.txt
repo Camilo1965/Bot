@@ -51,5 +51,5 @@ MetaTrader5
 vibe-trading-ai
 
 # Tests
-pytest
-pytest-asyncio
+pytest==8.2.2
+pytest-asyncio==0.23.8

@@ -221,7 +221,24 @@ class RiskManager:
         
         # [PRO] Portfolio-level risk tracking
         self._weekly_start_balance: float = initial_balance
+        # High-water mark: weekly drawdown is measured from the peak, not a fixed
+        # start, so a stable real balance never reads as a false drawdown.
+        self._weekly_peak_balance: float = initial_balance
+        # Anti-spam latch for the half-risk drawdown warning (log on transition only).
+        self._halfrisk_active: bool = False
+        self.equity: float = initial_balance
         self._total_risk_usd: float = 0.0 # Sum of (entry - SL) * lots for all open positions
+
+    def sync_live_equity(self, balance: float, equity: float | None = None) -> None:
+        """Adopt the broker account as the source of truth for balance/equity.
+
+        In live (MT5) mode the internal tracker drifts from the real account;
+        calling this each cycle with ``mt5.account_info()`` values keeps sizing,
+        drawdown and metrics aligned with the broker.
+        """
+        if balance is not None and balance > 0.0:
+            self.balance = float(balance)
+        self.equity = float(equity) if equity is not None and equity > 0.0 else self.balance
 
     def get_current_risk_exposure(self) -> float:
         """Return the current percentage of capital at risk."""
@@ -260,14 +277,22 @@ class RiskManager:
             logger.warning("calculate_position_size: non-positive balance=%.4f — returning 0.", self.balance)
             return 0.0
 
-        # 1. Drawdown 'Thermometer' - reduce risk if weekly performance is poor
-        weekly_dd = (self._weekly_start_balance - self.balance) / self._weekly_start_balance
+        # 1. Drawdown 'Thermometer' - reduce risk if weekly performance is poor.
+        # Measure from the weekly high-water mark so a stable balance reads 0% DD.
+        self._weekly_peak_balance = max(self._weekly_peak_balance, self.balance)
+        weekly_dd = (self._weekly_peak_balance - self.balance) / self._weekly_peak_balance
         if weekly_dd > DRAWDOWN_HALFRISK_THRESHOLD:
             base_r *= _HALFRISK_MULTIPLIER
-            logger.warning(
-                "Risk reduced by %.0f%% due to weekly drawdown (%.2f%% > %.2f%%)",
-                _HALFRISK_MULTIPLIER * 100, weekly_dd * 100, DRAWDOWN_HALFRISK_THRESHOLD * 100,
-            )
+            # Log only on the False->True transition to avoid Telegram spam.
+            if not self._halfrisk_active:
+                self._halfrisk_active = True
+                logger.warning(
+                    "Risk reduced by %.0f%% due to weekly drawdown (%.2f%% > %.2f%%)",
+                    _HALFRISK_MULTIPLIER * 100, weekly_dd * 100, DRAWDOWN_HALFRISK_THRESHOLD * 100,
+                )
+        elif self._halfrisk_active:
+            self._halfrisk_active = False
+            logger.info("Risk restored to full: weekly drawdown back under %.2f%%.", DRAWDOWN_HALFRISK_THRESHOLD * 100)
 
         # 2. Portfolio Exposure Check
         current_exposure = self.get_current_risk_exposure()
@@ -395,6 +420,12 @@ class RiskManager:
         self._daily_start_balance = self.balance
         self._daily_loss = 0.0
         self._trading_halted_until = None
+
+    def reset_weekly_stats(self) -> None:
+        """Reset the weekly drawdown baseline and high-water mark to the current balance."""
+        self._weekly_start_balance = self.balance
+        self._weekly_peak_balance = self.balance
+        self._halfrisk_active = False
 
     def is_sector_exposed(self, symbol: str, open_symbols: list[str]) -> bool:
         """Return *True* if any symbol in *open_symbols* shares the sector of *symbol*."""

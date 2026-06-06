@@ -85,13 +85,14 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "skip_regime": True,
         "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05},
     },
+    # XRP/USDT DEPRECATED 2026-06-04 — demoted (backtest -9.2% over 30d, risk 0.005 simbólico).
+    # Not in active WATCHLIST. Re-evaluate only after model rebuild. Do not re-enable.
     "XRP/USDT": {
-        # Threshold sweep 2026-06-03: pt=0.65 → 26 trades, Sharpe +0.40, PnL +1.19%.
-        "prob_threshold": 0.65,
+        "prob_threshold": 0.95,
         "fixed_sl_pct": 0.025,
         "fixed_tp_pct": 0.040,
         "use_sma_filter": True,
-        "risk": 0.005,
+        "risk": 0.001,
         "timeframe": "15m",
         "horizon": 16,
         "skip_regime": True,
@@ -391,6 +392,7 @@ class MLPredictor:
             random_state=42,
         )
         self._is_trained = False
+        self._short_warn_logged: set[str] = set()
         logger.info("MLPredictor initialised (XGBoost).")
 
     @property
@@ -607,6 +609,75 @@ class MLPredictor:
     # Inference
     # ------------------------------------------------------------------
 
+    def _finalize_features(
+        self,
+        features: list[float],
+        booster: Any,
+        vibe_features: list[float] | None = None,
+    ) -> "pd.DataFrame":
+        """Build the model input frame from raw features for any booster.
+
+        Appends VIBE features, pads/truncates to the booster's expected feature
+        count, and labels columns with the booster's own feature names (falling
+        back to ``FINAL_FEATURE_ORDER``). Shared by the LONG and SHORT paths so
+        both absorb models of any feature count (e.g. 30 quant+vibe or 36 MTF)
+        without a shape/column mismatch. Features the runtime does not compute
+        (e.g. higher-timeframe columns on an MTF model) are zero-padded.
+        """
+        feats = list(features)
+        if _VIBE_ENABLED:
+            if vibe_features is not None and len(vibe_features) == len(VIBE_FEATURE_COLS):
+                feats.extend(vibe_features)
+            else:
+                feats.extend(VIBE_FEATURE_NEUTRAL)
+
+        try:
+            model_features = int(booster.n_features_in_)
+        except AttributeError:
+            try:
+                model_features = int(booster.get_booster().num_features())
+            except Exception:
+                model_features = len(_FEATURE_COLS)
+
+        # Auto-Padding: V2 model (16) with only 12 input features
+        if model_features == 16 and len(feats) == 12:
+            feats.extend(VIBE_FEATURE_NEUTRAL)
+
+        # Generic length safety net
+        if len(feats) < model_features:
+            feats.extend([0.0] * (model_features - len(feats)))
+        elif len(feats) > model_features:
+            feats = feats[:model_features]
+
+        cols = self._model_feature_names(booster, model_features)
+        return pd.DataFrame([feats], columns=cols)
+
+    @staticmethod
+    def _model_feature_names(booster: Any, model_features: int) -> list[str]:
+        """Return exactly ``model_features`` column names for the booster.
+
+        Prefers the booster's stored feature names (sklearn ``feature_names_in_``
+        or the underlying booster's ``feature_names``) so the DataFrame matches
+        what the model was trained on; otherwise falls back to
+        ``FINAL_FEATURE_ORDER`` and synthetic ``f{i}`` names for any overflow.
+        """
+        names: list[str] | None = None
+        raw = getattr(booster, "feature_names_in_", None)
+        if raw is not None:
+            names = [str(n) for n in raw]
+        else:
+            try:
+                bn = booster.get_booster().feature_names
+                if bn:
+                    names = [str(n) for n in bn]
+            except Exception:
+                names = None
+        if not names:
+            names = list(FINAL_FEATURE_ORDER)
+        if len(names) < model_features:
+            names = names + [f"f{i}" for i in range(len(names), model_features)]
+        return names[:model_features]
+
     def predict_proba(
         self,
         prices: list[float],
@@ -662,15 +733,8 @@ class MLPredictor:
         if features is None:
             return None
 
-        # [VIBE FASE 4] Append VIBE features if enabled
-        if _VIBE_ENABLED:
-            if vibe_features is not None and len(vibe_features) == len(VIBE_FEATURE_COLS):
-                features.extend(vibe_features)
-            else:
-                features.extend(VIBE_FEATURE_NEUTRAL)
-
         # ------------------------------------------------------------------
-        # Resolve booster and determine expected feature count
+        # Resolve booster (VIBE append + padding handled by _finalize_features)
         # ------------------------------------------------------------------
         sym = symbol or "ETH/USDT"
         booster: XGBClassifier | None = None
@@ -686,35 +750,8 @@ class MLPredictor:
             logger.debug("predict_proba: no model file for %s and predictor untrained.", sym)
             return None
 
-        # Expected feature count from the loaded model
-        try:
-            model_features = int(booster.n_features_in_)
-        except AttributeError:
-            try:
-                model_features = int(booster.get_booster().num_features())
-            except Exception:
-                model_features = len(_FEATURE_COLS)
-
-        input_features = len(features)
-
-        # Auto-Padding: V2 model (16) with only 12 input features
-        if model_features == 16 and input_features == 12:
-            logger.error(
-                "[XGBOOST] Mismatch detectado. Esperadas: %d, Recibidas: %d. Aplicando corrección...",
-                model_features,
-                input_features,
-            )
-            features.extend(VIBE_FEATURE_NEUTRAL)
-
-        # Generic length safety net
-        if len(features) < model_features:
-            features.extend([0.0] * (model_features - len(features)))
-        elif len(features) > model_features:
-            features = features[:model_features]
-
-        # Force column order using FINAL_FEATURE_ORDER
-        cols = FINAL_FEATURE_ORDER[:model_features]
-        X = pd.DataFrame([features], columns=cols)
+        X = self._finalize_features(features, booster, vibe_features)
+        features = list(X.iloc[0])  # keep downstream debug logging consistent
         try:
             proba: float = float(booster.predict_proba(X)[0][1])
         except Exception as exc:  # noqa: BLE001
@@ -847,9 +884,18 @@ class MLPredictor:
             return "HOLD", 0.0
 
         try:
-            proba = float(short_model.predict_proba([features])[0, 1])
-        except Exception as exc:
-            logger.debug("SHORT predict_proba error %s: %s", symbol, exc)
+            X = self._finalize_features(features, short_model)
+            proba = float(short_model.predict_proba(X)[0, 1])
+        except Exception as exc:  # noqa: BLE001
+            # Warn once per symbol to avoid every-cycle Telegram spam.
+            if symbol not in self._short_warn_logged:
+                self._short_warn_logged.add(symbol)
+                logger.warning(
+                    "SHORT predict_proba failed %s: %s - SHORT model may need retraining "
+                    "with the current feature set.",
+                    symbol,
+                    exc,
+                )
             return "HOLD", 0.0
 
         # SHORT only fires when price is BELOW SMA200 (downtrend)

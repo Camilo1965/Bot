@@ -65,6 +65,7 @@ from bot.loops import (
     health_monitor_loop,
     monthly_report_loop,
     position_sync_loop,
+    risk_stats_reset_loop,
     weekly_report_loop,
 )
 from bot.task_supervisor import TaskSupervisor
@@ -959,6 +960,12 @@ async def main() -> None:
     supervisor.spawn(
         "monthly_report",
         lambda: monthly_report_loop(),
+        critical=False,
+        restart=True,
+    )
+    supervisor.spawn(
+        "risk_stats_reset",
+        lambda: risk_stats_reset_loop(risk_manager),
         critical=False,
         restart=True,
     )

@@ -22,6 +22,10 @@ from bot.monitoring import (
     check_vibe_down_alert,
     check_open_positions_alert,
 )
+from dashboard.api.bot_writer import (
+    write_state as _dash_write_state,
+    update_position_live as _dash_update_position_live,
+)
 from database.db_manager import db
 from execution.mt5_executor import MT5Executor, fetch_mt5_wallet_snapshot
 from execution.paper_executor import PaperExecutor
@@ -71,6 +75,15 @@ async def dashboard_logger(
             snap = fetch_mt5_wallet_snapshot()
             if snap:
                 state["mt5_wallet"] = snap
+                # MT5 is the source of truth in live mode: keep the RiskManager's
+                # balance/equity aligned with the broker so sizing, drawdown and
+                # metrics never drift (was producing a false 86% weekly drawdown).
+                try:
+                    risk_manager.sync_live_equity(
+                        float(snap["balance"]), float(snap.get("equity", snap["balance"]))
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
             # Reconcile before painting TUI so ghosts disappear without waiting
             # for the slower periodic sync loop (fixes stale open_count under lag).
             if dash_sync_iv > 0:
@@ -103,6 +116,25 @@ async def dashboard_logger(
             risk_manager.max_positions,
             list(paper_executor.open_positions.keys()) or "none",
         )
+
+        # ── Web dashboard mirror (Redis) ─────────────────────────────────────
+        try:
+            equity_w = float(w["equity"]) if isinstance(w, dict) and "equity" in w else float(bal_log)
+            daily_start = getattr(risk_manager, "_daily_start_balance", None) or float(bal_log)
+            daily_pnl_pct = ((float(bal_log) - float(daily_start)) / float(daily_start) * 100.0) if daily_start else 0.0
+            await _dash_write_state(
+                balance=float(bal_log),
+                equity=equity_w,
+                daily_pnl_pct=float(daily_pnl_pct),
+                open_positions=paper_executor.open_positions,
+                execution_mode=os.environ.get("EXECUTION_MODE", "paper"),
+                session_id=state.get("session_id"),
+                session_started_at=state.get("session_started_at"),
+                watchlist=watchlist,
+                total_pnl_session=float(paper_executor.total_pnl),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger_dash.debug("dashboard mirror write failed: %s", exc)
 
         # ── Audit telemetry: per-position risk data → audit.log only ─────────
         _tz_log, _ = display_timezone()
@@ -146,6 +178,31 @@ async def dashboard_logger(
             current_dd = state.get("max_drawdown", 0.0)
             if unrealized < current_dd:
                 state["max_drawdown"] = unrealized
+
+            # ── Web dashboard live mark (Redis) ─────────────────────────────
+            try:
+                is_short = getattr(pos, "direction", "long") == "short"
+                if pos.entry_price <= 0.0:
+                    pnl_pct_live = 0.0
+                elif is_short:
+                    pnl_pct_live = (pos.entry_price - mark_price) / pos.entry_price * 100.0
+                else:
+                    pnl_pct_live = (mark_price - pos.entry_price) / pos.entry_price * 100.0
+                pnl_usd_live = (pnl_pct_live / 100.0) * pos.position_size
+                await _dash_update_position_live(
+                    trade_id=str(pos.trade_id),
+                    current_price=float(mark_price),
+                    pnl_usd=float(pnl_usd_live),
+                    pnl_pct=float(pnl_pct_live),
+                    peak_price=float(pos.peak_price) if pos.peak_price else None,
+                    current_sl=float(stop_calculated),
+                    trailing_active=bool(
+                        (not is_short and mark_price >= pos.activation_price) or
+                        (is_short and mark_price <= pos.activation_price)
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger_dash.debug("dashboard live mark failed: %s", exc)
 
 
 async def position_sync_loop(
@@ -528,3 +585,25 @@ async def monthly_report_loop(interval_floor: int = 30) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Monthly report failed: %s", exc)
         await asyncio.sleep(interval_floor)
+
+
+async def risk_stats_reset_loop(risk_manager: Any) -> None:
+    """Reset RiskManager daily/weekly baselines at 00:00 UTC (weekly on Mondays).
+
+    Without this the weekly drawdown baseline never rolls over and the daily
+    loss-halt counter never clears.
+    """
+    logger = logging.getLogger("clawdbot.risk.reset")
+    while True:
+        now = datetime.now(tz=timezone.utc)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        sleep_s = max(60, int((next_midnight - now).total_seconds()))
+        await asyncio.sleep(sleep_s)
+        try:
+            risk_manager.reset_daily_stats()
+            logger.info("Daily risk stats reset at %s UTC.", datetime.now(tz=timezone.utc).isoformat())
+            if datetime.now(tz=timezone.utc).weekday() == 0:  # Monday
+                risk_manager.reset_weekly_stats()
+                logger.info("Weekly risk stats reset (Monday 00:00 UTC).")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Risk stats reset failed: %s", exc)

@@ -128,8 +128,8 @@ class TestVibeSizingInRiskManager:
     def test_drawdown_thermometer_stacks_with_vibe(self, risk_mgr: RiskManager) -> None:
         """Si weekly DD > 5%, el riesgo se reduce 50% ADICIONALMENTE
         sobre el ya ajustado por VIBE."""
-        # Forzar drawdown del 10%
-        risk_mgr._weekly_start_balance = 11_111.11  # balance=10_000 → ~10% DD
+        # Forzar drawdown del 10% desde el high-water mark semanal
+        risk_mgr._weekly_peak_balance = 11_111.11  # balance=10_000 → ~10% DD
         size = risk_mgr.calculate_position_size(
             win_probability=0.65,
             risk_pct=0.02,

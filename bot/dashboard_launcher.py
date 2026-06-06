@@ -80,7 +80,7 @@ async def _start_api_inproc() -> asyncio.Task | None:
 
 def _start_web(api_url: str) -> subprocess.Popen | None:
     if not (_WEB_DIR / "package.json").exists():
-        logger.warning("[DASH] dashboard/web/package.json not found — skipping web server")
+        logger.info("[DASH] dashboard/web/package.json not found — skipping web server")
         return None
     if _port_in_use(_WEB_PORT):
         logger.info("[DASH] Web port %s already bound — skipping Next.js launch", _WEB_PORT)
@@ -109,7 +109,7 @@ def _print_access_banner(lan_ip: str, api_url: str) -> None:
         "",
     ]
     for line in lines:
-        logger.warning(line)
+        logger.info(line)
 
 
 async def start_dashboard_servers() -> None:
