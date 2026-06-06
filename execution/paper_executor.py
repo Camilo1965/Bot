@@ -25,6 +25,10 @@ from typing import Any
 
 from bot.constants import DEBUG_LOG_HINT
 from bot.observability import TradeMetrics, ExitMetrics, get_buffer
+from dashboard.api.bot_writer import (
+    write_position_opened as _dash_pos_opened,
+    write_position_closed as _dash_pos_closed,
+)
 from database.db_manager import DatabaseManager
 from risk import risk_manager as _rm_mod
 from risk.risk_manager import RiskManager, BASE_SL, get_execution_thresholds
@@ -374,7 +378,7 @@ class PaperExecutor:
         risk_usd = pos_size_quote * sl_frac
         self._risk.register_open(risk_usd=risk_usd)
         self._risk.deduct(pos.margin_used)
-        
+
         # DB Record
         try:
             await self._db.insert_trade_open(
@@ -390,6 +394,26 @@ class PaperExecutor:
             )
         except Exception as exc:
             logger.warning("Failed to log trade open to DB: %s", exc)
+
+        try:
+            await _dash_pos_opened(
+                trade_id=trade_id,
+                symbol=symbol,
+                side="long",
+                entry=entry_price,
+                sl=sl_price,
+                tp=tp_price,
+                size=pos_size_quote,
+                ml_confidence=float(win_probability),
+                sl_pct=float(sl_frac),
+                activation_pct=float(thresh.activation_pct),
+                atr_at_entry=float(current_atr) if current_atr else None,
+                timeframe=str(tf),
+                entry_time=now.isoformat(),
+                threshold=float(cfg.get("prob_threshold", BUY_PROB_THRESHOLD)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("dashboard mirror pos_opened failed: %s", exc)
 
         # Observability: trade opened
         get_buffer().emit_trade(
@@ -486,6 +510,25 @@ class PaperExecutor:
             margin_used=margin_used,
         )
         self.open_positions[symbol] = pos
+
+        try:
+            await _dash_pos_opened(
+                trade_id=trade_id,
+                symbol=symbol,
+                side="short",
+                entry=entry_price,
+                sl=sl_price,
+                tp=tp_price,
+                size=pos_size_quote,
+                ml_confidence=float(win_probability),
+                sl_pct=float(sl_frac),
+                activation_pct=float(activation_pct),
+                atr_at_entry=float(current_atr) if current_atr else None,
+                timeframe=str(tf),
+                threshold=float(cfg.get("prob_threshold", BUY_PROB_THRESHOLD)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("dashboard mirror pos_opened (short) failed: %s", exc)
 
         try:
             await self._db.save_trade(
@@ -754,6 +797,10 @@ class PaperExecutor:
         )
 
         logger.info("🏁 [CLOSE] %s exit=%.4f pnl=%.2f (%.2f%%) reason=%s", symbol, exit_price, gross_pnl, pnl_pct_display, reason)
+        try:
+            await _dash_pos_closed(trade_id=str(pos.trade_id), pnl_usd=gross_pnl, reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("dashboard mirror pos_closed failed: %s", exc)
         await send_telegram_alert(f"🏁 *CLOSE* {symbol}\nExit: {exit_price:.4f}\nPnL: {gross_pnl:+.2f} ({pnl_pct_display:+.2f}%)\nReason: {reason}")
         return gross_pnl
 

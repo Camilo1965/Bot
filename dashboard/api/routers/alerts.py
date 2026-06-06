@@ -22,6 +22,59 @@ _DRIFT_LOG = _REPO / "logs" / "drift_events.log"
 _ACKED_KEY = "clawdbot:alerts:acked"
 
 
+def _derive_alert(obj: dict, source: str) -> dict:
+    """Inject UI-facing severity/message defaults derived from event shape."""
+    event = str(obj.get("event") or obj.get("type") or "")
+    severity = obj.get("severity")
+    message = obj.get("message")
+
+    if not severity:
+        if source == "kill_switch":
+            if event == "activated":
+                severity = "critical"
+            elif event == "symbol_demoted":
+                severity = "warn"
+            else:
+                severity = "info"
+        elif source == "drift":
+            severity = "warn"
+        else:
+            severity = "info"
+
+    if not message:
+        if source == "kill_switch":
+            if event == "activated":
+                reason = obj.get("reason", "")
+                message = f"Kill switch activated{(': ' + reason) if reason else ''}"
+            elif event == "deactivated":
+                message = "Kill switch deactivated"
+            elif event == "symbol_demoted":
+                sym = obj.get("symbol", "?")
+                thr = obj.get("threshold")
+                message = f"Symbol demoted: {sym}" + (f" (threshold={thr})" if thr is not None else "")
+            else:
+                message = f"kill_switch event: {event or 'unknown'}"
+        elif source == "drift":
+            if event == "drift_detected":
+                sym = obj.get("symbol", "?")
+                ks = obj.get("ks_stat")
+                pv = obj.get("p_value")
+                ks_str = f", KS={float(ks):.3f}" if isinstance(ks, (int, float)) else ""
+                pv_str = f", p={float(pv):.4f}" if isinstance(pv, (int, float)) else ""
+                message = f"Drift detected: {sym}{ks_str}{pv_str}"
+            else:
+                message = f"drift event: {event or 'unknown'}"
+        else:
+            message = event or "alert"
+
+    obj["severity"] = severity
+    obj["message"] = message
+    obj.setdefault("source", source)
+    if "id" not in obj:
+        obj["id"] = f"{source}:{obj.get('ts', '')}:{event}"
+    return obj
+
+
 def _read_jsonl_sync(path: Path, source: str) -> list[dict]:
     if not path.is_file():
         return []
@@ -34,11 +87,7 @@ def _read_jsonl_sync(path: Path, source: str) -> list[dict]:
                     continue
                 try:
                     obj = json.loads(line)
-                    obj.setdefault("source", source)
-                    # Derive an ID from ts + source if missing
-                    if "id" not in obj:
-                        obj["id"] = f"{source}:{obj.get('ts', '')}"
-                    events.append(obj)
+                    events.append(_derive_alert(obj, source))
                 except Exception:
                     pass
     except Exception:
@@ -60,7 +109,7 @@ class AckBody(BaseModel):
 
 @router.get("/api/alerts")
 async def get_alerts(status: Optional[str] = Query("unread")) -> list[dict]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     alerts = await loop.run_in_executor(None, _read_all_alerts_sync)
 
     if status == "unread":

@@ -20,11 +20,27 @@ Run:
 from __future__ import annotations
 
 import os
+import socket
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+
+def _get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
 
 load_dotenv()
 
@@ -74,6 +90,22 @@ async def on_startup() -> None:
 @app.get("/")
 async def root() -> dict:
     return {"status": "ok", "service": "clawdbot-api"}
+
+
+@app.get("/api/system/info")
+async def system_info() -> dict:
+    lan_ip = _get_local_ip()
+    api_port = int(os.environ.get("DASHBOARD_API_PORT", "8000"))
+    web_port = int(os.environ.get("DASHBOARD_WEB_PORT", "3000"))
+    return {
+        "lan_ip": lan_ip,
+        "hostname": socket.gethostname(),
+        "dashboard_url": f"http://{lan_ip}:{web_port}",
+        "api_url": f"http://{lan_ip}:{api_port}",
+        "web_port": web_port,
+        "api_port": api_port,
+        "execution_mode": os.environ.get("EXECUTION_MODE", "paper"),
+    }
 
 
 @app.websocket("/ws/stream")

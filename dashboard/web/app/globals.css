@@ -1,6 +1,28 @@
 @import "tailwindcss";
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap");
 
+@theme {
+  --color-bg-base: #0A0E14;
+  --color-bg-surface: #10151D;
+  --color-bg-elevated: #1E2530;
+  --color-border-default: #374151;
+  --color-text-primary: #F3F4F6;
+  --color-text-secondary: #9CA3AF;
+  --color-accent-blue: #3B82F6;
+  --color-accent-green: #10B981;
+  --color-accent-red: #EF4444;
+  --color-accent-yellow: #F59E0B;
+  --color-accent-purple: #8B5CF6;
+  --color-accent-critical: #DC2626;
+  --color-pnl-positive: #10B981;
+  --color-pnl-negative: #EF4444;
+
+  --font-mono: "JetBrains Mono", "Courier New", monospace;
+  --font-sans: "Inter", system-ui, sans-serif;
+
+  --radius-card: 12px;
+}
+
 :root {
   --bg-base: #0A0E14;
   --bg-surface: #10151D;
@@ -22,6 +44,7 @@
 body {
   background-color: var(--bg-base);
   color: var(--text-primary);
+  font-family: var(--font-sans);
 }
 
 /* Custom scrollbar */
@@ -32,6 +55,7 @@ body {
 
 /* Tabular numbers for prices/PnL */
 .tabular { font-variant-numeric: tabular-nums; }
+.tabular-nums { font-variant-numeric: tabular-nums; }
 
 /* Page transition fade */
 .page-fade {
@@ -42,17 +66,14 @@ body {
   to   { opacity: 1; transform: translateY(0); }
 }
 
-/* Focus rings — accessibility */
+/* Focus rings */
 *:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
   border-radius: 4px;
 }
-button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
-  outline-color: var(--accent-blue);
-}
 
-/* Reduced motion respect */
+/* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
@@ -62,27 +83,20 @@ button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
   }
 }
 
-/* Print stylesheet — clean tables/text for PDF capture */
+/* Print */
 @media print {
   body { background: white !important; color: black !important; }
   aside, header, button, .no-print { display: none !important; }
   main { padding: 0 !important; overflow: visible !important; }
-  .bg-\[\#10151D\], .bg-\[\#0a0e15\] { background: white !important; }
-  .text-\[\#F3F4F6\] { color: black !important; }
-  .text-\[\#9CA3AF\] { color: #555 !important; }
-  .border-\[\#374151\] { border-color: #ccc !important; }
 }
 
-/* Smooth scroll */
 html { scroll-behavior: smooth; }
 
-/* Selection */
 ::selection {
   background-color: var(--accent-blue);
   color: white;
 }
 
-/* Number transitions */
 @keyframes numberPulse {
   0%   { opacity: 0.4; transform: scale(1); }
   50%  { opacity: 1;   transform: scale(1.02); }
@@ -90,7 +104,6 @@ html { scroll-behavior: smooth; }
 }
 .number-pulse { animation: numberPulse 300ms ease-out; }
 
-/* Skeleton shimmer */
 @keyframes shimmer {
   0%   { background-position: -200px 0; }
   100% { background-position: calc(200px + 100%) 0; }

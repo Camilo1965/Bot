@@ -1,0 +1,14 @@
+16:18:44 | SESSION_START session_id=3adddce87606 pid=2524 | full JSON: bot_debug.log | esta sesión: logs/last_session.log
++-----------------------------------------------------------------------------+
+|           DESPLIEGUE OPERATIVO AGRESIVO                                     |
+| +------------------------------------------------+                          |
+| | Parametro               |                Valor |                          |
+| |-------------------------+----------------------|                          |
+| | ML BUY threshold (prob) |                 0.55 |                          |
+| | RISK_PER_TRADE (equity) |                 2.0% |                          |
+| | MAX_POSITIONS           |                    1 |                          |
+| | POSITION_TTL_HOURS      |                  2.0 |                          |
+| | BASE_SL (initial)       |                 0.1% |                          |
+| | Watchlist -> MT5        | DOGE/USDT -> DOGEUSD |                          |
+| +------------------------------------------------+                          |
++-----------------------------------------------------------------------------+

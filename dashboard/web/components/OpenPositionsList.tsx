@@ -58,7 +58,13 @@ export function OpenPositionsList({ apiBase }: { apiBase: string }) {
     );
   }
   if (!positions.length) {
-    return <EmptyState icon="○" title="No open positions" />;
+    return (
+      <EmptyState
+        icon="○"
+        title="No open positions"
+        body="Bot is monitoring the watchlist. Positions appear here when ML probability crosses each symbol's threshold and spread/volume filters pass."
+      />
+    );
   }
 
   return (

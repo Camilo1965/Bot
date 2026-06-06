@@ -94,10 +94,7 @@ set "PUBLIC_URL="
 powershell -NoProfile -Command "$i=0; Write-Host 'Obteniendo URL publica' -NoNewline; while($i -lt 20){ Start-Sleep 2; if(Test-Path 'logs\cloudflared.log'){ $m=Select-String 'logs\cloudflared.log' -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' | Select-Object -First 1; if($m){ $url=([regex]'https://[a-z0-9-]+\.trycloudflare\.com').Match($m.Line).Value; $url | Out-File 'logs\tunnel_url.txt' -Encoding ascii -NoNewline; Write-Host ('  ' + $url); exit 0 } }; Write-Host '.' -NoNewline; $i++ }; Write-Host '  timeout.'"
 if exist "logs\tunnel_url.txt" set /p PUBLIC_URL=<"logs\tunnel_url.txt"
 
-REM Push URL publica por Telegram (si TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID en .env)
-if not defined PUBLIC_URL goto :skip_telegram
-if not exist ".env" goto :skip_telegram
-powershell -NoProfile -Command "$ep = '.env'; $tok = (Select-String -Path $ep -Pattern '^\s*TELEGRAM_BOT_TOKEN\s*=\s*(.+?)\s*$' | Select-Object -First 1); $cid = (Select-String -Path $ep -Pattern '^\s*TELEGRAM_CHAT_ID\s*=\s*(.+?)\s*$' | Select-Object -First 1); if ($tok -and $cid) { $t = $tok.Matches[0].Groups[1].Value.Trim(); $c = $cid.Matches[0].Groups[1].Value.Trim(); if ($t -and $c) { $url = '%PUBLIC_URL%'; $msg = \"ClawdBot arrancado en VPS`nDashboard: $url`n(URL valida mientras el bot este arriba)\"; try { Invoke-RestMethod -Uri \"https://api.telegram.org/bot$t/sendMessage\" -Method Post -Body @{ chat_id = $c; text = $msg } -TimeoutSec 10 | Out-Null; Write-Host 'Telegram: URL enviada.' } catch { Write-Host ('Telegram: fallo envio - ' + $_.Exception.Message) } } }"
+REM Telegram push handled by the Python bot (dashboard_launcher._push_tunnel_url_via_telegram)
 :skip_telegram
 
 REM Abre navegador (en VPS sin GUI esto falla silenciosamente, ok)

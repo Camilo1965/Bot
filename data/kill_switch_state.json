@@ -4,7 +4,9 @@
   "until": null,
   "reason": null,
   "close_all": false,
-  "demoted_symbols": {},
+  "demoted_symbols": {
+    "BTC/USDT": 0.95
+  },
   "history": [
     {
       "event": "activated",
@@ -27,6 +29,28 @@
     {
       "event": "deactivated",
       "ts": "2026-06-03T01:18:11.689726+00:00"
+    },
+    {
+      "event": "activated",
+      "reason": "TEST_FASE1_CIERRE",
+      "duration_hours": 0.1,
+      "close_all": false,
+      "ts": "2026-06-06T20:00:03.591058+00:00"
+    },
+    {
+      "event": "deactivated",
+      "ts": "2026-06-06T20:00:57.694012+00:00"
+    },
+    {
+      "event": "activated",
+      "reason": "TEST_KILL_SWITCH_FASE6",
+      "duration_hours": 1.0,
+      "close_all": false,
+      "ts": "2026-06-06T20:25:08.076036+00:00"
+    },
+    {
+      "event": "deactivated",
+      "ts": "2026-06-06T20:29:53.610974+00:00"
     }
   ]
 }

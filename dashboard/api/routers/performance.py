@@ -28,85 +28,128 @@ def _parse_days(range_str: str) -> int:
         return 30
 
 
+def _empty_summary() -> dict:
+    return {
+        "total_trades": 0,
+        "win_rate": 0.0,
+        "pnl_pct": 0.0,
+        "profit_factor": 0.0,
+        "sharpe": 0.0,
+        "max_drawdown_pct": 0.0,
+    }
+
+
+def _pnl_of(t: dict) -> float:
+    for k in ("pnl_usd", "pnl", "profit_usd", "profit"):
+        v = t.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return 0.0
+
+
+def _pnl_pct_of(t: dict) -> float:
+    for k in ("pnl_pct", "return_pct", "profit_pct"):
+        v = t.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return 0.0
+
+
+def _holding_hours_of(t: dict) -> float:
+    from datetime import datetime
+    et = t.get("entry_time") or t.get("open_time")
+    xt = t.get("exit_time") or t.get("close_time")
+    if not et or not xt:
+        return 0.0
+    try:
+        a = datetime.fromisoformat(str(et).replace("Z", "+00:00"))
+        b = datetime.fromisoformat(str(xt).replace("Z", "+00:00"))
+        return max(0.0, (b - a).total_seconds() / 3600.0)
+    except Exception:
+        return 0.0
+
+
 def _compute_stats(trades: list[dict], symbol: Optional[str]) -> dict:
     if symbol and symbol.lower() != "all":
         trades = [t for t in trades if str(t.get("symbol", "")).upper() == symbol.upper()]
 
     if not trades:
-        return {
-            "trades": 0,
-            "win_rate": 0.0,
-            "pnl_pct": 0.0,
-            "profit_factor": 0.0,
-            "sharpe": 0.0,
-            "max_drawdown": 0.0,
-            "by_symbol": [],
-        }
+        return {"summary": _empty_summary(), "by_symbol": []}
 
-    def _pnl(t: dict) -> float:
-        for k in ("pnl_usd", "pnl", "profit_usd", "profit"):
-            v = t.get(k)
-            if v is not None:
-                try:
-                    return float(v)
-                except Exception:
-                    pass
-        return 0.0
-
-    pnls = [_pnl(t) for t in trades]
+    pnls = [_pnl_of(t) for t in trades]
+    pcts = [_pnl_pct_of(t) for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
 
     win_rate = len(wins) / len(pnls) if pnls else 0.0
-    total_pnl = sum(pnls)
+    total_pnl_usd = sum(pnls)
+    total_pnl_pct = sum(pcts)
     gross_profit = sum(wins) if wins else 0.0
     gross_loss = abs(sum(losses)) if losses else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
 
-    # Sharpe (annualised, assuming daily returns)
+    # Sharpe over per-trade USD pnls, annualized (assume ~252 trade days)
     if len(pnls) > 1:
-        mean_p = total_pnl / len(pnls)
+        mean_p = total_pnl_usd / len(pnls)
         variance = sum((p - mean_p) ** 2 for p in pnls) / len(pnls)
         std = math.sqrt(variance) if variance > 0 else 0.0
-        sharpe = (mean_p / std * math.sqrt(365)) if std > 0 else 0.0
+        sharpe = (mean_p / std * math.sqrt(252)) if std > 0 else 0.0
     else:
         sharpe = 0.0
 
-    # Max drawdown
+    # Max drawdown (% of running peak equity built from cumulative USD pnl)
     equity = 0.0
     peak = 0.0
-    max_dd = 0.0
+    max_dd_pct = 0.0
     for p in pnls:
         equity += p
         if equity > peak:
             peak = equity
-        dd = (peak - equity) / peak if peak > 0 else 0.0
-        if dd > max_dd:
-            max_dd = dd
+        if peak > 0:
+            dd = (peak - equity) / peak * 100.0
+            if dd > max_dd_pct:
+                max_dd_pct = dd
 
     # Per-symbol breakdown
-    sym_map: dict[str, list[float]] = {}
-    for t, p in zip(trades, pnls):
+    sym_map: dict[str, list[tuple[float, float, float]]] = {}
+    for t, p, pct in zip(trades, pnls, pcts):
         sym = str(t.get("symbol", "UNKNOWN"))
-        sym_map.setdefault(sym, []).append(p)
+        sym_map.setdefault(sym, []).append((p, pct, _holding_hours_of(t)))
 
     by_symbol = []
-    for sym, sym_pnls in sym_map.items():
+    for sym, rows in sym_map.items():
+        sym_pnls = [r[0] for r in rows]
+        sym_pcts = [r[1] for r in rows]
+        sym_hold = [r[2] for r in rows]
         sym_wins = [p for p in sym_pnls if p > 0]
+        sym_losses = [p for p in sym_pnls if p <= 0]
+        sym_gp = sum(sym_wins) if sym_wins else 0.0
+        sym_gl = abs(sum(sym_losses)) if sym_losses else 0.0
+        sym_pf = (sym_gp / sym_gl) if sym_gl > 0 else 0.0
         by_symbol.append({
             "symbol": sym,
             "trades": len(sym_pnls),
             "win_rate": round(len(sym_wins) / len(sym_pnls), 4),
-            "pnl_usd": round(sum(sym_pnls), 4),
+            "pnl_pct": round(sum(sym_pcts), 4),
+            "profit_factor": round(sym_pf, 4),
+            "avg_holding_h": round(sum(sym_hold) / len(sym_hold), 2) if sym_hold else 0.0,
         })
 
     return {
-        "trades": len(trades),
-        "win_rate": round(win_rate, 4),
-        "pnl_pct": round(total_pnl, 4),
-        "profit_factor": round(profit_factor, 4),
-        "sharpe": round(sharpe, 4),
-        "max_drawdown": round(max_dd, 4),
+        "summary": {
+            "total_trades": len(trades),
+            "win_rate": round(win_rate, 4),
+            "pnl_pct": round(total_pnl_pct, 4),
+            "profit_factor": round(profit_factor, 4),
+            "sharpe": round(sharpe, 4),
+            "max_drawdown_pct": round(max_dd_pct, 4),
+        },
         "by_symbol": by_symbol,
     }
 
@@ -118,7 +161,7 @@ async def get_performance(
 ) -> dict:
     days = _parse_days(range)
     trades = await query_trades(days=days)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _compute_stats, trades, symbol)
 
 

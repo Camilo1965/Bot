@@ -1482,6 +1482,13 @@ class MT5Executor(PaperExecutor):
         if not _MT5_AVAILABLE:
             return None
 
+        _filling_fallbacks = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+        _filling_idx = 0
+        if request.get("type_filling") == mt5.ORDER_FILLING_FOK:
+            _filling_idx = 1
+        elif request.get("type_filling") == mt5.ORDER_FILLING_RETURN:
+            _filling_idx = 2
+
         for attempt in range(1, max_retries + 1):
             result = mt5.order_send(request)
 
@@ -1553,6 +1560,18 @@ class MT5Executor(PaperExecutor):
             if sltp_10016:
                 self._log_sltp_10016_throttled(request.get("symbol"))
                 return None
+
+            # 10030 INVALID_FILL: broker doesn't support current filling type.
+            # Cycle through IOC → FOK → RETURN until one works.
+            if result.retcode == 10030 and attempt < max_retries:
+                _filling_idx = (_filling_idx + 1) % len(_filling_fallbacks)
+                request["type_filling"] = _filling_fallbacks[_filling_idx]
+                logger.warning(
+                    "[MT5] INVALID_FILL for %s — retrying with filling=%s",
+                    request.get("symbol"),
+                    _filling_fallbacks[_filling_idx],
+                )
+                continue
 
             if result.retcode in _RETRYABLE_RETCODES and attempt < max_retries:
                 self._mt5_failure_count += 1
@@ -2080,7 +2099,7 @@ class MT5Executor(PaperExecutor):
             exit_time,
             gross_pnl,
             code,
-            telegram_after=False,
+            telegram_after=True,
         )
         logger.info(
             "[MT5] Posición ya cerrada en broker - libro sincronizado sym=%s ticket=%s",
@@ -2437,7 +2456,7 @@ class MT5Executor(PaperExecutor):
             exit_time,
             pnl,
             exit_reason_code,
-            telegram_after=False,
+            telegram_after=True,
         )
         return True
 

@@ -112,6 +112,34 @@ def _print_access_banner(lan_ip: str, api_url: str) -> None:
         logger.info(line)
 
 
+_TUNNEL_URL_FILE = _REPO / "logs" / "tunnel_url.txt"
+
+
+async def _push_tunnel_url_via_telegram() -> None:
+    """Wait up to 60s for tunnel_url.txt then send URL to Telegram."""
+    for _ in range(30):
+        await asyncio.sleep(2)
+        if _TUNNEL_URL_FILE.exists():
+            try:
+                url = _TUNNEL_URL_FILE.read_text(encoding="utf-8").strip()
+                if url:
+                    from utils.telegram_notifier import send_telegram_alert
+                    lan_ip = _get_local_ip()
+                    msg = (
+                        f"ClawdBot arrancado\n"
+                        f"Dashboard: {url}\n"
+                        f"LAN: http://{lan_ip}:{_WEB_PORT}\n"
+                        f"(URL valida mientras el bot este activo)"
+                    )
+                    await send_telegram_alert(msg, parse_mode=None)
+                    logger.info("[DASH] Tunnel URL sent to Telegram: %s", url)
+                    return
+            except Exception as exc:
+                logger.info("[DASH] Telegram tunnel push failed: %s", exc)
+                return
+    logger.info("[DASH] Tunnel URL not found after 60s — skipping Telegram push")
+
+
 async def start_dashboard_servers() -> None:
     """Launch API + web servers, detect LAN IP, print access banner."""
     lan_ip = _get_local_ip()
@@ -130,6 +158,8 @@ async def start_dashboard_servers() -> None:
     web_proc = _start_web(api_url)
 
     _print_access_banner(lan_ip, api_url)
+
+    asyncio.create_task(_push_tunnel_url_via_telegram(), name="dash_tunnel_telegram")
 
     while True:
         await asyncio.sleep(30)

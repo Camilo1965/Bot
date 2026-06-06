@@ -12,6 +12,7 @@ from typing import Any
 import aiohttp
 
 from bot.constants import DEBUG_LOG_HINT
+from dashboard.api.bot_writer import publish_signal as _dash_publish_signal
 from database.db_manager import db
 from execution.paper_executor import PaperExecutor
 from risk.kill_switch import is_halted as kill_switch_is_halted, reason as kill_switch_reason
@@ -109,8 +110,8 @@ def _write_shadow_signal(
                 reason_skip,
             )
             f.write(",".join(row) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("clawdbot.signal").warning("[SHADOW CSV] Write failed: %s", exc)
 
 
 async def _fetch_vibe_mcp_decision(
@@ -258,6 +259,9 @@ async def signal_emitter(
             obi_ratio: float = state.get("obi_ratios", {}).get(symbol, 1.0)
             funding_rate: float = state.get("funding_rates", {}).get(symbol, 0.0)
 
+            _sym_cfg_pre = get_symbol_config(symbol)
+            _thr_pre = float(_sym_cfg_pre.get("prob_threshold", BUY_PROB_THRESHOLD))
+
             # ── Volume filter ─────────────────────────────────────────────────
             if _VOL_FILTER_ENABLED and len(volumes) >= _VOL_FILTER_PERIODS:
                 sma_v = sum(volumes[-_VOL_FILTER_PERIODS:]) / _VOL_FILTER_PERIODS
@@ -266,6 +270,10 @@ async def signal_emitter(
                         "[VOL GATE] %s vol=%.2f < %.1f×sma=%.2f — SKIP",
                         symbol, volumes[-1], _VOL_FILTER_MULT, sma_v,
                     )
+                    try:
+                        await _dash_publish_signal(symbol=symbol, raw_prob=0.0, cal_prob=0.0, threshold=_thr_pre, decision="SKIP_VOL")
+                    except Exception as exc:
+                        logger.debug("[DASH] publish SKIP_VOL failed: %s", exc)
                     return
 
             # ── Spread filter ─────────────────────────────────────────────────
@@ -279,6 +287,10 @@ async def signal_emitter(
                         "[SPREAD GATE] %s spread=%.4f%% > max=%.4f%% — SKIP",
                         symbol, (ask_s - bid_s) / mid_s * 100, _MAX_SPREAD_PCT * 100,
                     )
+                    try:
+                        await _dash_publish_signal(symbol=symbol, raw_prob=0.0, cal_prob=0.0, threshold=_thr_pre, decision="SKIP_SPREAD")
+                    except Exception as exc:
+                        logger.debug("[DASH] publish SKIP_SPREAD failed: %s", exc)
                     return
 
             # ── Trading hour filter ──────────────────────────────────────────
@@ -289,6 +301,10 @@ async def signal_emitter(
                         "[HOUR GATE] %s UTC=%02d outside [%02d-%02d) — SKIP",
                         symbol, _now_h, _TRADE_HOUR_START, _TRADE_HOUR_END,
                     )
+                    try:
+                        await _dash_publish_signal(symbol=symbol, raw_prob=0.0, cal_prob=0.0, threshold=_thr_pre, decision="SKIP_HOUR")
+                    except Exception as exc:
+                        logger.debug("[DASH] publish SKIP_HOUR failed: %s", exc)
                     return
 
             # [ATR] Compute ATR_14 from the 15m OHLCV buffers and cache in state
@@ -353,6 +369,12 @@ async def signal_emitter(
             if _regime_enabled and not _skip_regime:
                 _regime_result = predict_regime(symbol, prices, highs=highs or None, lows=lows or None, volumes=volumes or None)
 
+            # Compute SMA200 1H pass/fail BEFORE generate_signal (needed for dashboard)
+            _tf_str = _sym_cfg.get("timeframe", "15m")
+            _tf_min = int(_tf_str[:-1]) if _tf_str[:-1].isdigit() else 15
+            _use_sma = _sym_cfg.get("use_sma_filter", True)
+            _htf_pass: bool = (not _use_sma) or htf_sma200_1h_allows_long(prices, base_timeframe_min=_tf_min)
+
             # Single-pass prediction
             _t0_pred = time.time()
             signal, win_prob = predictor.generate_signal(
@@ -382,11 +404,32 @@ async def signal_emitter(
                 )
             )
 
+            _sym_threshold = float(_sym_cfg.get("prob_threshold", BUY_PROB_THRESHOLD))
+            _regime_prob_val: float | None = float(_regime_result[1]) if _regime_result is not None else None
+            _reason_skip = "" if signal == "BUY" else (
+                "sma200" if not _htf_pass else
+                ("regime" if _regime_prob_val is not None and _regime_prob_val < float(os.environ.get("REGIME_TRENDING_THRESHOLD", "0.65")) else
+                 "below_threshold")
+            )
+            try:
+                await _dash_publish_signal(
+                    symbol=symbol,
+                    raw_prob=float(win_prob),
+                    cal_prob=float(win_prob),
+                    threshold=_sym_threshold,
+                    decision=str(signal),
+                    regime_prob=_regime_prob_val,
+                    htf_pass=_htf_pass,
+                    reason_skip=_reason_skip,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("dashboard mirror publish_signal failed: %s", exc)
+
             vibe_pattern = state.get("vibe_patterns", {}).get(symbol)
             if vibe_pattern:
                 _pdesc = _extract_vibe_pattern_text(vibe_pattern)
                 if _pdesc:
-                    logger.warning("🔍 [VIBE] %s pattern: %s", symbol, _pdesc)
+                    logger.debug("🔍 [VIBE] %s pattern: %s", symbol, _pdesc)
 
             logger.debug(
                 "🧠 [AI THOUGHT] %s - Signal: %s | Confidence: %.2f%% | Prices in buffer: %d",
@@ -565,12 +608,12 @@ async def signal_emitter(
                 cal_prob=win_prob,
                 threshold=_tel_threshold,
                 regime_prob=_tel_regime_prob,
-                htf_pass=True,
+                htf_pass=_htf_pass,
                 vol_pass=True,
                 hour_filter=_TRADE_HOUR_FILTER,
                 ml_decision=signal,
                 executed=_tel_executed,
-                reason_skip="" if signal == "BUY" else "no_signal",
+                reason_skip=_reason_skip,
             )
 
     try:

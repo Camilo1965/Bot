@@ -39,7 +39,7 @@ def _get_symbol_config() -> list[dict]:
 
 @router.get("/api/symbols/config")
 async def get_symbols_config() -> list[dict]:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _get_symbol_config)
 
 

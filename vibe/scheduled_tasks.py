@@ -31,6 +31,19 @@ _FACTOR_INTERVAL_S = 2592000
 _SHADOW_INTERVAL_S = 604800
 
 _VIBE_STATE_FILE = Path("logs") / "vibe_state.json"
+_VIBE_JOURNAL_ARTIFACT = Path("logs") / "vibe_journal_analysis.json"
+_VIBE_PATTERNS_ARTIFACT = Path("logs") / "vibe_patterns_latest.json"
+
+
+def _write_artifact(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.debug("[VIBE] Could not write artifact %s: %s", path, exc)
 
 
 def _load_vibe_state() -> dict[str, Any]:
@@ -79,7 +92,7 @@ async def journal_analysis_loop(
     shared_state: dict[str, Any],
     interval_s: float = _JOURNAL_ANALYSIS_INTERVAL_S,
 ) -> None:
-    """Periodically analyze the trade journal and store results in shared_state."""
+    """Periodically analyze the trade journal and store results in shared_state + disk."""
     if not client.available:
         logger.info("[VIBE] Client not available - journal analysis disabled.")
         return
@@ -89,7 +102,14 @@ async def journal_analysis_loop(
             result = await analyze_journal(client)
             if result:
                 shared_state["vibe_journal_analysis"] = result
-                logger.info("[VIBE] Journal analysis stored in shared_state.")
+                _write_artifact(
+                    _VIBE_JOURNAL_ARTIFACT,
+                    {
+                        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+                        "analysis": result,
+                    },
+                )
+                logger.info("[VIBE] Journal analysis stored in shared_state + %s.", _VIBE_JOURNAL_ARTIFACT)
                 _record_run("journal")
         except Exception as exc:
             logger.warning("[VIBE] Journal analysis failed: %s", exc)
@@ -143,6 +163,16 @@ async def pattern_detection_loop(
                     shared_state.setdefault("vibe_patterns", {})[symbol] = result
             except Exception as exc:
                 logger.warning("[VIBE] Pattern detection failed for %s: %s", symbol, exc)
+        try:
+            _write_artifact(
+                _VIBE_PATTERNS_ARTIFACT,
+                {
+                    "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+                    "patterns": shared_state.get("vibe_patterns", {}),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[VIBE] write patterns artifact failed: %s", exc)
         _record_run("pattern")
         await asyncio.sleep(interval_s)
 

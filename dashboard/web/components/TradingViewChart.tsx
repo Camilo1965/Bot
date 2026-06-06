@@ -1,19 +1,20 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useMemo } from "react";
 
 interface Props {
   symbol: string;
   interval?: string;
-  height?: number;
+  height?: number | string;
 }
 
 function tvSymbol(s: string): string {
-  const base = s.replace("/", "").replace("USDT", "USDT");
+  const base = s.replace("/", "");
   return `BINANCE:${base}.P`;
 }
 
 const tvInterval: Record<string, string> = {
+  "1m": "1",
   "5m": "5",
   "15m": "15",
   "30m": "30",
@@ -22,43 +23,49 @@ const tvInterval: Record<string, string> = {
   "1d": "D",
 };
 
-export function TradingViewChart({ symbol, interval = "15m", height = 480 }: Props) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const containerId = `tv_${symbol.replace("/", "_")}_${interval}`;
-
-  useEffect(() => {
-    if (!containerRef.current) return;
-    containerRef.current.innerHTML = "";
-
-    const script = document.createElement("script");
-    script.src = "https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";
-    script.async = true;
-    script.type = "text/javascript";
-    script.innerHTML = JSON.stringify({
-      autosize: true,
+export function TradingViewChart({ symbol, interval = "15m", height = 720 }: Props) {
+  const src = useMemo(() => {
+    const params = new URLSearchParams({
       symbol: tvSymbol(symbol),
       interval: tvInterval[interval] || "15",
-      timezone: "Etc/UTC",
+      hidesidetoolbar: "0",
+      hidetoptoolbar: "0",
+      symboledit: "0",
+      saveimage: "1",
+      toolbarbg: "rgba(16,21,29,1)",
+      studies: "[]",
+      hideideas: "1",
       theme: "dark",
       style: "1",
-      locale: "en",
-      backgroundColor: "#10151D",
-      gridColor: "#374151",
-      hide_top_toolbar: false,
-      withdateranges: true,
-      allow_symbol_change: false,
-      hide_volume: false,
-      support_host: "https://www.tradingview.com",
+      timezone: "Etc/UTC",
+      withdateranges: "1",
+      hidevolume: "0",
+      utm_source: "clawdbot",
+      utm_medium: "widget",
     });
-    containerRef.current.appendChild(script);
+    return `https://s.tradingview.com/widgetembed/?${params.toString()}`;
   }, [symbol, interval]);
+
+  const cssHeight = typeof height === "number" ? `${height}px` : height;
 
   return (
     <div
-      id={containerId}
-      ref={containerRef}
-      className="tradingview-widget-container"
-      style={{ height, width: "100%" }}
-    />
+      className="tradingview-widget-container relative w-full"
+      style={{ height: cssHeight, minHeight: 320 }}
+    >
+      <iframe
+        title={`TradingView ${symbol}`}
+        src={src}
+        allow="fullscreen"
+        loading="lazy"
+        style={{
+          width: "100%",
+          height: "100%",
+          border: 0,
+          display: "block",
+          backgroundColor: "#10151D",
+        }}
+      />
+    </div>
   );
 }

@@ -100,7 +100,6 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "exec_costs": {"spread_bps": 2.0, "slippage_atr_mult": 0.05},
     },
     "SOL/USDT": {
-        # Threshold sweep 2026-06-03: pt=0.70 → 65 trades, Sharpe +0.04, PnL -2.86%.
         "prob_threshold": 0.70,
         "fixed_sl_pct": 0.025,
         "fixed_tp_pct": 0.035,
@@ -112,8 +111,6 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
         "exec_costs": {"spread_bps": 5.0, "slippage_atr_mult": 0.10},
     },
     "DOGE/USDT": {
-        # Disk sweep 2026-06-02 (60d, calibrated): pt=0.55 tp=0.045 sl=0.025
-        # → 32 trades, WR 90.6%, PnL +22.22%, PF 44.21.
         "prob_threshold": 0.55,
         "fixed_sl_pct": 0.025,
         "fixed_tp_pct": 0.045,
@@ -126,7 +123,6 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     },
     # ── Phase D survivors (2026-06-02): inline 70/30 OOS validated ──
     "NEAR/USDT": {
-        # Threshold sweep 2026-06-03: pt=0.65 → 54 trades, Sharpe +0.03, PnL -1.68%.
         "prob_threshold": 0.65,
         "fixed_sl_pct": 0.030,
         "fixed_tp_pct": 0.050,
@@ -141,10 +137,6 @@ SYMBOL_CONFIG: dict[str, dict[str, Any]] = {
     # Best Sharpe -0.02 at pt=0.55 (PnL -4.22%). Model unprofitable across all settings.
     # If you want to re-enable: retrain with --vibe or --mtf and re-sweep.
     "LINK/USDT": {
-        # Symbol scan 2026-06-02 (54d OOS): pt=0.55 tp=0.050 sl=0.030
-        # → 31 trades, WR 48.4%, PnL +1.00%, PF 1.55. MARGINAL — included for
-        # diversification at low risk. Skip from .env WATCHLIST until Phase F
-        # confirms profitability on the most recent 30d.
         "prob_threshold": 0.55,
         "fixed_sl_pct": 0.030,
         "fixed_tp_pct": 0.050,

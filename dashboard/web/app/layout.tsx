@@ -21,8 +21,8 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className="dark">
-      <body className="bg-[#0A0E14] text-[#F3F4F6] font-sans antialiased flex h-screen overflow-hidden">
+    <html lang="en" className="dark" suppressHydrationWarning>
+      <body className="bg-[#0A0E14] text-[#F3F4F6] font-sans antialiased flex h-screen overflow-hidden" suppressHydrationWarning>
         <AppShell>{children}</AppShell>
       </body>
     </html>
