@@ -823,7 +823,7 @@ async def main() -> None:
         "ml_signals[symbol]==BUY and prob>=%.2f.",
         BUY_PROB_THRESHOLD,
     )
-    logger.warning(
+    logger.info(
         "[RIESGO] Perfil ETH/USDT 15m - valores activos prob>=%.2f risk=%.1f%%.",
         BUY_PROB_THRESHOLD,
         RISK_PER_TRADE * 100.0,

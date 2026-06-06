@@ -69,6 +69,7 @@ def _make_executor_with_pos(
         current_stop_loss=entry_price * (1 - sl_pct),
     )
     executor.open_positions["BTC/USDT"] = pos
+    executor._append_to_journal = lambda *args, **kwargs: None
     return executor
 
 

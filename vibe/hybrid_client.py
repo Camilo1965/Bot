@@ -183,7 +183,9 @@ class VibeHybridClient:
         else:
             df = pd.read_excel(path)
 
-        # Ensure required columns exist via heuristic mapping
+        # Ensure required columns exist via heuristic mapping.
+        # Aliases: the bot's journal uses net_pnl/gross_pnl; 'pnl' is an alias.
+        _PNL_ALIASES = ("net_pnl", "gross_pnl", "realized_pnl", "profit_loss", "pl")
         required = {"symbol", "entry_price", "exit_price", "side", "pnl"}
         # Build normalized column lookup (exact matches first)
         norm_map: dict[str, str] = {}
@@ -204,7 +206,14 @@ class VibeHybridClient:
             # Fallback: if column already exists with exact name, use it directly
             for req in required:
                 if req not in df.columns:
-                    raise KeyError(f"Required column '{req}' not found in journal. Available: {list(df.columns)}")
+                    # Accept common pnl alias columns
+                    if req == "pnl":
+                        for alias in _PNL_ALIASES:
+                            if alias in df.columns:
+                                df = df.rename(columns={alias: "pnl"})
+                                break
+                    if req not in df.columns:
+                        raise KeyError(f"Required column '{req}' not found in journal. Available: {list(df.columns)}")
 
         total = len(df)
         wins = df[df["pnl"] > 0]
