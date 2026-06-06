@@ -68,10 +68,10 @@ class TestVibeGating:
 
         state: dict[str, Any] = {}
 
-        # 0.65 * 1.0 = 0.65 >= 0.60 (threshold BTC/USDT)
+        # 0.90 * 1.0 = 0.90 >= 0.85 (current threshold BTC/USDT after backtest-tune)
         with patch("bot.signal_emitter.is_extreme_macro_veto", return_value=False), \
              patch("bot.signal_emitter.compute_entry_score", return_value=1.0):
-            gated_signal, reason = _apply_vibe_gating(state, "BTC/USDT", "BUY", 0.65)
+            gated_signal, reason = _apply_vibe_gating(state, "BTC/USDT", "BUY", 0.90)
 
         assert gated_signal == "BUY"
         assert reason is None

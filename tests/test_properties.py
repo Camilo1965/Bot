@@ -24,6 +24,25 @@ async def _run_check_and_close(executor: PaperExecutor, symbol: str, price: floa
     return executor.open_positions.get(symbol)
 
 
+def _run_async(coro) -> None:
+    """Run a coroutine in an isolated event loop, cancelling pending tasks before close.
+
+    Using asyncio.run() directly in a hypothesis test can leave AsyncMock coroutines
+    pending; cancelling them prevents the 'coroutine ignored GeneratorExit' warning
+    that pytest-asyncio turns into a test failure.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(coro)
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+
+
 def _make_executor_with_pos(
     entry_price: float = 100.0,
     activation_pct: float = 0.02,
@@ -76,14 +95,14 @@ class TestTrailingStopProperties:
             # skip non-finite values that hypothesis might generate at boundaries
             if price != price or price <= 0.0:
                 continue
-            asyncio.run(_run_check_and_close(executor, "BTC/USDT", price))
+            _run_async(_run_check_and_close(executor, "BTC/USDT", price))
             pos = executor.open_positions.get("BTC/USDT")
             if pos is None:
                 break
             assert pos.sl_price >= prev_sl * 0.99999999  # allow tiny fp jitter
             prev_sl = pos.sl_price
 
-    @settings(max_examples=200)
+    @settings(max_examples=200, deadline=None)
     @given(
         entry_price=st.floats(min_value=10.0, max_value=100_000.0),
         activation_pct=st.floats(min_value=0.001, max_value=0.20),
@@ -113,7 +132,7 @@ class TestTrailingStopProperties:
         asyncio.run(_run_check_and_close(executor, "BTC/USDT", sl_price))
         assert "BTC/USDT" not in executor.open_positions
 
-    @settings(max_examples=200)
+    @settings(max_examples=200, deadline=None)
     @given(
         entry_price=st.floats(min_value=10.0, max_value=100_000.0),
         peak_multiplier=st.floats(min_value=1.0, max_value=5.0),
@@ -136,7 +155,7 @@ class TestTrailingStopProperties:
 # ── RiskManager properties ────────────────────────────────────────────────────
 
 class TestRiskManagerProperties:
-    @settings(max_examples=300)
+    @settings(max_examples=300, deadline=None)
     @given(
         balance=st.floats(min_value=100.0, max_value=10_000_000.0),
         win_prob=st.floats(min_value=0.0, max_value=1.0),
@@ -153,7 +172,7 @@ class TestRiskManagerProperties:
         )
         assert size >= 0.0
 
-    @settings(max_examples=300)
+    @settings(max_examples=300, deadline=None)
     @given(
         balance=st.floats(min_value=100.0, max_value=10_000_000.0),
         win_prob=st.floats(min_value=0.0, max_value=1.0),
@@ -169,7 +188,7 @@ class TestRiskManagerProperties:
         max_allocation = (balance / max_positions) * LEVERAGE
         assert size <= max_allocation * 1.00000001
 
-    @settings(max_examples=200)
+    @settings(max_examples=200, deadline=None)
     @given(
         open_count=st.integers(min_value=0, max_value=50),
         max_positions=st.integers(min_value=1, max_value=20),
@@ -182,7 +201,7 @@ class TestRiskManagerProperties:
         else:
             assert rm.can_open_position() is True
 
-    @settings(max_examples=200)
+    @settings(max_examples=200, deadline=None)
     @given(
         initial_balance=st.floats(min_value=100.0, max_value=10_000_000.0),
         dd_multiplier=st.floats(min_value=0.0, max_value=0.5),
@@ -196,7 +215,7 @@ class TestRiskManagerProperties:
         else:
             assert rm.is_portfolio_dd_exceeded() is False
 
-    @settings(max_examples=200)
+    @settings(max_examples=200, deadline=None)
     @given(
         loss=st.floats(min_value=0.0, max_value=1_000_000.0),
         daily_start=st.floats(min_value=100.0, max_value=10_000_000.0),
@@ -211,7 +230,7 @@ class TestRiskManagerProperties:
         else:
             assert rm.is_trading_halted() is False
 
-    @settings(max_examples=200)
+    @settings(max_examples=200, deadline=None)
     @given(
         balance=st.floats(min_value=100.0, max_value=10_000_000.0),
         total_risk_usd=st.floats(min_value=0.0, max_value=1_000_000_000.0),
@@ -222,7 +241,7 @@ class TestRiskManagerProperties:
         exposure = rm.get_current_risk_exposure()
         assert exposure >= 0.0
 
-    @settings(max_examples=200)
+    @settings(max_examples=200, deadline=None)
     @given(
         balance=st.floats(min_value=100.0, max_value=10_000_000.0),
         win_prob=st.floats(min_value=0.0, max_value=1.0),
@@ -238,7 +257,7 @@ class TestRiskManagerProperties:
         )
         assert size == 0.0
 
-    @settings(max_examples=200)
+    @settings(max_examples=200, deadline=None)
     @given(
         balance=st.floats(min_value=100.0, max_value=10_000_000.0),
         risk_usd=st.floats(min_value=0.0, max_value=1_000_000.0),

@@ -32,3 +32,6 @@ ignore = [
 [tool.bandit]
 exclude_dirs = ["tests", "coverage_report", ".venv", "venv", "MAQUINA VIRTUAL"]
 skips = ["B101", "B104"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

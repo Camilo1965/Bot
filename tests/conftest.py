@@ -71,16 +71,13 @@ def _clean_env(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────
-# Fixture: event loop para tests async
+# Fixture: event loop policy para Windows
+# pytest-asyncio 0.23 manages the loop per-test; the old session-scoped
+# event_loop fixture is deprecated and causes "coroutine never awaited"
+# failures across the suite. Set the policy once instead.
 # ─────────────────────────────────────────────────────────
-@pytest.fixture(scope="session")
-def event_loop():
-    """Proveer un event loop reusable para toda la sesión de tests."""
-    if sys.platform.startswith("win"):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 # ─────────────────────────────────────────────────────────
